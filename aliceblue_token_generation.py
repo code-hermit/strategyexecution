@@ -1,0 +1,29 @@
+"""
+Login to aliceblue 
+https://ant.aliceblueonline.com/?appcode=4IxfSoqtdk
+
+The Individual Trader must save the authCode and userId, and use them with the apiSecret to create a checksum. This is the SHA-256 hash of: userId + authCode + apiSecret
+"""
+
+
+import hashlib
+import dotenv
+import os 
+import requests
+import json
+dotenv.load_dotenv()
+
+ALICEBLUE_USER_ID = os.getenv('ALICEBLUE_USER_ID')
+ALICEBLUE_APP_SECRET = os.getenv('ALICEBLUE_APP_SECRET')
+auth_code = input("Enter the authCode from AliceBlue login: ")
+
+checksum=hashlib.sha256((ALICEBLUE_USER_ID + auth_code + ALICEBLUE_APP_SECRET).encode()).hexdigest()
+
+resp=requests.post("https://a3.aliceblueonline.com/open-api/od/v1/vendor/getUserDetails",json={"checkSum":checksum})
+
+rj=resp.json()
+# {'stat': 'Ok', 'clientId': 'AB036961', 'userSession': 'eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICIyam9lOFVScGxZU3FTcDB3RDNVemVBQkgxYkpmOE4wSDRDMGVVSWhXUVAwIn0.eyJleHAiOjE3OTA5MTYxMDgsImlhdCI6MTc4NTc0MDA2OSwianRpIjoib25ydHJ0OjMxMGU2ODhiLWQ3NmUtZGRkMy0xZWQ1LWEyN2U5NTBjN2FlZSIsImlzcyI6Imh0dHBzOi8vaWRhYXMuYWxpY2VibHVlb25saW5lLmNvbS9pZGFhcy9yZWFsbXMvQWxpY2VCbHVlIiwiYXVkIjoiYWNjb3VudCIsInN1YiI6ImE4ZmJiZTUzLTIyMTgtNDg5Ny05YTMzLTljMjQ0NThjMDA1ZCIsInR5cCI6IkJlYXJlciIsImF6cCI6ImFsaWNlLWtiIiwic2lkIjoiY2YwYTQxZDEtYzMwYi04ODRmLTgxZDctMGRlY2MxM2E2NzRkIiwiYWxsb3dlZC1vcmlnaW5zIjpbImh0dHA6Ly9sb2NhbGhvc3Q6MzAwMiIsImh0dHA6Ly9sb2NhbGhvc3Q6NTA1MCIsImh0dHA6Ly9sb2NhbGhvc3Q6OTk0MyIsImh0dHA6Ly9sb2NhbGhvc3Q6OTAwMCJdLCJyZWFsbV9hY2Nlc3MiOnsicm9sZXMiOlsib2ZmbGluZV9hY2Nlc3MiLCJkZWZhdWx0LXJvbGVzLWFsaWNlYmx1ZWtiIiwidW1hX2F1dGhvcml6YXRpb24iXX0sInJlc291cmNlX2FjY2VzcyI6eyJhbGljZS1rYiI6eyJyb2xlcyI6WyJHVUVTVF9VU0VSIiwiQUNUSVZFX1VTRVIiXX0sImFjY291bnQiOnsicm9sZXMiOlsibWFuYWdlLWFjY291bnQiLCJtYW5hZ2UtYWNjb3VudC1saW5rcyIsInZpZXctcHJvZmlsZSJdfX0sInNjb3BlIjoiZW1haWwgcHJvZmlsZSBvcGVuaWQiLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwidWNjIjoiQUIwMzY5NjEiLCJjbGllbnRSb2xlIjpbIkdVRVNUX1VTRVIiLCJBQ1RJVkVfVVNFUiJdLCJuYW1lIjoiU1VCSEFTSCBIVU5ESSIsInByZWZlcnJlZF91c2VybmFtZSI6ImFiMDM2OTYxIiwiZ2l2ZW5fbmFtZSI6IlNVQkhBU0giLCJmYW1pbHlfbmFtZSI6IkhVTkRJIn0.bhtqHJS8g9iyfiB7P29FLc0UBaGCnYy5pB2ZlTT6I1lsW2FoCNgeaLm9YLkLNqASTfOVXcbsoLJzn_shUM0-I9xeN8eADkVNJpjY3WMczXeEagCEFk9RHJBam7AvCHX_yHCd0Dk2EpfsNeRDU4xaJxZwyCzOm9Pg9iaYoa1HxyWItyDhBGD7RPpKbtTsOc1Tl-yvkKluY6wi1lMTgOWxBCyyWcawFeCPMsZ0Z8JJyIrDlRv8VO5DIt_vDQLksVjeCmmWVjzZ04fVuDelcdC6aJnPVRfQpKzbJtO__VCMvyei4tzH4JkXPpuCPMZcCbV9-oAg_nfXQavMG8FajSeulw'}
+access_token=rj.get('userSession')
+with open("aliceblue_token.json", "w") as f:
+    json.dump(rj, f, indent=2)
+print("Saved to aliceblue_token.json")

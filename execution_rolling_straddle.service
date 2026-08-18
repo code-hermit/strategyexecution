@@ -1,0 +1,32 @@
+[Unit]
+Description=execution_rolling_straddle - live rolling ATM straddle strategy
+# Only makes sense once the network (and DNS, for the Dhan/AliceBlue/Telegram APIs) is up.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/trading
+ExecStart=/usr/bin/python3 /home/ec2-user/trading/execution_rolling_straddle.py
+
+# Auto-restart on ANY exit that isn't a clean `systemctl stop` - a crash, an uncaught exception,
+# a SIGHUP/SIGTERM from something outside our control, an OOM kill. Running as a systemd service
+# in the first place also means there's no controlling terminal to lose - the SIGHUP you've been
+# hitting from a dropped SSH session can't happen at all under systemd.
+Restart=on-failure
+RestartSec=10
+# Belt-and-braces: cap restarts so a persistent, unfixable problem (e.g. bad credentials) doesn't
+# spin the unit forever - 5 restarts within 10 minutes and systemd gives up and leaves it failed,
+# rather than retrying forever burning through the rate limit and Telegram alerts.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# The script does its own file+console+Telegram logging (execution_rolling_straddle.log); this
+# just also mirrors stdout/stderr into the systemd journal (`journalctl -u execution_rolling_straddle`)
+# as a second, independent place to look if the script's own logging is ever the thing that's broken.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

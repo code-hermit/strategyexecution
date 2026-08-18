@@ -1,0 +1,6 @@
+.env
+/execution
+/__pycache__
+*.log
+*.json
+*.sh
