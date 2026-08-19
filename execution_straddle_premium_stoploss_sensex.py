@@ -85,7 +85,7 @@ EXIT_TIME = dtime(15, 15)  # EOD square-off
 
 COMBINED_STOPLOSS_POINTS = 50  # combined CE+PE premium move against entry that flattens the straddle
 DAILY_LOSS_LIMIT = -100  # realized + unrealized pnl (points) at which trading stops for the rest of the day
-LEG_STOPLOSS_POINTS = 100  # per-leg extreme-move stoploss distance from that leg's entry price
+LEG_STOPLOSS_POINTS = 300  # per-leg extreme-move stoploss distance from that leg's entry price
 
 MONITOR_INTERVAL = 60  # seconds between combined-stoploss / daily-loss-limit checks while a position is open
 MISSED_CHECKPOINT_GRACE = 90  # seconds past a checkpoint time beyond which it's skipped rather than run late
