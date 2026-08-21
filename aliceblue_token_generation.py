@@ -15,6 +15,8 @@ dotenv.load_dotenv()
 
 ALICEBLUE_USER_ID = os.getenv('ALICEBLUE_USER_ID')
 ALICEBLUE_APP_SECRET = os.getenv('ALICEBLUE_APP_SECRET')
+LOGIN_URL = f'https://ant.aliceblueonline.com/?appcode=4IxfSoqtdk'
+print(f'Log in here, then copy the request_token from the redirect URL:\n{LOGIN_URL}')
 auth_code = input("Enter the authCode from AliceBlue login: ")
 
 checksum=hashlib.sha256((ALICEBLUE_USER_ID + auth_code + ALICEBLUE_APP_SECRET).encode()).hexdigest()

@@ -53,11 +53,13 @@ fire-immediately enters right away (matching execution_rolling_straddle.py's own
 handling); honor-checkpoints instead stays flat until the next ENTRY_TIME-anchored checkpoint
 fires the entry. Either way, every checkpoint after that first entry is always grid-anchored -
 ENTRY_MODE only changes when the first one lands. If it starts with positions already open
-(mid-day restart), it adopts them into local state using their *current*
-LTP as an approximate entry price (this codebase's AliceBlue positions wrapper doesn't expose the
-original average fill price) and alerts loudly that pnl/premium bookkeeping from before the
-restart is lost - daily-loss-limit and premium-stoploss comparisons only see pnl/premium moves
-from the restart onward.
+(mid-day restart, or legs placed manually), it adopts them into local state, reconstructing each
+leg's actual entry price from the AliceBlue order book's completed SELL fills where possible (see
+_infer_entry_price_from_orderbook) instead of assuming live LTP - falling back to LTP, logged
+clearly as an approximation, only if that reconstruction fails. The reconstructed combined entry
+also stands in for the previous checkpoint's premium, so the next checkpoint's ATM-rise comparison
+isn't starting blind. Realized pnl from before the restart is still lost either way (this process
+wasn't the one that tracked it) - alerted loudly.
 """
 
 import logging
@@ -218,14 +220,21 @@ ENTRY_MODES = (ENTRY_MODE_HONOR_CHECKPOINTS, ENTRY_MODE_FIRE_IMMEDIATELY)
 DEFAULT_ENTRY_MODE = ENTRY_MODE_FIRE_IMMEDIATELY
 
 FIRST_OTM_STRIKES = 0  # 0 = ATM; n = n strikes OTM (CE up, PE down)
+
+# Per-leg stoploss: NIFTY keeps ers.STOPLOSS_PCT (30%, percentage-of-entry-premium) unchanged.
+# SENSEX uses a fixed points-based distance instead - SENSEX premiums are large enough that a
+# percentage stoploss ends up too tight or too loose depending on strike, so a flat points move
+# is used instead (same idea as execution_straddle_premium_stoploss_sensex.py's LEG_STOPLOSS_POINTS).
+SENSEX_LEG_STOPLOSS_POINTS = 300
+
 PREMIUM_HIGH_STOPLOSS_ENABLED = False
 PREMIUM_HIGH_LOOKBACK = timedelta(hours=2)
 PREMIUM_STOPLOSS_ENABLED = False
 PREMIUM_STOPLOSS_PCT = 0.25
 DAILY_LOSS_LIMIT = 100  # points, unscaled by lot size - see module docstring
 
-# Per-weekday lot overrides, keyed by (symbol, weekday name) - falls back to ers.UNDERLYINGS[symbol]['lots']
-# when a symbol/weekday isn't listed here.
+# Per-weekday lot overrides, keyed by (symbol, weekday name) - falls back to
+# ers.UNDERLYINGS[symbol]['lots'] (NIFTY=5, SENSEX=5) when a symbol/weekday isn't listed here.
 LOTS_OVERRIDE = {
     ('NIFTY', 'Friday'): 3,
 }
@@ -394,14 +403,47 @@ def _new_state():
     return {opt: None for opt in OPTION_TYPES}  # None, or {'instrument','strike','entry_price','quantity'}
 
 
-def _enter_leg(state, opt, instrument, ltp, strike, cfg):
+def _short_leg_with_stoploss(instrument, quantity, ltp, symbol):
+    """Same as ers.short_leg_with_stoploss, except the stoploss distance is symbol-dependent: NIFTY
+    keeps ers.STOPLOSS_PCT (percentage of entry premium), SENSEX uses a fixed points move instead
+    (SENSEX_LEG_STOPLOSS_POINTS - see its definition above for why)."""
+    entry_price = ers._round_to_tick(ltp * (1 - ers.LIMIT_OFFSET_PCT), instrument.tick_size)
+    tag = f'{"[DRY RUN] " if ers.DRY_RUN else ""}SELL {quantity} x {instrument.name} LIMIT @ {entry_price} (ltp {ltp})'
+    log.info(tag)
+    if ers.DRY_RUN:
+        return entry_price
+
+    entry = ers._place_order(
+        'SELL', instrument, quantity, 'LIMIT', price=str(entry_price), order_tag='rolling_straddle_entry',
+    )
+    order_no = entry.get('brokerOrderId')
+    if not order_no:
+        raise RuntimeError(f'{instrument.name} entry order rejected: {entry}')
+
+    entry_price = ers._wait_for_fill_price(order_no)
+    if symbol == 'SENSEX':
+        trigger_price = round(entry_price + SENSEX_LEG_STOPLOSS_POINTS, 1)
+    else:
+        trigger_price = round(entry_price * (1 + ers.STOPLOSS_PCT), 1)
+    sl_limit_price = ers._round_to_tick(trigger_price * (1 + ers.LIMIT_OFFSET_PCT), instrument.tick_size)
+    log.info(f'{instrument.name} entered @ {entry_price}, SL trigger {trigger_price} limit {sl_limit_price}')
+
+    ers._place_order(
+        'BUY', instrument, quantity, 'SL', price=str(sl_limit_price),
+        trigger_price=trigger_price, order_tag='rolling_straddle_sl',
+    )
+    return entry_price
+
+
+def _enter_leg(state, opt, instrument, ltp, strike, cfg, symbol):
     quantity = instrument.lot_size * cfg['lots']
-    ers.short_leg_with_stoploss(instrument, quantity, ltp)
+    _short_leg_with_stoploss(instrument, quantity, ltp, symbol)
     state[opt] = dict(instrument=instrument, strike=strike, entry_price=ltp, quantity=quantity)
-    alert(f'ENTER {opt} {instrument.name} x{quantity} @ ~{ltp} (SL {ers.STOPLOSS_PCT:.0%})')
+    sl_desc = f'{SENSEX_LEG_STOPLOSS_POINTS}pt' if symbol == 'SENSEX' else f'{ers.STOPLOSS_PCT:.0%}'
+    alert(f'ENTER {opt} {instrument.name} x{quantity} @ ~{ltp} (SL {sl_desc})')
 
 
-def _enter_initial_day_legs(state, market, cfg, day):
+def _enter_initial_day_legs(state, market, cfg, day, symbol):
     """Today's first entry - shared by both ENTRY_MODEs: fire-immediately calls this the moment
     the process comes up, honor-checkpoints calls it once the first checkpoint after a late start
     arrives. Records today's baseline ATM premium (for the ATM-rise/premium-stoploss checks) and
@@ -411,7 +453,7 @@ def _enter_initial_day_legs(state, market, cfg, day):
     if day['entry_premium'] is not None:
         day['premium_history'] = [(datetime.now(), day['entry_premium'])]
     for opt, (instrument, ltp, strike) in _desired_legs(market, cfg).items():
-        _enter_leg(state, opt, instrument, ltp, strike, cfg)
+        _enter_leg(state, opt, instrument, ltp, strike, cfg, symbol)
 
 
 def _close_leg(state, opt, market, cfg, reason):
@@ -448,8 +490,77 @@ def _sync_stopped_out_legs(state, market):
             state[opt] = None
 
 
+# ── Startup adoption: reconstruct entry price from the order book ──────────────────────────────
+# Ported from execution_straddle_premium_stoploss_sensex.py's _infer_entry_price_from_orderbook -
+# used when this process starts up and finds positions already open at the broker (mid-day
+# restart, or legs placed manually) so adoption can use the real fill price instead of assuming
+# live LTP.
+_ORDER_TIME_FIELDS = ('orderGeneratedTime', 'orderEntryTime', 'exchangeTime', 'orderTime')  # candidate
+# order-timestamp fields, tried in order - AliceBlue's exact field name for this isn't confirmed
+# anywhere else in this codebase (only brokerOrderId, orderStatus, rejectionReason,
+# averageTradedPrice are established, via ers._wait_for_fill_price). Falls back to brokerOrderId
+# (assigned sequentially, so still a decent recency proxy) if none of these are present.
+
+
+def _order_sort_key(order):
+    for field in _ORDER_TIME_FIELDS:
+        if order.get(field):
+            return order[field]
+    return order.get('brokerOrderId', '')
+
+
+def _infer_entry_price_from_orderbook(token, open_quantity):
+    """Best-effort reconstruction of a short leg's actual average fill price from AliceBlue's
+    order book: walks its completed SELL orders for this instrument, most-recent-first,
+    accumulating filled quantity until it covers `open_quantity`, and returns the
+    quantity-weighted average price across just those orders - so older fills belonging to a
+    since-closed position (e.g. an earlier roll today) don't pollute the average. Returns None
+    (caller falls back to live LTP) if the order book doesn't yield a confident answer - a wrong
+    assumption about field names should fail closed, not silently produce a wrong entry price."""
+    try:
+        orders = _resilient_call(ers._order_book)
+    except Exception as exc:
+        log.warning(f'could not fetch order book to infer entry price for token {token}: {exc}')
+        return None
+
+    fills = [
+        o for o in orders
+        if str(o.get('instrumentId')) == str(token)
+        and str(o.get('transactionType', '')).upper() == 'SELL'
+        and str(o.get('orderStatus', '')).lower() == 'complete'
+    ]
+    fills.sort(key=_order_sort_key, reverse=True)
+
+    remaining = open_quantity
+    weighted_sum = 0.0
+    covered = 0
+    for o in fills:
+        try:
+            filled_qty = int(o.get('quantity') or o.get('filledQuantity') or 0)
+            price = float(o.get('averageTradedPrice') or 0)
+        except (TypeError, ValueError):
+            continue
+        if filled_qty <= 0 or price <= 0:
+            continue
+        take = min(filled_qty, remaining)
+        weighted_sum += take * price
+        covered += take
+        remaining -= take
+        if remaining <= 0:
+            break
+
+    if covered == 0:
+        return None
+    if covered < open_quantity:
+        log.warning(
+            f'order book only accounted for {covered}/{open_quantity} of open quantity for token '
+            f'{token} - using the weighted average of what it did find'
+        )
+    return weighted_sum / covered
+
+
 # ── Checkpoint (hourly) ──────────────────────────────────────────────────────────────────────
-def run_checkpoint(state, market, cfg, day):
+def run_checkpoint(state, market, cfg, day, symbol):
     prev_premium = day['prev_checkpoint_premium']  # snapshot before it gets overwritten below,
     # so both the comparison and the log line below refer to the same "previous" value
     current_premium = _atm_premium(market['option_chain'], market['atm'])
@@ -489,12 +600,12 @@ def run_checkpoint(state, market, cfg, day):
         alert('first-OTM strike has moved - rolling both legs')
         day['realized_pnl'] += _close_open_legs(state, market, cfg, 'ROLL_OTM_DRIFT')
         for opt, (instrument, ltp, strike) in desired.items():
-            _enter_leg(state, opt, instrument, ltp, strike, cfg)
+            _enter_leg(state, opt, instrument, ltp, strike, cfg, symbol)
         return
 
     for opt, (instrument, ltp, strike) in desired.items():
         if state[opt] is None:
-            _enter_leg(state, opt, instrument, ltp, strike, cfg)
+            _enter_leg(state, opt, instrument, ltp, strike, cfg, symbol)
         else:
             log.info(f'{opt} still open at {state[opt]["strike"]}, leaving as is')
 
@@ -585,7 +696,7 @@ def run_day(symbol, trade_weekdays, entry_mode=DEFAULT_ENTRY_MODE):
         return
 
     # Copy rather than mutate ers.UNDERLYINGS[symbol] - that dict is shared with
-    # execution_rolling_straddle.py, which has its own (unrelated) lot sizing.
+    # execution_rolling_straddle.py.
     cfg = dict(ers.UNDERLYINGS[symbol])
     override_lots = LOTS_OVERRIDE.get((symbol, today_name))
     if override_lots is not None:
@@ -626,11 +737,15 @@ def run_day(symbol, trade_weekdays, entry_mode=DEFAULT_ENTRY_MODE):
     pending_initial_entry = False
     if open_tokens:
         # Mid-day restart with positions already open - adopt them so rolling/re-entry keeps
-        # working, but we can't recover the original entry price or premium history (see module
-        # docstring), so pnl/premium tracking effectively restarts from now.
+        # working. Reconstruct each leg's real entry price from the AliceBlue order book's
+        # completed SELL fills where possible (see _infer_entry_price_from_orderbook), falling
+        # back to live LTP - logged clearly - only if that reconstruction fails. The reconstructed
+        # combined entry also stands in for the previous checkpoint's premium, so the ATM-rise
+        # check at the next checkpoint has something real to compare against instead of starting
+        # blind.
         alert(
-            'Found open positions at startup (mid-day restart?) - adopting them with an '
-            'approximate entry price; realized pnl and premium history before this restart are lost',
+            'Found open positions at startup (mid-day restart?) - reconstructing entry prices '
+            'from the order book where possible',
             level=logging.WARNING,
         )
         open_legs_by_token = _resilient_call(ers.get_open_legs, market["contracts_by_token"])
@@ -639,12 +754,28 @@ def run_day(symbol, trade_weekdays, entry_mode=DEFAULT_ENTRY_MODE):
             if token in open_tokens:
                 opt = contract['option_type']
                 instrument = ers._to_instrument(contract)
-                try:
-                    ltp = ers.option_ltp(market['option_chain'], strike_opt[0], opt)
-                except (KeyError, TypeError):
-                    ltp = 0.0
                 pos = open_legs_by_token[token]
-                state[opt] = dict(instrument=instrument, strike=strike_opt[0], entry_price=ltp, quantity=abs(int(pos['netQuantity'])))
+                quantity = abs(int(pos['netQuantity']))
+                entry_price = _infer_entry_price_from_orderbook(token, quantity)
+                if entry_price is not None:
+                    log.info(f'{opt} {strike_opt[0]}: reconstructed entry price {entry_price:.2f} from order book')
+                else:
+                    try:
+                        entry_price = ers.option_ltp(market['option_chain'], strike_opt[0], opt)
+                    except (KeyError, TypeError):
+                        entry_price = 0.0
+                    log.warning(
+                        f"{opt} {strike_opt[0]}: couldn't reconstruct entry price from order book - "
+                        f"falling back to live LTP {entry_price:.2f} (not the actual fill price)"
+                    )
+                state[opt] = dict(instrument=instrument, strike=strike_opt[0], entry_price=entry_price, quantity=quantity)
+
+        adopted_premium = sum(leg['entry_price'] for leg in state.values() if leg is not None) or None
+        day['entry_premium'] = adopted_premium
+        day['prev_checkpoint_premium'] = adopted_premium
+        if adopted_premium is not None:
+            day['premium_history'] = [(datetime.now(), adopted_premium)]
+            alert(f'Adopted legs - reconstructed combined entry ~{adopted_premium:.2f}, used as the previous-checkpoint premium')
     elif late_start and entry_mode == ENTRY_MODE_HONOR_CHECKPOINTS:
         # Late start, honoring checkpoints (the default) - stay flat, no bookkeeping yet, until
         # the main loop below hits next_checkpoint and fires the deferred entry from there.
@@ -655,7 +786,7 @@ def run_day(symbol, trade_weekdays, entry_mode=DEFAULT_ENTRY_MODE):
         )
     else:
         log.info('No open positions - entering initial legs')
-        _enter_initial_day_legs(state, market, cfg, day)
+        _enter_initial_day_legs(state, market, cfg, day, symbol)
     reuse_entry_market = True  # the entry-time `market` above is still fresh - don't immediately
     # re-fetch it (and hammer /optionchain a second time within the same second) on loop pass 1
     poll_failure_count = 0
@@ -676,10 +807,10 @@ def run_day(symbol, trade_weekdays, entry_mode=DEFAULT_ENTRY_MODE):
             if not day['halted'] and now >= next_checkpoint:
                 if pending_initial_entry:
                     log.info('Checkpoint reached - firing the deferred initial entry')
-                    _enter_initial_day_legs(state, market, cfg, day)
+                    _enter_initial_day_legs(state, market, cfg, day, symbol)
                     pending_initial_entry = False
                 else:
-                    run_checkpoint(state, market, cfg, day)
+                    run_checkpoint(state, market, cfg, day, symbol)
                 next_checkpoint += checkpoint_interval
 
             if now >= next_heartbeat:

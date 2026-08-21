@@ -210,7 +210,7 @@ UNDERLYINGS = {
     ),
     'SENSEX': dict(
         dhan_security_id=51, dhan_segment='IDX_I', aliceblue_exchange='BFO',
-        strike_interval=100, lots=1,
+        strike_interval=100, lots=5,
     ),
 }
 # datetime.weekday(): Monday=0 ... Sunday=6. Days not listed here don't trade.
