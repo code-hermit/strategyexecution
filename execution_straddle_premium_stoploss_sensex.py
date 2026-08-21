@@ -1,8 +1,8 @@
 """
-Live execution: short SENSEX ATM straddles between 10:15 and 15:15, managed by combined-premium
+Live execution: short SENSEX ATM straddles between 10:15 and 15:13, managed by combined-premium
 and daily-loss stoplosses rather than a fixed per-leg stoploss percentage.
 
-Window: 10:15 (start/first entry) -> 15:15 (end/EOD square-off). Checkpoints on the hour-and-15:
+Window: 10:15 (start/first entry) -> 15:13 (end/EOD square-off). Checkpoints on the hour-and-15:
 10:15, 11:15, 12:15, 13:15, 14:15.
 
 At 10:15 (entry): short the ATM straddle (ATM CE + ATM PE).
@@ -27,7 +27,7 @@ At each checkpoint from 11:15 to 14:15, in priority order:
      is currently open at this point (e.g. flattened earlier by the combined stoploss or an earlier
      premium-rise), this step just opens a fresh ATM straddle instead of rolling one.
 
-At 15:15: force-close anything still open (EOD).
+At 15:13: force-close anything still open (EOD).
 
 Each leg also gets its own extreme-move stoploss at entry, LEG_STOPLOSS_POINTS away from that leg's
 entry price - a backstop independent of the combined/daily checks above, in case this process itself
@@ -81,7 +81,7 @@ CFG = dict(ers.UNDERLYINGS[SYMBOL], lots=5)
 STATE_FILE = os.path.join(os.path.dirname(__file__), 'execution_straddle_premium_stoploss_sensex_state.json')
 
 CHECKPOINT_TIMES = [dtime(10, 15), dtime(11, 15), dtime(12, 15), dtime(13, 15), dtime(14, 15)]
-EXIT_TIME = dtime(15, 15)  # EOD square-off
+EXIT_TIME = dtime(15, 13)  # EOD square-off
 
 COMBINED_STOPLOSS_POINTS = 50  # combined CE+PE premium move against entry that flattens the straddle
 DAILY_LOSS_LIMIT = -100  # realized + unrealized pnl (points) at which trading stops for the rest of the day

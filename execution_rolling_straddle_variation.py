@@ -200,7 +200,7 @@ except Exception:
 
 # ── Strategy config (mirrors backtest_rolling_straddle_variation.py) ───────────────────────────
 ENTRY_TIME = dtime(9, 45)
-EXIT_TIME = dtime(15, 15)
+EXIT_TIME = dtime(15, 13)
 CHECKPOINT_INTERVAL = timedelta(hours=1)
 POLL_INTERVAL_SECONDS = 30  # how often minute-level checks (stoploss-fill detection, optional
 # premium stoplosses, daily loss limit) run between hourly checkpoints
@@ -832,8 +832,29 @@ def run_day(symbol, trade_weekdays, entry_mode=DEFAULT_ENTRY_MODE):
     if not day['halted']:
         log.info(f'{EXIT_TIME} reached - squaring off any open positions')
     # Belt-and-braces square-off: goes through the broker's own position list rather than our
-    # local `state`, so it also cleans up anything local bookkeeping lost track of.
-    ers.exit_all_positions(symbol, cfg)
+    # local `state`, so it also cleans up anything local bookkeeping lost track of. It's safe to
+    # retry wholesale on failure - each call re-derives "what's still open" from the broker rather
+    # than local memory, and close_leg() cancels any resting exit order for a leg before replacing
+    # it, so a retry after a partial failure just re-squares-off whatever is still open rather than
+    # double-submitting. Unlike _resilient_call this isn't read-only (it places exit orders), so it
+    # gets its own loop here rather than reusing that helper. This is belt-and-braces itself: the
+    # very call that used to die uncaught on a plain /optionchain 429 and leave positions open for
+    # the rest of the day (see _resilient_call's docstring) - it must not go back to failing silently.
+    for attempt in range(RETRY_MAX_ATTEMPTS):
+        try:
+            ers.exit_all_positions(symbol, cfg)
+            break
+        except Exception as exc:
+            if attempt == RETRY_MAX_ATTEMPTS - 1:
+                alert(f'{symbol}: final square-off failed after {RETRY_MAX_ATTEMPTS} attempts - '
+                      f'positions may still be OPEN, check manually: {exc}', level=logging.CRITICAL)
+                raise
+            delay = RETRY_BASE_DELAY * (2 ** attempt)
+            log.warning(
+                f'exit_all_positions failed ({exc}) - retrying in {delay:.0f}s '
+                f'(attempt {attempt + 1}/{RETRY_MAX_ATTEMPTS})'
+            )
+            time_module.sleep(delay)
 
     alert(f'Rolling straddle (variation) done for {symbol} - realized pnl {day["realized_pnl"]:+.2f} points')
 

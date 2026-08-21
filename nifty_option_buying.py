@@ -2,13 +2,13 @@
 What it is: a standalone ATM-straddle buy strategy — no short leg anywhere in this file. NIFTY
 version of sensex_option_buying.py, same rules, tuned trigger/hold:
 
-Window: 10:15 (ENTRY_TIME) → 15:15 (EXIT_TIME, forced day-end square-off).
+Window: 10:15 (ENTRY_TIME) → 15:13 (EXIT_TIME, forced day-end square-off).
 
 Checkpoints: 10:15, 11:15, 12:15, 13:15, 14:15 (CHECK_TIMES). At each one, the combined ATM straddle premium (ATM CE close + ATM PE close) is recorded as the current baseline, overwriting whatever baseline the previous checkpoint set.
 
 Signal (checked every minute, not just at checkpoints): if the live combined ATM premium has risen SPIKE_POINTS = 15 points or more above the latest checkpoint's baseline, buy the ATM straddle (CE+PE) right then.
 
-Exit: hold for HOLD_MINUTES = 3 minutes, then exit at the first minute at/after that deadline (TIME_EXIT), or at day end if 15:15 arrives first (EOD).
+Exit: hold for HOLD_MINUTES = 3 minutes, then exit at the first minute at/after that deadline (TIME_EXIT), or at day end if 15:13 arrives first (EOD).
 
 Position sizing / concurrency rules:
 
@@ -152,7 +152,7 @@ CFG = dict(aliceblue_exchange='NFO', strike_interval=50, lots=3)
 STATE_FILE = os.path.join(os.path.dirname(__file__), 'nifty_option_buying_state.json')
 
 ENTRY_TIME = dtime(10, 15)  # strategy start
-EXIT_TIME = dtime(15, 15)  # day end / forced square-off
+EXIT_TIME = dtime(15, 13)  # day end / forced square-off
 CHECK_TIMES = (dtime(10, 15), dtime(11, 15), dtime(12, 15), dtime(13, 15), dtime(14, 15))
 SPIKE_POINTS = 15  # combined ATM premium rise above the latest checkpoint's baseline that triggers a buy
 HOLD_MINUTES = 3  # how long a triggered buy is held before being time-exited

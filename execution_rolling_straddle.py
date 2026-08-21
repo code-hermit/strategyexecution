@@ -1,6 +1,6 @@
 """
 Live execution: short an ATM straddle on current-week options at 9:45, 10:45, 11:45, 12:45,
-13:45 and 14:45, with a 30% stoploss on each leg. Any open positions are squared off by 15:15.
+13:45 and 14:45, with a 30% stoploss on each leg. Any open positions are squared off by 15:13.
 
 The underlying traded depends on the day of week (see UNDERLYINGS / WEEKDAY_UNDERLYING) -
 NIFTY on Monday/Tuesday, SENSEX on Wednesday/Thursday. No trading on other days.
@@ -190,7 +190,7 @@ ALICEBLUE_CONTRACT_MASTER_URL = 'https://v2api.aliceblueonline.com/restpy/static
 REQUEST_TIMEOUT = 10
 # cur_dtime=dtime(datetime.now().hour, datetime.now().minute)
 CHECKPOINT_TIMES = [dtime(9, 45), dtime(10, 45), dtime(11, 45), dtime(12, 45), dtime(13, 45), dtime(14, 45)]
-EXIT_TIME = dtime(15, 15)  # any open positions are squared off at (or immediately after) this time
+EXIT_TIME = dtime(15, 13)  # any open positions are squared off at (or immediately after) this time
 STOPLOSS_PCT = 0.30
 DAILY_LOSS_LIMIT = 100  # points, unscaled by lot size (matches backtest_rolling_straddle.py) -
 # once realized+unrealized pnl crosses -this, square off and stop re-entering for the rest of the day
