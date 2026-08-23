@@ -3,5 +3,4 @@
 /__pycache__
 /archive
 *.log
-*.json
 *.sh
