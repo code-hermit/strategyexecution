@@ -75,12 +75,23 @@ def lambda_handler(event, context):
             "commands": [
                 "timedatectl set-timezone Asia/Kolkata",
                 "dnf install -y python3 python3-pip git",
+                "sudo dnf install -y tmux",
                 "python3 -m pip install --upgrade pip",
                 "mkdir -p /home/ec2-user/trading",
                 f"git clone https://{github_pat}@github.com/code-hermit/strategyexecution.git /home/ec2-user/trading",
                 build_env_file_command("/home/ec2-user/trading/.env"),
                 "cd /home/ec2-user/trading && pip install -r requirements.txt",
                 "cd /home/ec2-user/trading && python3 dhan_generate_access_token.py",
+                "chmod +x /home/ec2-user/trading/execution_rolling_straddle_variation_mn_hs_fn.sh "
+                "/home/ec2-user/trading/sensex_buying.sh /home/ec2-user/trading/nifty_buying.sh",
+                (
+                    "crontab -l 2>/dev/null | grep -q option_selling || "
+                    "(crontab -l 2>/dev/null; "
+                    "echo \"45 9 * * * /usr/bin/tmux new-session -d -s option_selling '/home/ec2-user/trading/execution_rolling_straddle_variation_mn_hs_fn.sh'\"; "
+                    "echo \"15 10 * * * /usr/bin/tmux new-session -d -s sensex_buying '/home/ec2-user/trading/sensex_buying.sh'\"; "
+                    "echo \"15 10 * * * /usr/bin/tmux new-session -d -s nifty_buying '/home/ec2-user/trading/nifty_buying.sh'\") | crontab -"
+                ),
+
             ]
         }
     )
