@@ -1,4 +1,11 @@
 """
+MONDAY,FRIDAY - NIFTY
+THURSDAY - SENSEX
+
+MONDAY -NIFTY - 5 lots
+THURSDAY - SENSEX - 5 lots
+FRIDAY - NIFTY 3 lots
+
 Live execution of the "variation" strategy from backtest_rolling_straddle_variation.py:
 short a first-OTM strangle (FIRST_OTM_STRIKES away from ATM; 0 = ATM itself) at ENTRY_TIME,
 each leg with a resting STOPLOSS_PCT stoploss. Every CHECKPOINT_INTERVAL thereafter:
@@ -193,7 +200,7 @@ def _log_uncaught_exception(exc_type, exc_value, exc_tb):
 sys.excepthook = _log_uncaught_exception
 
 try:
-    import execution_rolling_straddle as ers
+    import execution_rolling_straddle_tn as ers
 except Exception:
     log.critical('Failed to import execution_rolling_straddle (Dhan/AliceBlue auth failed?)', exc_info=True)
     raise

@@ -1,6 +1,7 @@
 .env
 /execution
 /__pycache__
+/archive
 *.log
 *.json
 *.sh

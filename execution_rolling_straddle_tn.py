@@ -1,4 +1,6 @@
 """
+TUESDAY - NIFTY - 5 lots
+
 Live execution: short an ATM straddle on current-week options at 9:45, 10:45, 11:45, 12:45,
 13:45 and 14:45, with a 30% stoploss on each leg. Any open positions are squared off by 15:13.
 
