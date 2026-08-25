@@ -76,20 +76,27 @@ def lambda_handler(event, context):
                 "timedatectl set-timezone Asia/Kolkata",
                 "dnf install -y python3 python3-pip git",
                 "sudo dnf install -y tmux",
+                "dnf install -y cronie",
+                "systemctl enable --now crond",
                 "python3 -m pip install --upgrade pip",
                 "mkdir -p /home/ec2-user/trading",
                 f"git clone https://{github_pat}@github.com/code-hermit/strategyexecution.git /home/ec2-user/trading",
                 build_env_file_command("/home/ec2-user/trading/.env"),
                 "cd /home/ec2-user/trading && pip install -r requirements.txt",
                 "cd /home/ec2-user/trading && python3 dhan_generate_access_token.py",
+                # Everything up to here ran as root (SSM's default user), so
+                # /home/ec2-user/trading and the files inside it (including
+                # .env) are root-owned. Hand it back to ec2-user before wiring
+                # up cron, so the scripts can actually read .env when they run.
+                "chown -R ec2-user:ec2-user /home/ec2-user/trading",
                 "chmod +x /home/ec2-user/trading/execution_rolling_straddle_variation_mn_hs_fn.sh "
                 "/home/ec2-user/trading/sensex_buying.sh /home/ec2-user/trading/nifty_buying.sh",
                 (
-                    "crontab -l 2>/dev/null | grep -q option_selling || "
-                    "(crontab -l 2>/dev/null; "
+                    "crontab -u ec2-user -l 2>/dev/null | grep -q option_selling || "
+                    "(crontab -u ec2-user -l 2>/dev/null; "
                     "echo \"45 9 * * * /usr/bin/tmux new-session -d -s option_selling '/home/ec2-user/trading/execution_rolling_straddle_variation_mn_hs_fn.sh'\"; "
                     "echo \"15 10 * * * /usr/bin/tmux new-session -d -s sensex_buying '/home/ec2-user/trading/sensex_buying.sh'\"; "
-                    "echo \"15 10 * * * /usr/bin/tmux new-session -d -s nifty_buying '/home/ec2-user/trading/nifty_buying.sh'\") | crontab -"
+                    "echo \"15 10 * * * /usr/bin/tmux new-session -d -s nifty_buying '/home/ec2-user/trading/nifty_buying.sh'\") | crontab -u ec2-user -"
                 ),
 
             ]
