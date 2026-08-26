@@ -5,7 +5,7 @@ Live execution: short an ATM straddle on current-week options at 9:45, 10:45, 11
 13:45 and 14:45, with a 30% stoploss on each leg. Any open positions are squared off by 15:13.
 
 The underlying traded depends on the day of week (see UNDERLYINGS / WEEKDAY_UNDERLYING) -
-NIFTY on Monday/Tuesday, SENSEX on Wednesday/Thursday. No trading on other days.
+NIFTY (5 lots) on Tuesday only. No trading on other days, even if this script is run.
 
 At every checkpoint:
   - Fetch the underlying's spot LTP from Dhan, round to the nearest strike -> desired ATM CE/PE.
@@ -216,7 +216,7 @@ UNDERLYINGS = {
     ),
 }
 # datetime.weekday(): Monday=0 ... Sunday=6. Days not listed here don't trade.
-WEEKDAY_UNDERLYING = {0: 'NIFTY', 1: 'NIFTY', 2: 'SENSEX', 3: 'SENSEX'}
+WEEKDAY_UNDERLYING = {1: 'NIFTY'}  # Tuesday only
 
 FILL_POLL_TIMEOUT = 10
 FILL_POLL_INTERVAL = 1

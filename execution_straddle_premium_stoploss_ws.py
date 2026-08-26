@@ -1,4 +1,6 @@
 """
+WEDNESDAY - SENSEX - 5 lots. No trading on other days, even if this script is run.
+
 Live execution: short SENSEX ATM straddles between 10:15 and 15:13, managed by combined-premium
 and daily-loss stoplosses rather than a fixed per-leg stoploss percentage.
 
@@ -73,6 +75,7 @@ import execution_rolling_straddle_tn as ers
 log = ers.log
 
 SYMBOL = 'SENSEX'
+TRADE_WEEKDAY = 'Wednesday'  # the only day this strategy trades - see module docstring
 # Copy rather than reuse ers.UNDERLYINGS[SYMBOL] directly - this strategy trades 5 lots, but that
 # dict is shared module state; mutating it in place would also change execution_rolling_straddle
 # (and anything else importing it, e.g. day_end_straddle_buy.py) out from under them.
@@ -639,6 +642,10 @@ def run_checkpoint(state, checkpoint_label, is_entry_checkpoint):
 
 def run_day():
     global _next_status_ping
+    today_name = datetime.now().strftime('%A')
+    if today_name != TRADE_WEEKDAY:
+        log.info(f'{today_name} is not {TRADE_WEEKDAY} - {SYMBOL} premium-stoploss strategy does not trade today')
+        return
     state = _load_state()
     log.info(f'Starting {SYMBOL} premium-stoploss execution for {state["date"]} - {_status_line(state)}')
     _next_status_ping = time_module.time() + STATUS_PING_INTERVAL.total_seconds()

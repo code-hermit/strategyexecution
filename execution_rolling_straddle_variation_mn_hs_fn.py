@@ -6,6 +6,9 @@ MONDAY -NIFTY - 5 lots
 THURSDAY - SENSEX - 5 lots
 FRIDAY - NIFTY 3 lots
 
+(Default when run with no command-line arguments - see WEEKDAY_SYMBOL/DEFAULT_TRADE_WEEKDAYS.
+No trading Tuesday/Wednesday by default.)
+
 Live execution of the "variation" strategy from backtest_rolling_straddle_variation.py:
 short a first-OTM strangle (FIRST_OTM_STRIKES away from ATM; 0 = ATM itself) at ENTRY_TIME,
 each leg with a resting STOPLOSS_PCT stoploss. Every CHECKPOINT_INTERVAL thereafter:
@@ -40,9 +43,12 @@ day_end_straddle_buy.py does. Importing it runs its Dhan/AliceBlue auth checks a
 same DRY_RUN env var and no-MARKET-orders policy (LIMIT entries/exits 1% through LTP, SL orders
 capped 1% beyond trigger).
 
-Trades a single underlying (command-line arg, default NIFTY) on TRADE_WEEKDAYS (command-line
-weekday codes, default every weekday) - unlike execution_rolling_straddle.py's per-weekday
-underlying switch, matching how backtest_rolling_straddle_variation.py is invoked.
+Trades a single underlying (command-line arg) on TRADE_WEEKDAYS (command-line weekday codes) -
+unlike execution_rolling_straddle.py's per-weekday underlying switch, matching how
+backtest_rolling_straddle_variation.py is invoked. When neither is given on the command line, the
+default (see WEEKDAY_SYMBOL/DEFAULT_TRADE_WEEKDAYS below) is: NIFTY x5 lots on Monday, SENSEX x5
+lots on Thursday, NIFTY x3 lots on Friday (via LOTS_OVERRIDE) - no trading Tuesday/Wednesday.
+Passing an explicit symbol/weekday-codes pair overrides this entirely, the same as before.
 
 Logging: every checkpoint/poll decision goes to execution_rolling_straddle_variation.log and
 stdout. Lifecycle events (day start/skip, entries, exits, rolls, stoploss fills, halts, day
@@ -254,6 +260,15 @@ CHECKPOINT_INTERVAL_OVERRIDE = {
 
 OPTION_TYPES = ('CE', 'PE')
 DAY_CODE_TO_WEEKDAY = {'m': 'Monday', 't': 'Tuesday', 'w': 'Wednesday', 'h': 'Thursday', 'f': 'Friday'}
+
+# Default per-weekday underlying, used when no symbol is given on the command line - Monday/
+# Thursday/Friday only, per LOTS_OVERRIDE above (Friday NIFTY is 3 lots, everything else here is
+# the ers.UNDERLYINGS default of 5). Tuesday/Wednesday aren't listed - no default trading those
+# days (covered by execution_rolling_straddle_tn.py / execution_straddle_premium_stoploss_ws.py
+# instead). An explicit symbol argument bypasses this mapping entirely.
+WEEKDAY_SYMBOL = {'Monday': 'NIFTY', 'Thursday': 'SENSEX', 'Friday': 'NIFTY'}
+DEFAULT_TRADE_WEEKDAYS = set(WEEKDAY_SYMBOL)  # trade only these days when neither symbol nor
+# weekday codes are given on the command line
 
 
 def _parse_trade_weekdays(codes):
@@ -867,8 +882,16 @@ def run_day(symbol, trade_weekdays, entry_mode=DEFAULT_ENTRY_MODE):
 
 
 if __name__ == '__main__':
-    SYMBOL = sys.argv[1].upper() if len(sys.argv) > 1 else 'NIFTY'
-    TRADE_WEEKDAYS = _parse_trade_weekdays(sys.argv[2] if len(sys.argv) > 2 else None)
+    # No symbol given on the command line -> fall back to today's default underlying
+    # (WEEKDAY_SYMBOL) and restrict trading to Monday/Thursday/Friday (DEFAULT_TRADE_WEEKDAYS),
+    # rather than always defaulting to NIFTY on every weekday. An explicit symbol argument (and/or
+    # weekday-codes argument) overrides this the same as before.
+    _today_name = datetime.now().strftime('%A')
+    SYMBOL = sys.argv[1].upper() if len(sys.argv) > 1 and sys.argv[1] else WEEKDAY_SYMBOL.get(_today_name, 'NIFTY')
+    if len(sys.argv) > 2 and sys.argv[2]:
+        TRADE_WEEKDAYS = _parse_trade_weekdays(sys.argv[2])
+    else:
+        TRADE_WEEKDAYS = DEFAULT_TRADE_WEEKDAYS
     ENTRY_MODE = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_ENTRY_MODE
     if ENTRY_MODE not in ENTRY_MODES:
         raise ValueError(f'unknown entry mode {ENTRY_MODE!r} - use one of {ENTRY_MODES}')
