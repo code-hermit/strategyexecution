@@ -89,25 +89,22 @@ def lambda_handler(event, context):
                 # .env) are root-owned. Hand it back to ec2-user before wiring
                 # up cron, so the scripts can actually read .env when they run.
                 "chown -R ec2-user:ec2-user /home/ec2-user/trading",
-                "chmod +x /home/ec2-user/trading/execution_rolling_straddle_variation_mn_hs_fn.sh "
-                "/home/ec2-user/trading/execution_rolling_straddle_tn.sh "
-                "/home/ec2-user/trading/execution_straddle_premium_stoploss_ws.sh "
-                "/home/ec2-user/trading/sensex_buying.sh /home/ec2-user/trading/nifty_buying.sh",
+                "chmod +x /home/ec2-user/trading/exec_rsv_cont.sh "
+                "/home/ec2-user/trading/exec_rs_ps.sh "
+                "/home/ec2-user/trading/sensex_buying.sh",
                 # One cron line per weekday's strategy, rather than one daily line for
-                # execution_rolling_straddle_variation_mn_hs_fn.sh - each script also refuses to
-                # trade outside its own day(s) if invoked on the wrong day, but restricting the
-                # cron day-of-week field too means the wrong tmux session never even spins up:
-                #   Mon/Thu/Fri (1,4,5) 9:45 -> execution_rolling_straddle_variation_mn_hs_fn.sh (NIFTY/SENSEX/NIFTY)
-                #   Tue (2)              9:45 -> execution_rolling_straddle_tn.sh (NIFTY)
-                #   Wed (3)             10:15 -> execution_straddle_premium_stoploss_ws.sh (SENSEX)
+                # exec_rsv_cont.sh - each script also refuses to trade outside its own
+                # day(s) if invoked on the wrong day, but restricting the cron
+                # day-of-week field too means the wrong tmux session never even spins up:
+                #   Mon/Wed/Thu/Fri (1,3,4,5) 9:45 -> exec_rsv_cont.sh
+                #   Tue (2)                    9:45 -> exec_rs_ps.sh
+                #   All days                  10:15 -> sensex_buying.sh
                 (
                     "crontab -u ec2-user -l 2>/dev/null | grep -q option_selling || "
                     "(crontab -u ec2-user -l 2>/dev/null; "
-                    "echo \"45 9 * * 1,4,5 /usr/bin/tmux new-session -d -s option_selling '/home/ec2-user/trading/execution_rolling_straddle_variation_mn_hs_fn.sh'\"; "
-                    "echo \"45 9 * * 2 /usr/bin/tmux new-session -d -s option_selling_tn '/home/ec2-user/trading/execution_rolling_straddle_tn.sh'\"; "
-                    "echo \"15 10 * * 3 /usr/bin/tmux new-session -d -s option_selling_ws '/home/ec2-user/trading/execution_straddle_premium_stoploss_ws.sh'\"; "
-                    "echo \"15 10 * * * /usr/bin/tmux new-session -d -s sensex_buying '/home/ec2-user/trading/sensex_buying.sh'\"; "
-                    "echo \"15 10 * * * /usr/bin/tmux new-session -d -s nifty_buying '/home/ec2-user/trading/nifty_buying.sh'\") | crontab -u ec2-user -"
+                    "echo \"45 9 * * 1,3,4,5 /usr/bin/tmux new-session -d -s option_selling '/home/ec2-user/trading/exec_rsv_cont.sh'\"; "
+                    "echo \"45 9 * * 2 /usr/bin/tmux new-session -d -s option_selling_tn '/home/ec2-user/trading/exec_rs_ps.sh'\"; "
+                    "echo \"15 10 * * * /usr/bin/tmux new-session -d -s sensex_buying '/home/ec2-user/trading/sensex_buying.sh'\") | crontab -u ec2-user -"
                 ),
 
             ]
