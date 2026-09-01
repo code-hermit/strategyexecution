@@ -78,6 +78,12 @@ def lambda_handler(event, context):
                 "sudo dnf install -y tmux",
                 "dnf install -y cronie",
                 "systemctl enable --now crond",
+                # Redis backs zerodha_ltp_client.py's shared LTP cache (see zerodha_ticker_service.py) -
+                # redis6 is Amazon Linux 2023's package name; fall back to plain "redis" for any other
+                # dnf-based AMI. Binds to localhost by default (the package's stock config), which is
+                # all every script here needs - they all run on this same instance.
+                "dnf install -y redis6 || dnf install -y redis",
+                "systemctl enable --now redis6 2>/dev/null || systemctl enable --now redis",
                 "python3 -m pip install --upgrade pip",
                 "mkdir -p /home/ec2-user/trading",
                 f"git clone https://{github_pat}@github.com/code-hermit/strategyexecution.git /home/ec2-user/trading",
@@ -91,17 +97,21 @@ def lambda_handler(event, context):
                 "chown -R ec2-user:ec2-user /home/ec2-user/trading",
                 "chmod +x /home/ec2-user/trading/exec_rsv_cont.sh "
                 "/home/ec2-user/trading/exec_rs_ps.sh "
-                "/home/ec2-user/trading/sensex_buying.sh",
+                "/home/ec2-user/trading/sensex_buying.sh "
+                "/home/ec2-user/trading/zerodha_ticker_service.sh",
                 # One cron line per weekday's strategy, rather than one daily line for
                 # exec_rsv_cont.sh - each script also refuses to trade outside its own
                 # day(s) if invoked on the wrong day, but restricting the cron
                 # day-of-week field too means the wrong tmux session never even spins up:
-                #   Mon/Wed/Thu/Fri (1,3,4,5) 9:45 -> exec_rsv_cont.sh
-                #   Tue (2)                    9:45 -> exec_rs_ps.sh
-                #   All days                  10:15 -> sensex_buying.sh
+                #   Mon-Fri (1,2,3,4,5)         9:42 -> zerodha_ticker_service.sh (started first,
+                #                                       so its Redis feed is already warm by 9:45)
+                #   Mon/Wed/Thu/Fri (1,3,4,5)   9:45 -> exec_rsv_cont.sh
+                #   Tue (2)                     9:45 -> exec_rs_ps.sh
+                #   All days                   10:15 -> sensex_buying.sh
                 (
                     "crontab -u ec2-user -l 2>/dev/null | grep -q option_selling || "
                     "(crontab -u ec2-user -l 2>/dev/null; "
+                    "echo \"42 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s zerodha_ticker '/home/ec2-user/trading/zerodha_ticker_service.sh'\"; "
                     "echo \"45 9 * * 1,3,4,5 /usr/bin/tmux new-session -d -s option_selling '/home/ec2-user/trading/exec_rsv_cont.sh'\"; "
                     "echo \"45 9 * * 2 /usr/bin/tmux new-session -d -s option_selling_tn '/home/ec2-user/trading/exec_rs_ps.sh'\"; "
                     "echo \"15 10 * * * /usr/bin/tmux new-session -d -s sensex_buying '/home/ec2-user/trading/sensex_buying.sh'\") | crontab -u ec2-user -"

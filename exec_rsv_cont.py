@@ -75,12 +75,16 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time as time_module
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time as dtime, timedelta, timezone
 from typing import NamedTuple
 
 import requests
 from dotenv import load_dotenv
+
+import zerodha_ltp_client
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
@@ -185,7 +189,10 @@ DRY_RUN = os.getenv('DRY_RUN', 'true').lower() != 'false'  # set DRY_RUN=false t
 ENTRY_TIME = dtime(9, 45)
 EXIT_TIME = dtime(15, 13)  # 2-min live-trading safety buffer before the backtest's literal 15:15
 CHECKPOINT_INTERVAL = timedelta(hours=1)
-POLL_INTERVAL_SECONDS = 30
+POLL_INTERVAL_SECONDS = 15  # was 30 - halved after the 31 Aug 2026 review found up to ~30s of pure
+# detection lag (a checkpoint/stoploss-fill notice waiting for the next poll) compounding with
+# fill-wait/retry delays into multi-minute-late exits (see notes.md) - 15s roughly halves that
+# worst case while staying well above the API throttle floor below (DEFAULT_MIN_CALL_INTERVAL).
 HEARTBEAT_INTERVAL = timedelta(minutes=30)
 
 FIRST_OTM_STRIKES = 0  # 0 = ATM; n = n strikes OTM (CE up, PE down)
@@ -312,15 +319,17 @@ def _load_zerodha_current_week_options(symbol, cfg):
     return opts
 
 
-def _zerodha_tradingsymbol(zerodha_options, strike, option_type):
+def _zerodha_option_row(zerodha_options, strike, option_type):
     for row in zerodha_options:
         if int(float(row['strike'])) == strike and row['instrument_type'] == option_type:
-            return row['tradingsymbol']
+            return row
     raise KeyError(f'no Zerodha instrument found for strike={strike} type={option_type}')
 
 
 def _zerodha_quote_ltp(instrument_keys):
-    """instrument_keys like ['NSE:NIFTY 50', 'NFO:NIFTY25813950CE']. Returns key -> last_price."""
+    """instrument_keys like ['NSE:NIFTY 50', 'NFO:NIFTY25813950CE']. Returns key -> last_price.
+    REST only - the hot path is zerodha_ltp_client.py's shared Redis cache (see below); this is
+    passed to it as the rest_fetch/rest_fetch_batch fallback callable."""
     resp = requests.get(
         f'{ZERODHA_BASE_URL}/quote/ltp', headers=_zerodha_headers(ZERODHA_ACCESS_TOKEN),
         params=[('i', k) for k in instrument_keys], timeout=REQUEST_TIMEOUT,
@@ -330,9 +339,39 @@ def _zerodha_quote_ltp(instrument_keys):
     return {k: float(v['last_price']) for k, v in data.items()}
 
 
-def get_spot_ltp(cfg):
+_zerodha_spot_token_cache = {}  # cfg['zerodha_spot_instrument'] -> {'date', 'token'}
+
+
+def _zerodha_spot_token(cfg):
+    """This underlying's spot index instrument_token (needed to read/subscribe it via the shared
+    Redis cache) - looked up once per day per underlying from the relevant exchange's instrument
+    dump, same caching pattern as _load_zerodha_current_week_options above."""
     key = cfg['zerodha_spot_instrument']
-    return _zerodha_quote_ltp([key])[key]
+    today = _today_str()
+    cached = _zerodha_spot_token_cache.get(key)
+    if cached and cached['date'] == today:
+        return cached['token']
+
+    exchange, tradingsymbol = key.split(':', 1)
+    resp = requests.get(f'{ZERODHA_BASE_URL}/instruments/{exchange}', headers=_zerodha_headers(ZERODHA_ACCESS_TOKEN), timeout=30)
+    resp.raise_for_status()
+    rows = list(csv.DictReader(io.StringIO(resp.text)))
+    for row in rows:
+        if row.get('segment') == 'INDICES' and row.get('tradingsymbol') == tradingsymbol:
+            token = int(row['instrument_token'])
+            _zerodha_spot_token_cache[key] = {'date': today, 'token': token}
+            return token
+    raise RuntimeError(f'{tradingsymbol} index instrument_token not found on Zerodha {exchange} dump')
+
+
+def get_spot_ltp(cfg):
+    """Live spot LTP via the shared Redis cache (REST fallback baked in - see
+    zerodha_ltp_client.get_ltp). Registers the spot token with the ticker service first
+    (harmless/no-op if already registered, or if Redis is down)."""
+    key = cfg['zerodha_spot_instrument']
+    token = _zerodha_spot_token(cfg)
+    zerodha_ltp_client.register_subscription(token)
+    return zerodha_ltp_client.get_ltp(token, rest_fetch=lambda: _zerodha_quote_ltp([key])[key], log=log)
 
 
 # ── AliceBlue (REST, v3 open-api) - order placement only ────────────────────────────────────────
@@ -340,11 +379,25 @@ ALICEBLUE_TOKEN_FILE = os.path.join(os.path.dirname(__file__), 'aliceblue_token.
 ALICEBLUE_BASE_URL = 'https://a3.aliceblueonline.com/open-api/od/v1'
 ALICEBLUE_CONTRACT_MASTER_URL = 'https://v2api.aliceblueonline.com/restpy/static/contract_master/V2/{exchange}'
 LIMIT_OFFSET_PCT = 0.05  # limit price offset from LTP: below LTP for SELL, above LTP for BUY -
-# matches execution_rolling_straddle_tn.py's rolling-straddle-family value
+# matches execution_rolling_straddle_tn.py's rolling-straddle-family value. Entries and the resting
+# SL still use this fixed offset unchanged - only EXITS chase (see EXIT_CHASE_* below), since
+# getting OUT fast is the priority once we've already decided to close, not getting a clean price.
 FILL_POLL_TIMEOUT = 10
 FILL_POLL_INTERVAL = 1
 TERMINAL_ORDER_STATUSES = {'complete', 'rejected', 'cancelled'}
 _ALICEBLUE_EMPTY_RESULT_STATUSES = {'EC920'}
+
+# Exit chase: once we've decided to close a leg, priority is getting OUT, not a clean fill price -
+# see notes.md's 14:45->14:55:51 NIFTY CE walkthrough, where a single passive LIMIT order got
+# stuck chasing a fast move for ~10 minutes. Give a resting exit LIMIT order EXIT_CHASE_WAIT_SECONDS
+# to fill; if it hasn't, cancel it and replace at a wider (more aggressive) offset, repeating with
+# the offset escalating by EXIT_CHASE_OFFSET_STEP each round, capped at EXIT_CHASE_MAX_OFFSET_PCT
+# (by then effectively marketable, though still technically a LIMIT - the broker rejects MARKET
+# orders on these NFO options, EC965).
+EXIT_CHASE_WAIT_SECONDS = 2
+EXIT_CHASE_POLL_INTERVAL = 0.5
+EXIT_CHASE_OFFSET_STEP = 0.05
+EXIT_CHASE_MAX_OFFSET_PCT = 0.50
 
 
 def _aliceblue_headers(session_id):
@@ -484,6 +537,29 @@ def _cancel_order(broker_order_id):
     return _aliceblue_post('/orders/cancel', {'brokerOrderId': broker_order_id})
 
 
+def _modify_order(broker_order_id, instrument, quantity, order_type, price, trigger_price=None):
+    """Reprices a resting order in place via AliceBlue's /orders/modifyorder, mirroring
+    _place_order's payload shape plus the brokerOrderId identifying which order to change.
+    CAUTION: mcx_option_buying.py and mcx_short_straddle_premium_stoploss.py elsewhere in this
+    folder both document this same endpoint returning a live 400 Bad Request against the payload
+    shape they sent, and fell back to cancel+place-new. This may hit the same wall - see
+    _exit_chase_fill below, which tries this first but falls back to cancel+place-new the first
+    time this raises, so a modify rejection can never leave a live exit stuck."""
+    payload = {
+        'brokerOrderId': broker_order_id,
+        'exchange': instrument.exchange,
+        'instrumentId': str(instrument.token),
+        'quantity': quantity,
+        'product': 'INTRADAY',
+        'orderComplexity': 'REGULAR',
+        'orderType': order_type,
+        'validity': 'DAY',
+        'price': str(price),
+        'slTriggerPrice': str(trigger_price) if trigger_price is not None else '',
+    }
+    return _aliceblue_post('/orders/modifyorder', payload)
+
+
 def _wait_for_fill_price(broker_order_id):
     deadline = time_module.time() + FILL_POLL_TIMEOUT
     while time_module.time() < deadline:
@@ -497,6 +573,99 @@ def _wait_for_fill_price(broker_order_id):
                 return float(o.get('averageTradedPrice') or 0)
         time_module.sleep(FILL_POLL_INTERVAL)
     raise TimeoutError(f'order {broker_order_id} not filled within {FILL_POLL_TIMEOUT}s')
+
+
+def _poll_order_status(broker_order_id, deadline):
+    """One EXIT_CHASE-style poll pass: checks the order book (at most once every
+    EXIT_CHASE_POLL_INTERVAL) until `deadline` (a time_module.time() value) for `broker_order_id`
+    to go terminal. Returns the fill price on completion, raises on rejection, or returns None if
+    `deadline` passed with the order still resting (caller decides whether to chase further)."""
+    while time_module.time() < deadline:
+        for o in _order_book():
+            if o.get('brokerOrderId') != broker_order_id:
+                continue
+            status = str(o.get('orderStatus', '')).lower()
+            if status == 'rejected':
+                raise RuntimeError(f'order {broker_order_id} rejected: {o.get("rejectionReason")}')
+            if status == 'complete':
+                return float(o.get('averageTradedPrice') or 0)
+        time_module.sleep(min(EXIT_CHASE_POLL_INTERVAL, max(0, deadline - time_module.time())))
+    return None
+
+
+def _exit_chase_fill(instrument, transaction_type, quantity, get_fresh_ltp, order_tag):
+    """Place an exit LIMIT order and, if it hasn't filled within EXIT_CHASE_WAIT_SECONDS, REPRICE
+    it wider in place via AliceBlue's modify-order endpoint (_modify_order) rather than
+    cancel+place-new - modifying a resting order doesn't waste the round trip of tearing one down
+    and re-establishing another. Repeats, offset escalating each round up to
+    EXIT_CHASE_MAX_OFFSET_PCT, until it fills - see EXIT_CHASE_* constants' comment: once we've
+    decided to exit, speed matters more than price.
+
+    Falls back to cancel+place-new if modify itself fails: see _modify_order's docstring - two
+    other scripts in this folder document AliceBlue's /orders/modifyorder returning a live 400
+    against the payload shape they sent, so this may hit the same wall. The FIRST modify failure
+    latches this exit onto cancel+place-new for every remaining attempt (never bounces back), so a
+    broker-side modify rejection can never leave a live exit stuck retrying the same broken path.
+
+    `transaction_type` is 'BUY' (closing a short, price moves UP each round) or 'SELL' (closing a
+    long, price moves DOWN each round). `get_fresh_ltp` is a zero-arg callable - re-fetched every
+    attempt, never reused stale."""
+    sign = 1 if transaction_type == 'BUY' else -1
+    offset_pct = LIMIT_OFFSET_PCT
+
+    ltp = get_fresh_ltp()
+    if ltp is None:
+        raise RuntimeError(f'{instrument.name}: no LTP available to place exit order')
+    price = _round_to_tick(ltp * (1 + sign * offset_pct), instrument.tick_size)
+    order = _place_order(transaction_type, instrument, quantity, 'LIMIT', price=str(price), order_tag=order_tag)
+    order_no = order.get('brokerOrderId')
+    if not order_no:
+        raise RuntimeError(f'{instrument.name} exit order rejected: {order}')
+
+    attempt = 1
+    modify_broken = False  # latched True on the first _modify_order failure - see docstring
+
+    while True:
+        fill_price = _poll_order_status(order_no, time_module.time() + EXIT_CHASE_WAIT_SECONDS)
+        if fill_price is not None:
+            if attempt > 1:
+                log.info(f'{instrument.name} exit filled on attempt {attempt} at offset {offset_pct:.0%}')
+            return fill_price
+
+        attempt += 1
+        offset_pct = min(offset_pct + EXIT_CHASE_OFFSET_STEP, EXIT_CHASE_MAX_OFFSET_PCT)
+        ltp = get_fresh_ltp()
+        if ltp is None:
+            raise RuntimeError(f'{instrument.name}: no LTP available to reprice exit order')
+        price = _round_to_tick(ltp * (1 + sign * offset_pct), instrument.tick_size)
+
+        if not modify_broken:
+            log.warning(
+                f'{instrument.name} exit not filled within {EXIT_CHASE_WAIT_SECONDS}s '
+                f'(attempt {attempt}, offset {offset_pct:.0%}) - modifying resting order to {price}',
+            )
+            try:
+                _modify_order(order_no, instrument, quantity, 'LIMIT', price)
+                continue  # same order_no - poll it again next loop
+            except Exception as exc:
+                modify_broken = True
+                log.warning(
+                    f'{instrument.name}: modify of order {order_no} failed ({exc}) - falling back '
+                    f'to cancel+place-new for the rest of this exit',
+                )
+
+        log.warning(
+            f'{instrument.name} exit not filled within {EXIT_CHASE_WAIT_SECONDS}s '
+            f'(attempt {attempt}, offset {offset_pct:.0%}) - cancelling and re-pricing more aggressively',
+        )
+        try:
+            _cancel_order(order_no)
+        except Exception as exc:
+            log.warning(f'{instrument.name}: cancel of unfilled exit order {order_no} failed ({exc}) - placing a fresh order anyway')
+        order = _place_order(transaction_type, instrument, quantity, 'LIMIT', price=str(price), order_tag=order_tag)
+        order_no = order.get('brokerOrderId')
+        if not order_no:
+            raise RuntimeError(f'{instrument.name} exit order rejected: {order}')
 
 
 def get_open_legs(contracts_by_token):
@@ -573,16 +742,25 @@ def _fetch_market(symbol, cfg, state):
             strike_types_needed.add((leg['strike'], opt))
 
     key_to_strike_type = {}
+    token_to_key = {}
     for strike, opt in strike_types_needed:
         try:
-            symbol_name = _zerodha_tradingsymbol(zerodha_options, strike, opt)
+            row = _zerodha_option_row(zerodha_options, strike, opt)
         except KeyError:
             log.warning(f'{opt} {strike}: no Zerodha instrument found - skipping this quote')
             continue
-        key_to_strike_type[f"{cfg['zerodha_options_exchange']}:{symbol_name}"] = (strike, opt)
+        key = f"{cfg['zerodha_options_exchange']}:{row['tradingsymbol']}"
+        key_to_strike_type[key] = (strike, opt)
+        token_to_key[int(row['instrument_token'])] = key
 
-    quotes = _resilient_call(_zerodha_quote_ltp, list(key_to_strike_type)) if key_to_strike_type else {}
-    price = {key_to_strike_type[k]: v for k, v in quotes.items() if k in key_to_strike_type}
+    # Redis first (shared ticker service feed - see zerodha_ltp_client.py), one batched REST call
+    # via _zerodha_quote_ltp for whatever's missing/stale - same batched-fallback efficiency this
+    # had before, just Redis-fast for the common case instead of a REST round trip every poll.
+    zerodha_ltp_client.register_subscriptions(list(token_to_key))
+    token_to_price = zerodha_ltp_client.get_ltps(
+        token_to_key, rest_fetch_batch=lambda keys: _resilient_call(_zerodha_quote_ltp, keys), log=log,
+    ) if token_to_key else {}
+    price = {key_to_strike_type[token_to_key[token]]: p for token, p in token_to_price.items()}
 
     return dict(
         spot=spot, atm=atm, desired_strike=desired_strike,
@@ -662,11 +840,48 @@ def _short_leg_with_stoploss(instrument, quantity, ltp):
     return entry_price
 
 
+def _run_legs_in_parallel(tasks):
+    """Run one no-arg callable per leg (keyed by 'CE'/'PE') concurrently instead of one after
+    another. Every broker call in this file is I/O (REST + up to FILL_POLL_TIMEOUT of polling for
+    a fill), so entering/closing two legs serially was pure wasted latency - up to a full
+    FILL_POLL_TIMEOUT per extra leg on every multi-leg entry/exit, which is exactly what turned
+    the 31 Aug 2026 10:45 checkpoint's close into a 10:47:08 fill (see notes.md). Every leg is
+    always given the chance to run even if another one raises; if any did, the first exception is
+    re-raised afterwards (matching the existing single-leg behaviour, so the caller's normal
+    retry/alert path still fires) - but only after every other leg's order has already gone in,
+    never skipped because a sibling leg failed first."""
+    if not tasks:
+        return {}
+    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+        futures = {opt: pool.submit(fn) for opt, fn in tasks.items()}
+        results, errors = {}, {}
+        for opt, fut in futures.items():
+            try:
+                results[opt] = fut.result()
+            except Exception as exc:
+                errors[opt] = exc
+    if errors:
+        raise next(iter(errors.values()))
+    return results
+
+
 def _enter_leg(state, opt, instrument, ltp, strike, cfg):
     quantity = instrument.lot_size * cfg['lots']
     entry_price = _short_leg_with_stoploss(instrument, quantity, ltp)
-    state[opt] = dict(instrument=instrument, strike=strike, entry_price=entry_price, quantity=quantity)
+    with _state_lock:  # see _state_lock's comment - races the SL-watch thread's own clear
+        state[opt] = dict(instrument=instrument, strike=strike, entry_price=entry_price, quantity=quantity)
     alert(f'ENTER {opt} {instrument.name} x{quantity} @ ~{entry_price} (SL {STOPLOSS_PCT:.0%})')
+
+
+def _enter_legs_parallel(state, desired, cfg, only_missing=False):
+    """Enter every (or, with only_missing, every currently-flat) leg in `desired` at once rather
+    than one after another - see _run_legs_in_parallel."""
+    tasks = {
+        opt: (lambda opt=opt, instrument=instrument, ltp=ltp, strike=strike: _enter_leg(state, opt, instrument, ltp, strike, cfg))
+        for opt, (instrument, ltp, strike) in desired.items()
+        if not only_missing or state[opt] is None
+    }
+    _run_legs_in_parallel(tasks)
 
 
 def _close_leg(state, opt, market, cfg, reason):
@@ -677,58 +892,156 @@ def _close_leg(state, opt, market, cfg, reason):
     if exit_ltp is None:
         log.warning(f'{opt} {leg["strike"]}: no live quote to close against, leaving position open')
         return None
-    _close_leg_order(leg['instrument'], leg['quantity'])
-    pnl = leg['entry_price'] - exit_ltp
-    alert(f'EXIT {opt} {leg["instrument"].name} @ ~{exit_ltp} (entry ~{leg["entry_price"]}) pnl~{pnl:+.2f} reason={reason}')
+    fill_price = _close_leg_order(leg['instrument'], leg['quantity'], fallback_ltp=exit_ltp)
+    # prefer the ACTUAL fill price for pnl/alert once we have one - the exit chase (see
+    # _close_leg_order) can land well away from `exit_ltp`, the price at the moment we merely
+    # decided to close, so reporting off that decision-time snapshot would misstate the real pnl.
+    realized_exit = fill_price if fill_price is not None else exit_ltp
+    pnl = leg['entry_price'] - realized_exit
+    alert(f'EXIT {opt} {leg["instrument"].name} @ ~{realized_exit} (entry ~{leg["entry_price"]}) pnl~{pnl:+.2f} reason={reason}')
     state[opt] = None
     return pnl
 
 
-def _close_leg_order(instrument, quantity):
-    """Cancel any resting order on this instrument (the SL from entry) then BUY at a LIMIT price
-    through the LTP to square off. Uses a fresh quote at close time rather than the one passed in
-    by the caller - avoids placing against a stale price if a retry happened."""
-    ltp = None
+SL_TRIGGER_BELOW_LTP_PCT = 0.01  # how far below current LTP to drop a resting BUY SL's trigger -
+# guarantees the "price >= trigger" condition is already true (not marginal/racy against the next
+# tick), so the broker releases it immediately instead of continuing to wait for price to reach it
+SL_RELEASE_PRICE_MIN_ABOVE_LTP_PCT = 0.01  # the released order's own limit price floor, as a % above LTP
+SL_RELEASE_PRICE_MIN_POINTS_ABOVE_LTP = 10  # ...or this many points above LTP, whichever is higher
+
+
+def _convert_resting_sl_to_market_exit(instrument, quantity, get_fresh_ltp):
+    """Every short leg here always has a resting BUY-side SL order protecting it from the moment
+    it's entered (_short_leg_with_stoploss) - so closing it doesn't need to cancel that order and
+    place a fresh one at all. Instead, MODIFY the SAME resting SL in place: drop its trigger price
+    to just below the current LTP (the "price >= trigger" condition is then already satisfied, so
+    the broker releases it immediately rather than waiting for price to actually reach it) and set
+    its release price aggressively - max(1% above LTP, LTP+10 points) - so the released BUY LIMIT
+    is priced well through the touch and fills essentially instantly. One modify call, and the leg
+    is never left unprotected in between (no cancel-then-place gap) - see EXIT_CHASE_* elsewhere
+    for the cancel+place-new fallback this is preferred over.
+
+    Returns the fill price if this worked, or None if there's no resting order to convert, the
+    modify itself failed (see _modify_order's docstring - a documented risk with this broker), or
+    it didn't fill within EXIT_CHASE_WAIT_SECONDS anyway - in every None case the caller falls back
+    to the ordinary cancel+chase path in _close_leg_order below."""
+    resting_order_id = None
+    for o in _order_book():
+        if str(o.get('instrumentId')) == str(instrument.token) and str(o.get('orderStatus', '')).lower() not in TERMINAL_ORDER_STATUSES:
+            resting_order_id = o.get('brokerOrderId')
+            break
+    if resting_order_id is None:
+        return None
+
+    ltp = get_fresh_ltp()
+    if ltp is None:
+        return None
+    trigger_price = round(ltp * (1 - SL_TRIGGER_BELOW_LTP_PCT), 1)
+    release_price = _round_to_tick(
+        max(ltp * (1 + SL_RELEASE_PRICE_MIN_ABOVE_LTP_PCT), ltp + SL_RELEASE_PRICE_MIN_POINTS_ABOVE_LTP),
+        instrument.tick_size,
+    )
+
+    try:
+        _modify_order(resting_order_id, instrument, quantity, 'SL', release_price, trigger_price=trigger_price)
+    except Exception as exc:
+        log.warning(f'{instrument.name}: modify-to-market of resting SL order {resting_order_id} failed ({exc}) - falling back to cancel+place-new')
+        return None
+
+    return _poll_order_status(resting_order_id, time_module.time() + EXIT_CHASE_WAIT_SECONDS)
+
+
+def _close_leg_order(instrument, quantity, fallback_ltp=None):
+    """Square off by converting the leg's existing resting SL order into an immediate market-ish
+    exit (_convert_resting_sl_to_market_exit above) - falls back to cancelling whatever's resting
+    and chasing a fresh LIMIT order (_exit_chase_fill) only if that didn't work (no resting order
+    found, the modify failed, or it didn't fill in time). Returns the actual average fill price
+    (None in DRY_RUN, where nothing is placed). Uses a fresh quote at close time rather than the
+    one passed in by the caller - avoids placing against a stale price if a retry happened - but
+    falls back to the caller's quote if the fresh fetch comes up empty. The broker rejects MARKET
+    orders on these NFO options (EC965), so we never place one - EXIT_CHASE_MAX_OFFSET_PCT is as
+    aggressive as the fallback path ever gets. If no LTP is available at all we leave the SL order
+    in place rather than touch it and be left with an unprotected naked leg."""
     tag = f'{"[DRY RUN] " if DRY_RUN else ""}BUY (square off) {quantity} x {instrument.name}'
     log.info(tag)
     if DRY_RUN:
-        return
+        return None
+
+    def _fresh_ltp():
+        key = f'{instrument.exchange}:{instrument.name}'
+        try:
+            ltp = _zerodha_quote_ltp([key]).get(key)
+        except Exception:
+            ltp = None
+        return ltp if ltp is not None else fallback_ltp
+
+    if _fresh_ltp() is None:
+        raise RuntimeError(f'{instrument.name}: no LTP available to square off, leaving SL in place')
+
+    fill_price = _convert_resting_sl_to_market_exit(instrument, quantity, _fresh_ltp)
+    if fill_price is not None:
+        return fill_price
 
     for o in _order_book():
         if str(o.get('instrumentId')) == str(instrument.token) and str(o.get('orderStatus', '')).lower() not in TERMINAL_ORDER_STATUSES:
             _cancel_order(o['brokerOrderId'])
 
-    key = f'{instrument.exchange}:{instrument.name}'
-    try:
-        ltp = _zerodha_quote_ltp([key]).get(key)
-    except Exception:
-        pass
-    if ltp is None:
-        exit_order = _place_order('BUY', instrument, quantity, 'MARKET', order_tag='rsv_cont_exit')
-    else:
-        exit_price = _round_to_tick(ltp * (1 + LIMIT_OFFSET_PCT), instrument.tick_size)
-        exit_order = _place_order('BUY', instrument, quantity, 'LIMIT', price=str(exit_price), order_tag='rsv_cont_exit')
-    order_no = exit_order.get('brokerOrderId')
-    if not order_no:
-        raise RuntimeError(f'{instrument.name} exit order rejected: {exit_order}')
-    _wait_for_fill_price(order_no)
+    return _exit_chase_fill(instrument, 'BUY', quantity, _fresh_ltp, order_tag='rsv_cont_exit')
 
 
 def _close_open_legs(state, market, cfg, reason):
-    return sum(pnl for opt in OPTION_TYPES if (pnl := _close_leg(state, opt, market, cfg, reason)) is not None)
+    tasks = {
+        opt: (lambda opt=opt: _close_leg(state, opt, market, cfg, reason))
+        for opt in OPTION_TYPES if state[opt] is not None
+    }
+    results = _run_legs_in_parallel(tasks)
+    return sum(pnl for pnl in results.values() if pnl is not None)
+
+
+_state_lock = threading.Lock()  # guards state[opt] wherever a concurrent thread could race a
+# read-then-write against it - specifically _enter_leg's write vs. _sync_stopped_out_legs' below,
+# now that the latter runs on its own dedicated thread (see SL_WATCH_INTERVAL_SECONDS) rather than
+# only inline in the main loop. A plain dict read elsewhere doesn't need it (CPython's GIL already
+# makes a single read/write atomic; the only unsafe pattern is read-then-write across threads).
 
 
 def _sync_stopped_out_legs(state, market):
     """Broker-side truth: a leg we believe is open but whose position has vanished means its
     resting stoploss filled. This IS the live "continuous" stoploss check - a real resting order
-    fires the instant price touches it; polling here just notices promptly (every
-    POLL_INTERVAL_SECONDS), it isn't what protects the position."""
+    fires the instant price touches it; polling here just notices promptly. Runs on its own
+    SL_WATCH_INTERVAL_SECONDS-cadence background thread (see _sl_watch_loop) as well as inline
+    each main-loop cycle - noticing a fill promptly matters on its own, independent of the main
+    loop's heavier market-data-fetching cadence (see notes.md)."""
     open_tokens = set(_resilient_call(get_open_legs, market['contracts_by_token']))
     for opt in OPTION_TYPES:
-        leg = state[opt]
-        if leg is not None and leg['instrument'].token not in open_tokens:
+        with _state_lock:
+            leg = state[opt]
+            stopped = leg is not None and leg['instrument'].token not in open_tokens
+            if stopped:
+                state[opt] = None
+        if stopped:
             alert(f'STOPLOSS FILLED: {opt} {leg["instrument"].name} (entry ~{leg["entry_price"]}) - flat until next checkpoint')
-            state[opt] = None
+
+
+SL_WATCH_INTERVAL_SECONDS = 1  # dedicated cadence for noticing a resting stoploss fill -
+# independent of POLL_INTERVAL_SECONDS (the main loop's cadence for market-data/checkpoint/
+# heartbeat work, which is naturally heavier and slower) - see notes.md.
+
+
+def _sl_watch_loop(state, contracts_box, stop_event):
+    """Runs for the whole trading day on its own thread: checks every SL_WATCH_INTERVAL_SECONDS
+    whether a resting stoploss has filled, independent of the main loop's own cadence.
+    `contracts_box` is a 1-item list holding the most recently known contracts_by_token map, kept
+    updated by the main loop each time it refreshes market data - this thread never fetches full
+    market data itself (no quotes needed here), only AliceBlue's positions endpoint."""
+    while not stop_event.is_set():
+        try:
+            contracts_by_token = contracts_box[0]
+            if contracts_by_token is not None:
+                _sync_stopped_out_legs(state, {'contracts_by_token': contracts_by_token})
+        except Exception as exc:
+            log.warning(f'SL watch thread: check failed ({exc})', extra={'no_telegram': True})
+        stop_event.wait(SL_WATCH_INTERVAL_SECONDS)
 
 
 # ── Startup adoption: reconstruct entry price from the order book ──────────────────────────────
@@ -819,15 +1132,14 @@ def run_checkpoint(state, market, cfg, day, symbol):
     if drifted:
         alert('first-OTM strike has moved - rolling both legs')
         day['realized_pnl'] += _close_open_legs(state, market, cfg, 'ROLL_OTM_DRIFT')
-        for opt, (instrument, ltp, strike) in desired.items():
-            _enter_leg(state, opt, instrument, ltp, strike, cfg)
+        _enter_legs_parallel(state, desired, cfg)
         return
 
-    for opt, (instrument, ltp, strike) in desired.items():
+    for opt in desired:
         if state[opt] is None:
-            _enter_leg(state, opt, instrument, ltp, strike, cfg)
-        else:
-            log.info(f'{opt} still open at {state[opt]["strike"]}, leaving as is')
+            continue
+        log.info(f'{opt} still open at {state[opt]["strike"]}, leaving as is')
+    _enter_legs_parallel(state, desired, cfg, only_missing=True)
 
 
 # ── Minute-level checks (every poll) ─────────────────────────────────────────────────────────
@@ -927,6 +1239,16 @@ def run_day(symbol, trade_weekdays):
     next_heartbeat = entry_time + HEARTBEAT_INTERVAL
 
     market = _fetch_market_until_success(symbol, cfg, state)
+
+    contracts_box = [market['contracts_by_token']]  # kept updated below every time market data
+    # refreshes - see _sl_watch_loop's docstring on why this thread doesn't fetch its own.
+    sl_watch_stop = threading.Event()
+    sl_watch_thread = threading.Thread(
+        target=_sl_watch_loop, args=(state, contracts_box, sl_watch_stop),
+        daemon=True, name=f'sl-watch-{symbol}',
+    )
+    sl_watch_thread.start()
+
     open_tokens = set(_resilient_call(get_open_legs, market['contracts_by_token']))
     if open_tokens:
         alert('Found open positions at startup (mid-day restart?) - reconstructing entry prices from the order book where possible', level=logging.WARNING)
@@ -957,8 +1279,7 @@ def run_day(symbol, trade_weekdays):
         day['prev_checkpoint_premium'] = entry_premium
         if entry_premium is not None:
             day['premium_history'] = [(datetime.now(), entry_premium)]
-        for opt, (instrument, ltp, strike) in _desired_legs(market, cfg).items():
-            _enter_leg(state, opt, instrument, ltp, strike, cfg)
+        _enter_legs_parallel(state, _desired_legs(market, cfg), cfg)
 
     reuse_entry_market = True
     poll_failure_count = 0
@@ -973,6 +1294,7 @@ def run_day(symbol, trade_weekdays):
                 reuse_entry_market = False
             else:
                 market = _fetch_market(symbol, cfg, state)
+                contracts_box[0] = market['contracts_by_token']
             _sync_stopped_out_legs(state, market)
             run_minute_checks(state, market, cfg, day, now)
 
@@ -1002,12 +1324,14 @@ def run_day(symbol, trade_weekdays):
             break
         except Exception as exc:
             if attempt == RETRY_MAX_ATTEMPTS - 1:
+                sl_watch_stop.set()
                 alert(f'{symbol}: final square-off failed after {RETRY_MAX_ATTEMPTS} attempts - positions may still be OPEN, check manually: {exc}', level=logging.CRITICAL)
                 raise
             delay = RETRY_BASE_DELAY * (2 ** attempt)
             log.warning(f'final square-off failed ({exc}) - retrying in {delay:.0f}s (attempt {attempt + 1}/{RETRY_MAX_ATTEMPTS})')
             time_module.sleep(delay)
 
+    sl_watch_stop.set()
     alert(f'Rolling straddle (variation, continuous) done for {symbol} - realized pnl {day["realized_pnl"]:+.2f} points')
 
 
