@@ -3,3 +3,4 @@ python-dotenv
 pyotp
 psutil
 redis
+websocket-client

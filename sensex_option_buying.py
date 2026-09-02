@@ -49,11 +49,15 @@ Dhan at import time as a side effect (it's used there as the market-data source)
 market data comes from Zerodha's Kite Connect API instead, never Dhan. So all the AliceBlue REST
 plumbing needed to place orders (auth, contract master, order placement, tick rounding) is
 reimplemented locally below, and Dhan is never touched, imported, or authenticated by this file at
-all. Entries here carry no resting stoploss order at all - this strategy has no per-leg stoploss,
-no profit target, and no daily loss limit, by design. Exiting a held leg (TIME_EXIT or EOD) places
-a fresh SELL SL (stop-loss LIMIT) order and repeatedly re-prices it via modify (never cancel then a
-brand-new order, and never MARKET/SLM - not permitted for this account/strategy) until the position
-is actually confirmed closed - see _force_exit_leg. CE and PE, on both entry and exit, run in
+all. Entries here carry no resting stoploss order at all - there's still no per-leg stoploss and no
+profit target, by design, but the live port adds one thing the backtest above never modeled: a
+COMBINED (CE+PE) stoploss of STOPLOSS_POINTS = 60 points below the position's combined entry fill,
+scanned every STOPLOSS_SCAN_SECONDS = 2 seconds once a position is open (independent of, and much
+faster than, the once-a-minute checkpoint/spike-signal cadence) - see _position_combined_premium /
+_position_combined_entry and the scan in run_day. Still no daily loss limit. Exiting a held leg
+(TIME_EXIT, STOPLOSS, or EOD) places a fresh SELL SL (stop-loss LIMIT) order and repeatedly re-prices
+it via modify (never cancel then a brand-new order, and never MARKET/SLM - not permitted for this
+account/strategy) until the position is actually confirmed closed - see _force_exit_leg. CE and PE, on both entry and exit, run in
 parallel threads (_run_legs_in_parallel) reading from one shared order-book/positions poller
 (_order_book_cache/_positions_cache) rather than each hammering AliceBlue's API on its own.
 
@@ -177,7 +181,7 @@ for _sig in (signal.SIGTERM, signal.SIGHUP):
 DRY_RUN = os.getenv('DRY_RUN', 'true').lower() != 'false'  # set DRY_RUN=false to place real orders
 
 SYMBOL = 'SENSEX'
-CFG = dict(aliceblue_exchange='BFO', strike_interval=100, lots=5)
+CFG = dict(aliceblue_exchange='BFO', strike_interval=100, lots=3)
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), 'sensex_option_buying_state.json')
 
@@ -186,6 +190,11 @@ EXIT_TIME = dtime(15, 13)  # day end / forced square-off
 CHECK_TIMES = (dtime(10, 15), dtime(11, 15), dtime(12, 15), dtime(13, 15), dtime(14, 15))
 SPIKE_POINTS = 50  # combined ATM premium rise above the latest checkpoint's baseline that triggers a buy
 HOLD_MINUTES = 5  # how long a triggered buy is held before being time-exited
+STOPLOSS_POINTS = 60  # combined (CE+PE) premium drop from the position's combined entry fill price
+# that force-closes it early, on top of TIME_EXIT/EOD - see _position_combined_premium/run_day.
+STOPLOSS_SCAN_SECONDS = 2  # how often the combined stoploss is checked once a position is open -
+# independent of, and much faster than, the once-a-minute checkpoint/spike-signal cadence, since a
+# fast adverse move shouldn't have to wait for the minute to roll over.
 
 WALLCLOCK_TICK_SECONDS = 1  # was POLL_INTERVAL=60, then 20 - no longer a network poll interval at
 # all now that prices stream continuously over the websocket (see that section above): this is
@@ -689,8 +698,12 @@ def _force_exit_leg(instrument, quantity, get_fresh_ltp, order_tag, log_prefix):
             time_module.sleep(FORCE_EXIT_POLL_INTERVAL)
             continue
 
-        trigger_price = round(ltp * (1 + LIMIT_OFFSET_PCT), 1)
-        limit_price = _round_to_tick(ltp * (1 - LIMIT_OFFSET_PCT), instrument.tick_size)
+        # Rounded to the nearest integer, not just a tick - the exchange rejects SL trigger
+        # prices for these contracts with "STOP PRICE IS NOT REASONABLE" unless they're whole
+        # rupees.
+        trigger_price = round(ltp * (1 + LIMIT_OFFSET_PCT))
+        # Nearest integer, not a tick - same rejection applies to the SL order's limit price.
+        limit_price = round(ltp * (1 - LIMIT_OFFSET_PCT))
 
         if working_order_id is not None:
             log.info(
@@ -853,6 +866,20 @@ def _pinned_premium(zerodha_options, checkpoint):
     return ce_ltp + pe_ltp, ce_ltp, pe_ltp
 
 
+def _position_combined_premium(zerodha_options, position):
+    """Live combined (CE+PE) premium of an open position's actual legs - each looked up by the
+    strike/type recorded on that leg at entry (not the checkpoint's pinned strike, though today
+    they're always the same strike - this just reads directly off what's actually held)."""
+    return sum(get_option_ltp(zerodha_options, leg['strike'], opt) for opt, leg in position['legs'].items())
+
+
+def _position_combined_entry(position):
+    """Combined actual fill price the open position was bought at - sum of each leg's own entry
+    fill (not the pre-fill LTP-based 'entry_premium' snapshot taken before orders were placed),
+    matching how _close_position computes realized pnl."""
+    return sum(leg['entry'] for leg in position['legs'].values())
+
+
 def _run_legs_in_parallel(tasks):
     """Run one no-arg callable per leg ('CE'/'PE') concurrently rather than one after another -
     every call here is I/O (a REST order placement plus up to FILL_POLL_TIMEOUT of polling for a
@@ -970,10 +997,13 @@ def run_day():
 
     checkpoint_failure_count = 0
     tick_failure_count = 0
+    stoploss_failure_count = 0
     last_evaluated_minute = None  # (hour, minute) of the last minute this loop actually acted on -
     # guards the per-minute body below so it runs exactly once per wall-clock minute, matching the
     # backtest's once-per-bar cadence (see module docstring), even though this loop itself now
     # wakes up every WALLCLOCK_TICK_SECONDS just to detect the rollover promptly.
+    last_stoploss_check = 0.0  # monotonic time of the last combined-stoploss scan - independent of
+    # last_evaluated_minute so it isn't gated by the once-a-minute cadence below.
 
     while True:
         now = datetime.now()
@@ -990,6 +1020,28 @@ def run_day():
             if state['position'] is not None:
                 _close_position(state, 'EOD')
             break
+
+        # Combined (CE+PE) stoploss - scanned every STOPLOSS_SCAN_SECONDS whenever a position is
+        # open, on this same 1s-tick loop but on its own timer, so it isn't gated by the
+        # once-a-minute cadence the checkpoint/spike-signal/TIME_EXIT logic below runs on (a fast
+        # adverse move shouldn't have to wait for the minute to roll over).
+        if state['position'] is not None:
+            now_mono = time_module.monotonic()
+            if now_mono - last_stoploss_check >= STOPLOSS_SCAN_SECONDS:
+                last_stoploss_check = now_mono
+                try:
+                    zerodha_options = _load_zerodha_current_week_options()
+                    current_premium = _position_combined_premium(zerodha_options, state['position'])
+                    combined_entry = _position_combined_entry(state['position'])
+                    drop = combined_entry - current_premium
+                    if drop >= STOPLOSS_POINTS:
+                        log.warning(f'{SYMBOL} combined stoploss hit: entry={combined_entry:.1f} '
+                                    f'current={current_premium:.1f} (-{drop:.1f}, stoploss {STOPLOSS_POINTS}) - closing')
+                        _close_position(state, 'STOPLOSS')
+                    stoploss_failure_count = 0
+                except Exception:
+                    stoploss_failure_count += 1
+                    _log_failure_throttled('combined stoploss scan failed - will retry next scan', stoploss_failure_count)
 
         minute_key = (now.hour, now.minute)
         if minute_key == last_evaluated_minute:

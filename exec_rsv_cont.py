@@ -35,7 +35,8 @@ Between checkpoints, polls every POLL_INTERVAL_SECONDS (not just once an hour) t
   - (optional, off by default) close both legs if the ATM premium is now above its own highest
     reading over the trailing PREMIUM_HIGH_LOOKBACK window.
   - halt trading for the day (square everything off, no more re-entries) once realized+unrealized
-    pnl crosses -DAILY_LOSS_LIMIT (100 points, unscaled by lot size - matches the backtest).
+    pnl crosses -daily_loss_limit (points, unscaled by lot size; per-underlying via CFG - SENSEX 100
+    matches the backtest, NIFTY overridden tighter at 40).
 
 EXIT_TIME is 15:13, not the backtest's literal 15:15 - a 2-minute live-trading safety buffer before
 the hard close, matching every other live script in this folder's convention (see
@@ -196,24 +197,29 @@ POLL_INTERVAL_SECONDS = 15  # was 30 - halved after the 31 Aug 2026 review found
 HEARTBEAT_INTERVAL = timedelta(minutes=30)
 
 FIRST_OTM_STRIKES = 0  # 0 = ATM; n = n strikes OTM (CE up, PE down)
-STOPLOSS_PCT = 0.3  # per-leg resting stoploss, flat across every underlying - matches the backtest exactly
+STOPLOSS_PCT = 0.25  # per-leg resting stoploss, flat across every underlying - matches the backtest exactly
 PREMIUM_HIGH_STOPLOSS_ENABLED = False
 PREMIUM_HIGH_LOOKBACK = timedelta(hours=1)
-DAILY_LOSS_LIMIT = 100  # points, unscaled by lot size - matches the backtest's convention
+# DAILY_LOSS_LIMIT is now per-underlying (see CFG's daily_loss_limit below) rather than one flat
+# value - NIFTY's is tighter than SENSEX's, unlike the backtest this was ported from.
 
 OPTION_TYPES = ('CE', 'PE')
 DAY_CODE_TO_WEEKDAY = {'m': 'Monday', 't': 'Tuesday', 'w': 'Wednesday', 'h': 'Thursday', 'f': 'Friday'}
 
 # Per-underlying config - strike_interval/lots/aliceblue_exchange match ers.UNDERLYINGS in
 # execution_rolling_straddle_tn.py; zerodha_* fields are this file's own (market data only).
+# daily_loss_limit: points, unscaled by lot size - was one flat DAILY_LOSS_LIMIT = 100 for every
+# underlying (matching the backtest's convention); now set per-underlying instead.
 CFG = {
     'NIFTY': dict(
-        strike_interval=50, lots=5, aliceblue_exchange='NFO',
+        strike_interval=50, lots=3, aliceblue_exchange='NFO',
         zerodha_options_exchange='NFO', zerodha_spot_instrument='NSE:NIFTY 50',
+        daily_loss_limit=40,
     ),
     'SENSEX': dict(
-        strike_interval=100, lots=5, aliceblue_exchange='BFO',
+        strike_interval=100, lots=3, aliceblue_exchange='BFO',
         zerodha_options_exchange='BFO', zerodha_spot_instrument='BSE:SENSEX',
+        daily_loss_limit=100,
     ),
 }
 
@@ -830,8 +836,13 @@ def _short_leg_with_stoploss(instrument, quantity, ltp):
         raise RuntimeError(f'{instrument.name} entry order rejected: {entry}')
 
     entry_price = _wait_for_fill_price(order_no)
-    trigger_price = round(entry_price * (1 + STOPLOSS_PCT), 1)
-    sl_limit_price = _round_to_tick(trigger_price * (1 + LIMIT_OFFSET_PCT), instrument.tick_size)
+    # Rounded to the nearest integer, not just a tick - the exchange rejects SL trigger
+    # prices for these contracts with "STOP PRICE IS NOT REASONABLE" unless they're whole
+    # rupees.
+    trigger_price = round(entry_price * (1 + STOPLOSS_PCT))
+    # Nearest integer, not a tick - same "STOP PRICE IS NOT REASONABLE" rejection applies to the
+    # SL order's limit price as well as its trigger.
+    sl_limit_price = round(trigger_price * (1 + LIMIT_OFFSET_PCT))
     log.info(f'{instrument.name} entered @ {entry_price}, SL trigger {trigger_price} limit {sl_limit_price}')
 
     sl = _place_order('BUY', instrument, quantity, 'SL', price=str(sl_limit_price), trigger_price=trigger_price, order_tag='rsv_cont_sl')
@@ -936,10 +947,13 @@ def _convert_resting_sl_to_market_exit(instrument, quantity, get_fresh_ltp):
     ltp = get_fresh_ltp()
     if ltp is None:
         return None
-    trigger_price = round(ltp * (1 - SL_TRIGGER_BELOW_LTP_PCT), 1)
-    release_price = _round_to_tick(
-        max(ltp * (1 + SL_RELEASE_PRICE_MIN_ABOVE_LTP_PCT), ltp + SL_RELEASE_PRICE_MIN_POINTS_ABOVE_LTP),
-        instrument.tick_size,
+    # Rounded to the nearest integer, not just a tick - the exchange rejects SL trigger
+    # prices for these contracts with "STOP PRICE IS NOT REASONABLE" unless they're whole
+    # rupees.
+    trigger_price = round(ltp * (1 - SL_TRIGGER_BELOW_LTP_PCT))
+    # Nearest integer, not a tick - same rejection applies to the SL order's limit price.
+    release_price = round(
+        max(ltp * (1 + SL_RELEASE_PRICE_MIN_ABOVE_LTP_PCT), ltp + SL_RELEASE_PRICE_MIN_POINTS_ABOVE_LTP)
     )
 
     try:
@@ -1167,10 +1181,11 @@ def run_minute_checks(state, market, cfg, day, now):
             continue
         unrealized += leg['entry_price'] - current_ltp
 
-    if day['realized_pnl'] + unrealized <= -DAILY_LOSS_LIMIT:
+    daily_loss_limit = cfg['daily_loss_limit']
+    if day['realized_pnl'] + unrealized <= -daily_loss_limit:
         alert(
             f'DAILY LOSS LIMIT hit: realized {day["realized_pnl"]:.2f} + unrealized {unrealized:.2f} '
-            f'<= -{DAILY_LOSS_LIMIT} - halting for the day, squaring off',
+            f'<= -{daily_loss_limit} - halting for the day, squaring off',
             level=logging.CRITICAL,
         )
         day['realized_pnl'] += _close_open_legs(state, market, cfg, 'DAILY_LOSS_LIMIT')

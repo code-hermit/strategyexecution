@@ -185,7 +185,11 @@ def _parse_ltp_ticks(raw):
             ltp = struct.unpack('>I', packet[4:8])[0] / KITE_TICK_PRICE_DIVISOR
             ticks.append((token, ltp))
         return ticks
-    except struct.error:
+    except (struct.error, TypeError, IndexError):
+        # struct.error: truncated/malformed binary frame. TypeError: `raw` wasn't bytes-like after
+        # all (shouldn't happen now that _ws_on_message filters non-binary frames, but fail closed
+        # rather than crash the ticker loop if that guard is ever bypassed). IndexError: a slice
+        # came up short in a way struct.unpack's own length check didn't catch.
         return []
 
 
@@ -210,6 +214,14 @@ def _ws_on_open(ws):
 
 
 def _ws_on_message(ws, message):
+    # Kite's ticker sends both binary tick frames (what _parse_ltp_ticks understands) and
+    # occasional text/JSON frames (connection acks, postbacks, error notices) on the same socket -
+    # websocket-client hands those to this callback as `str`, not `bytes`. There's no tick data to
+    # extract from a text frame, so skip it rather than let struct.unpack blow up on it below.
+    if not isinstance(message, (bytes, bytearray)):
+        log.debug(f'non-binary websocket message (ignored, not tick data): {message!r}')
+        return
+
     now = time_module.time()
     pipe = _redis.pipeline(transaction=False)
     wrote_any = False
