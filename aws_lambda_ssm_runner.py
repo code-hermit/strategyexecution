@@ -1,11 +1,23 @@
 import base64
+import logging
 import re
 
 import boto3
 import os
 
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
 ec2 = boto3.client("ec2")
 ssm = boto3.client("ssm")
+# Optional: set this to an SNS topic ARN to get notified when a scheduled run
+# fails outright (as opposed to "not_found"/"waiting_for_ssm", which are
+# expected states while the instance boots). Left unset, failures are still
+# logged and the Lambda invocation is still marked as an error (so a
+# CloudWatch alarm on the function's Errors metric will catch it too) -
+# this is just a more immediate/direct notification if you want one.
+alert_topic_arn = os.environ.get('ALERT_SNS_TOPIC_ARN')
+sns = boto3.client("sns") if alert_topic_arn else None
 github_pat = os.environ.get('GITHUB_PAT')
 
 # The Elastic IP this Lambda should look for. Override via event["ip_address"]
@@ -54,20 +66,49 @@ def lambda_handler(event, context):
     1 minute) instead of sleeping inside the Lambda. Returns a status of
     "not_found", "waiting_for_ssm", or "commands_sent" so the caller knows
     whether to try again.
+
+    Any unexpected exception (e.g. a boto3/IAM/throttling error) is logged
+    with its full traceback, optionally pushed to SNS if ALERT_SNS_TOPIC_ARN
+    is set, and then re-raised - so the invocation still shows up as a
+    failure in CloudWatch/the Lambda's Errors metric instead of the schedule
+    just quietly not doing anything that run.
     """
 
     ip_address = (event or {}).get("ip_address", DEFAULT_IP_ADDRESS)
 
+    try:
+        return _run(ip_address)
+    except Exception:
+        logger.exception(f"aws_lambda_ssm_runner failed for ip {ip_address}")
+        _notify_failure(ip_address)
+        raise
+
+
+def _notify_failure(ip_address):
+    if not sns:
+        return
+    try:
+        sns.publish(
+            TopicArn=alert_topic_arn,
+            Subject="aws_lambda_ssm_runner failed",
+            Message=f"aws_lambda_ssm_runner failed for ip {ip_address}. See CloudWatch Logs for the traceback.",
+        )
+    except Exception:
+        # Don't let a broken notification path mask the original error.
+        logger.exception("also failed to publish failure notification to SNS")
+
+
+def _run(ip_address):
     instance_id = find_instance_id_by_ip(ip_address)
     if not instance_id:
-        print(f"no running instance found with ip {ip_address}")
+        logger.info(f"no running instance found with ip {ip_address}")
         return {"status": "not_found", "ip_address": ip_address}
 
     if not is_ssm_ready(instance_id):
-        print(f"instance {instance_id} not yet visible to SSM")
+        logger.info(f"instance {instance_id} not yet visible to SSM")
         return {"status": "waiting_for_ssm", "instance_id": instance_id}
 
-    print(f"got ssm for {instance_id}, sending commands")
+    logger.info(f"got ssm for {instance_id}, sending commands")
     ssm.send_command(
         InstanceIds=[instance_id],
         DocumentName="AWS-RunShellScript",
