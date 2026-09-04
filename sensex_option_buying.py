@@ -1,23 +1,26 @@
 """
 What it is: a standalone premium-spike buy strategy — no short leg anywhere in this file.
 Tracking (the checkpoint baseline and the spike signal) is done purely on the ATM straddle;
-execution (the strikes actually bought when a spike fires) buys the 1st-OTM strangle instead -
-CE strike = ATM + strike_interval, PE strike = ATM - strike_interval, both derived from the same
-pinned ATM strike. See _enter_position.
+execution buys exactly ONE first-OTM leg when a spike fires, not a strangle - whichever leg (CE or
+PE) actually drove the trigger minute's rise (see "Direction" below). CE strike = ATM +
+strike_interval, PE strike = ATM - strike_interval, both derived from the same pinned ATM strike.
+See _enter_position.
 
 Window: 10:15 (ENTRY_TIME) → 15:13 (EXIT_TIME, forced day-end square-off).
 
 Checkpoints: 10:15, 11:15, 12:15, 13:15, 14:15 (CHECK_TIMES). At each one, the combined ATM straddle premium (ATM CE close + ATM PE close) is recorded as the current baseline, overwriting whatever baseline the previous checkpoint set.
 
-Signal (checked every minute, not just at checkpoints): if the live combined ATM premium has risen SPIKE_POINTS = 50 points or more above the latest checkpoint's baseline, buy the 1st-OTM strangle (CE+PE) right then.
+Signal (checked every minute, not just at checkpoints): if the live combined ATM premium has risen SPIKE_POINTS = 50 points or more above the latest checkpoint's baseline, a trade fires.
 
-Exit: hold for HOLD_MINUTES = 15 minutes, then exit at the first minute at/after that deadline (TIME_EXIT), or at day end if 15:13 arrives first (EOD).
+Direction (which single leg to buy): compares the pinned ATM strike's own CE and PE premium each against their own value exactly one minute before the trigger (prev_pinned_ce/prev_pinned_pe in run_day) - whichever moved more over that one minute is judged the driver of the rise and is the leg actually bought (first-OTM). A tie (equal moves) or not yet having a "1 minute ago" reading for this checkpoint's strike (right after it was freshly pinned) means no clear driver: no trade fires that minute, but the checkpoint stays live and is retried the following minute. Flip INVERT_DIRECTION to True to buy the OTHER leg instead - see _direction_for_driver. Matches Data/backtests/backtest_atm_spike_v3.py's own selection rule exactly.
+
+Exit: hold for HOLD_MINUTES = 5 minutes, then exit at the first minute at/after that deadline (TIME_EXIT), or at day end if 15:13 arrives first (EOD), or on the combined stoploss below (STOPLOSS) - whichever comes first.
 
 Position sizing / concurrency rules:
 
 Only one position open at a time — while a position is open, no new signal is evaluated at all.
 Each checkpoint's baseline can fire at most one trade. Once a trade has been taken off a given checkpoint's value, that baseline is "used up" (checkpoint_used = True) and won't trigger again — even after the position closes and the premium is still elevated — until the next checkpoint sets a fresh baseline (which also re-arms the signal).
-No other exits or filters — no per-leg stoploss, no profit target, no daily loss limit. Purely: spike-triggered entry, fixed-time (or EOD) exit, one trade per checkpoint window.
+No profit target, no daily loss limit. Spike-triggered entry, direction from the last-candle driver, fixed-time/stoploss/EOD exit, one trade per checkpoint window.
 
 Day/weekday handling:
 
@@ -27,20 +30,29 @@ Underlying handling: defaults to NIFTY; pass an underlying as the first CLI arg 
 
 ---
 
-Live version of Data/backtests/backtest_atm_premium_spike_buy_v2.py, SENSEX only. Ported rule-for-rule
-from that backtest's run_day(): checkpoints refresh the baseline regardless of whether a position is
-open (so the baseline is current the moment a position closes, and re-armed since nothing has
-traded off the fresh value yet); unlike v1, each checkpoint *pins* the exact ATM strike tagged at
-that moment, and the spike check keeps tracking that same pinned strike's ATM premium for the rest
-of the hour - even after spot moves on and a different strike becomes the new ATM - so a strike roll
-can never masquerade as a premium spike, or vice versa. When a spike fires, the strangle actually
-bought is the 1st-OTM pair derived from that same pinned ATM strike (not whatever's ATM/1st-OTM at
-that instant), for the same reason; a still-open position is force-closed at day end even if its
+Live version of Data/backtests/backtest_atm_spike_v3.py, SENSEX only (that file is itself v2's
+checkpoint/pinned-strike mechanism, ported rule-for-rule from Data/backtests/
+backtest_atm_premium_spike_buy_v2.py's run_day(), with single-leg selection added on top - see that
+file's own docstring for the full history/reasoning). Checkpoints refresh the baseline regardless of
+whether a position is open (so the baseline is current the moment a position closes, and re-armed
+since nothing has traded off the fresh value yet); each checkpoint *pins* the exact ATM strike
+tagged at that moment, and the spike check keeps tracking that same pinned strike's ATM premium for
+the rest of the hour - even after spot moves on and a different strike becomes the new ATM - so a
+strike roll can never masquerade as a premium spike, or vice versa. When a spike fires, the single
+first-OTM leg actually bought is derived from that same pinned ATM strike (not whatever's ATM/1st-OTM
+at that instant), for the same reason; a still-open position is force-closed at day end even if its
 hold deadline hasn't arrived.
 
 Progress (today's checkpoints already applied, the current baseline, whether it's used up, and any
 open position's legs/entry prices/deadline) is persisted to STATE_FILE after every change, so a
 restart mid-day resumes instead of losing track of an open position or re-arming a used baseline.
+Separately, the pinned strike's CE/PE premium from one minute ago (what the last-candle direction
+check compares against - see "Direction" above) is persisted every minute to LAST_CANDLE_FILE, so a
+restart doesn't lose that reading either - restored only if it's for today, the currently pinned
+strike, and not older than LAST_CANDLE_MAX_AGE_SECONDS; otherwise treated as unavailable, same as
+any fresh start (see _load_last_candle/_save_last_candle). This file is NOT trading state - purely a
+nice-to-have for direction accuracy across a restart - so every read/write of it fails safe and can
+never interrupt the actual signal/entry logic, unlike STATE_FILE.
 Late-start behaviour is automatic, based on where the process's actual start time falls relative to
 CHECK_TIMES - no manual mode to pick: started before the first checkpoint (10:15) - wait for it to
 fire for real, same as any on-time start, no special-casing needed. Started after the first
@@ -55,11 +67,13 @@ Dhan at import time as a side effect (it's used there as the market-data source)
 market data comes from Zerodha's Kite Connect API instead, never Dhan. So all the AliceBlue REST
 plumbing needed to place orders (auth, contract master, order placement, tick rounding) is
 reimplemented locally below, and Dhan is never touched, imported, or authenticated by this file at
-all. Entries here carry no resting stoploss order at all - there's still no per-leg stoploss and no
-profit target, by design, but the live port adds one thing the backtest above never modeled: a
-COMBINED (CE+PE) stoploss of STOPLOSS_POINTS = 60 points below the position's combined entry fill,
-scanned every STOPLOSS_SCAN_SECONDS = 2 seconds once a position is open (independent of, and much
-faster than, the once-a-minute checkpoint/spike-signal cadence) - see _position_combined_premium /
+all. Entries here carry no resting stoploss order at all - there's no separate stoploss on the
+single leg actually bought, by design (matches backtest_atm_spike_v3.py's own 'combined'
+STOPLOSS_MODE); instead there's a COMBINED (CE+PE) stoploss of STOPLOSS_POINTS = 60 points below the
+pinned ATM strike's own combined premium at entry (both legs' LTP snapshot, position['atm_legs'] -
+NOT a fill price, since only one leg is ever actually bought), scanned every
+STOPLOSS_SCAN_SECONDS = 2 seconds once a position is open (independent of, and much faster than, the
+once-a-minute checkpoint/spike-signal cadence) - see _position_combined_premium /
 _position_combined_entry and the scan in run_day. Still no daily loss limit. Exiting a held leg
 (TIME_EXIT, STOPLOSS, or EOD) places a fresh SELL SL (stop-loss LIMIT) order and repeatedly re-prices
 it via modify (never cancel then a brand-new order, and never MARKET/SLM - not permitted for this
@@ -90,8 +104,9 @@ Requires zerodha_ticker_service.py to be running separately (and a reachable Red
 path - if either is down, every price read here transparently falls back to the same REST call
 this file made before either existed, just slower; nothing here fails outright.
 
-Logging: goes to sensex_option_buying.log and stdout; if TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are
-set in .env, every log record is also pushed to Telegram (see TelegramHandler below) - if either is
+Logging: goes to logs/sensex_option_buying.log (the logs/ folder is created next to this script on
+first run if it doesn't already exist) and stdout; if TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are set in
+.env, every log record is also pushed to Telegram (see TelegramHandler below) - if either is
 missing, Telegram alerts are just skipped (logged once as a warning) and trading proceeds normally.
 """
 
@@ -115,7 +130,10 @@ import zerodha_ltp_client
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
-LOG_FILE = os.path.join(os.path.dirname(__file__), 'sensex_option_buying.log')
+LOGS_DIR = os.path.join(os.path.dirname(__file__), 'logs')
+os.makedirs(LOGS_DIR, exist_ok=True)  # created on first run if missing - every log destination
+# below lives under here now, not loose in the execution folder.
+LOG_FILE = os.path.join(LOGS_DIR, 'sensex_option_buying.log')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 TELEGRAM_TIMEOUT = 10
@@ -190,6 +208,17 @@ SYMBOL = 'SENSEX'
 CFG = dict(aliceblue_exchange='BFO', strike_interval=100, lots=3)
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), 'sensex_option_buying_state.json')
+LAST_CANDLE_FILE = os.path.join(os.path.dirname(__file__), 'sensex_option_buying_last_candle.json')
+# separate from STATE_FILE deliberately: this is the "1 minute ago" pinned-strike CE/PE reading the
+# last-candle direction check depends on (see run_day), updated every single minute rather than
+# only at the checkpoint/position-change events STATE_FILE saves on - see _load_last_candle/
+# _save_last_candle. Purely a nice-to-have for direction accuracy across a restart, never trading
+# state itself, so every read/write of it is wrapped to fail safe (see those two functions) and can
+# never affect state/STATE_FILE or interrupt the actual signal/entry logic in run_day.
+LAST_CANDLE_MAX_AGE_SECONDS = 90  # a restored "1 minute ago" reading older than this (loop was down
+# a while) is too stale to treat as this minute's actual previous tick - safer to start fresh (no
+# driver decision until a new in-process reading lands, same as any other cold start) than compare
+# against a stale number and risk misjudging the driver.
 
 ENTRY_TIME = dtime(10, 15)  # strategy start
 EXIT_TIME = dtime(15, 13)  # day end / forced square-off
@@ -198,6 +227,8 @@ SPIKE_POINTS = 50  # combined ATM premium rise above the latest checkpoint's bas
 HOLD_MINUTES = 5  # how long a triggered buy is held before being time-exited
 STOPLOSS_POINTS = 60  # combined (CE+PE) premium drop from the position's combined entry fill price
 # that force-closes it early, on top of TIME_EXIT/EOD - see _position_combined_premium/run_day.
+INVERT_DIRECTION = False  # False (default): buy whichever leg (CE/PE) actually drove the trigger
+# minute's rise. True: buy the OTHER leg instead (contrarian) - see _direction_for_driver.
 STOPLOSS_SCAN_SECONDS = 2  # how often the combined stoploss is checked once a position is open -
 # independent of, and much faster than, the once-a-minute checkpoint/spike-signal cadence, since a
 # fast adverse move shouldn't have to wait for the minute to roll over.
@@ -248,6 +279,17 @@ def otm_strikes(spot, strike_interval):
     call), PE strike one interval below ATM (OTM for a put)."""
     atm = atm_strike(spot, strike_interval)
     return atm + strike_interval, atm - strike_interval
+
+
+def _direction_for_driver(driving_leg):
+    """driving_leg is 'CE' or 'PE' - whichever leg's own tracked ATM premium rose more over the
+    trigger minute's last candle (see run_day) and so actually drove the combined-premium trigger.
+    Normally buys that same leg; swapped when INVERT_DIRECTION is True. Centralizes the CE/PE
+    choice so INVERT_DIRECTION is the only thing to flip - matches
+    Data/backtests/backtest_atm_spike_v3.py's own _direction_for_driver."""
+    if INVERT_DIRECTION:
+        return 'PE' if driving_leg == 'CE' else 'CE'
+    return driving_leg
 
 
 # ── Zerodha (REST, Kite Connect) - market data only ─────────────────────────
@@ -391,7 +433,7 @@ def get_option_ltp(zerodha_options, strike, option_type):
 
 def _current_atm(zerodha_options):
     """ATM strike/premium - what the checkpoint baseline and spike signal are tracked against.
-    Execution (the strikes actually bought) uses the 1st-OTM strikes derived from this same
+    Execution (the single leg actually bought) uses the 1st-OTM strike derived from this same
     pinned ATM strike instead - see _enter_position/otm_strikes."""
     spot = get_spot_ltp()
     strike = atm_strike(spot, CFG['strike_interval'])
@@ -841,7 +883,10 @@ def _fresh_state():
         'checkpoint': None,  # {'strike', 'premium'} - the exact ATM strike pinned at the last checkpoint
         'checkpoint_used': False,
         'checkpoints_done': [],
-        'position': None,  # {'entry_time', 'deadline', 'checkpoint_premium', 'entry_atm_premium', 'legs': {'CE': {...}, 'PE': {...}}}
+        'position': None,  # {'entry_time', 'deadline', 'checkpoint_premium', 'entry_atm_premium',
+        # 'option_type', 'trigger_driver', 'legs': {<option_type>: {...}} (single leg actually
+        # bought), 'atm_legs': {'CE': {...}, 'PE': {...}} (both ATM legs, combined-stoploss tracking
+        # only - see _enter_position)}
     }
 
 
@@ -860,6 +905,23 @@ def _load_state():
                             f'stale baseline {state.pop("checkpoint_premium", None)}, will re-pin fresh')
                 state['checkpoint'] = None
                 state['checkpoint_used'] = False
+            position = state.get('position')
+            if position is not None and ('atm_legs' not in position or 'option_type' not in position):
+                # pre-single-leg schema (both CE+PE bought, no atm_legs snapshot) - this is a REAL
+                # open broker position this new code cannot safely resume: it can't compute the
+                # combined stoploss (no atm_legs) and doesn't know which one leg is "the" traded
+                # position vs. the untraded tracking leg. Unlike the checkpoint case above, silently
+                # dropping this would abandon a live position with real money on it - it would never
+                # get force-closed at EOD since state['position'] would look like None. Fail loudly
+                # instead and require a manual look at the broker's actual positions before this
+                # process runs again with the new code.
+                raise RuntimeError(
+                    f'Persisted state has an open position in the old (pre-single-leg) schema: {position!r}. '
+                    'This new code cannot safely resume it (no atm_legs for the combined stoploss, no '
+                    'option_type to know which leg is actually held). Check the broker\'s actual open '
+                    'positions manually, close/reconcile as needed, then either delete the "position" key '
+                    f'from {STATE_FILE} (if already flat) or restore the old script version until it is.'
+                )
             log.info(f'Resuming from persisted state: {state}')
             return state
         log.info(f'Persisted state is for {state.get("date")}, not today - starting fresh')
@@ -871,6 +933,60 @@ def _save_state(state):
     with open(tmp, 'w') as f:
         json.dump(state, f, indent=2)
     os.replace(tmp, STATE_FILE)
+
+
+def _load_last_candle(checkpoint):
+    """Best-effort restore of prev_pinned_ce/prev_pinned_pe from disk, so a restart doesn't lose the
+    "1 minute ago" reading the last-candle direction check depends on (see run_day). Returns
+    (None, None) on ANY problem at all - missing file, wrong day, checkpoint pinned a different
+    strike since this was saved, the reading is older than LAST_CANDLE_MAX_AGE_SECONDS, corrupt
+    JSON, whatever - this never raises. The caller just proceeds as if this were a fresh start,
+    which is always safe: run_day's own "no clear driver yet" skip already handles prev_pinned_ce/pe
+    being None, same as any other cold start."""
+    try:
+        if not os.path.exists(LAST_CANDLE_FILE):
+            return None, None
+        with open(LAST_CANDLE_FILE) as f:
+            data = json.load(f)
+        if data.get('date') != _today_str():
+            return None, None
+        if checkpoint is None or data.get('checkpoint_strike') != checkpoint.get('strike'):
+            return None, None
+        age = (datetime.now() - datetime.fromisoformat(data['as_of'])).total_seconds()
+        if age > LAST_CANDLE_MAX_AGE_SECONDS:
+            log.info(f'Restored last-candle reading is {age:.0f}s old (> {LAST_CANDLE_MAX_AGE_SECONDS}s) - '
+                      f'discarding, will need a fresh in-process reading first', extra={'no_telegram': True})
+            return None, None
+        log.info(f'Restored last-candle reading from disk: CE={data["ce"]} PE={data["pe"]} (age {age:.0f}s)',
+                  extra={'no_telegram': True})
+        return data['ce'], data['pe']
+    except Exception as exc:
+        try:
+            log.warning(f'_load_last_candle failed ({exc}) - starting without a restored reading', extra={'no_telegram': True})
+        except Exception:
+            pass
+        return None, None
+
+
+def _save_last_candle(checkpoint, ce_ltp, pe_ltp):
+    """Best-effort persist of this minute's pinned-strike CE/PE, purely so a restart can restore the
+    "1 minute ago" reading (see _load_last_candle/run_day). This is NOT trading state - unlike
+    _save_state, a failure here must never interrupt trading, hence the broad except swallowing
+    everything (including a failure in the logging call itself)."""
+    try:
+        tmp = LAST_CANDLE_FILE + '.tmp'
+        data = {
+            'date': _today_str(), 'checkpoint_strike': checkpoint['strike'],
+            'ce': ce_ltp, 'pe': pe_ltp, 'as_of': datetime.now().isoformat(),
+        }
+        with open(tmp, 'w') as f:
+            json.dump(data, f)
+        os.replace(tmp, LAST_CANDLE_FILE)
+    except Exception as exc:
+        try:
+            log.warning(f'_save_last_candle failed ({exc}) - "1 minute ago" reading may not survive a restart right now', extra={'no_telegram': True})
+        except Exception:
+            pass
 
 
 # ── Strategy ──────────────────────────────────────────────────────────────
@@ -885,17 +1001,20 @@ def _pinned_premium(zerodha_options, checkpoint):
 
 
 def _position_combined_premium(zerodha_options, position):
-    """Live combined (CE+PE) premium of an open position's actual legs - each looked up by the
-    strike/type recorded on that leg at entry (not the checkpoint's pinned strike, though today
-    they're always the same strike - this just reads directly off what's actually held)."""
-    return sum(get_option_ltp(zerodha_options, leg['strike'], opt) for opt, leg in position['legs'].items())
+    """Live combined (CE+PE) premium of the TRACKED ATM strike - position['atm_legs'], snapshotted
+    at entry (both CE and PE, even though only ONE of them, position['legs'], was ever actually
+    bought - see module docstring and _enter_position). Looked up by strike/type fixed at entry,
+    not via state['checkpoint'] (which can itself move on to a later checkpoint's strike while this
+    position is still open) - so this stays pinned to the exact strike this position's own stoploss
+    was defined against, immune to that drift."""
+    return sum(get_option_ltp(zerodha_options, leg['strike'], opt) for opt, leg in position['atm_legs'].items())
 
 
 def _position_combined_entry(position):
-    """Combined actual fill price the open position was bought at - sum of each leg's own entry
-    fill (not the pre-fill LTP-based 'entry_atm_premium' snapshot taken before orders were placed),
-    matching how _close_position computes realized pnl."""
-    return sum(leg['entry'] for leg in position['legs'].values())
+    """Combined ATM entry premium (both legs, see _position_combined_premium above) the position's
+    stoploss is measured from - the LTP-based snapshot taken at entry, not a fill price (only ONE
+    leg, position['legs'], was ever actually filled - see module docstring)."""
+    return sum(leg['entry'] for leg in position['atm_legs'].values())
 
 
 def _run_legs_in_parallel(tasks):
@@ -920,39 +1039,38 @@ def _run_legs_in_parallel(tasks):
     return results
 
 
-def _enter_position(state, checkpoint):
-    """Buy the 1st-OTM strangle derived from the checkpoint's pinned ATM strike - the tracking
-    signal (checkpoint['strike']/checkpoint['premium']) stays ATM throughout, but the strikes
-    actually bought are one interval either side of it (CE = ATM+interval, PE = ATM-interval),
-    via otm_strikes. So the logged spike is against the ATM premium; the fill prices below are
-    each OTM leg's own live LTP."""
+def _enter_position(state, checkpoint, option_type, trigger_driver, ce_ltp, pe_ltp):
+    """Buy ONE first-OTM leg derived from the checkpoint's pinned ATM strike - the tracking signal
+    (checkpoint['strike']/checkpoint['premium']) stays ATM throughout, but the strike actually
+    bought is one interval to that leg's OTM side (CE = ATM+interval, PE = ATM-interval), via
+    otm_strikes. `option_type` (which leg to buy - already resolved by _direction_for_driver, so
+    INVERT_DIRECTION has already been applied) and `trigger_driver` (which leg actually drove the
+    trigger, pre-inversion, purely for logging) are decided by the caller; `ce_ltp`/`pe_ltp` are the
+    ATM strike's own live premiums at the trigger minute, reused here (not re-fetched) so the
+    combined ATM entry snapshot below reflects the exact instant the trigger fired, matching what
+    was actually compared against SPIKE_POINTS.
+
+    STOPLOSS_POINTS still tracks the COMBINED ATM premium (both CE and PE, snapshotted below as
+    position['atm_legs']) as if the whole straddle were held, even though only `option_type` is
+    ever actually bought - matching Data/backtests/backtest_atm_spike_v3.py's 'combined'
+    STOPLOSS_MODE exactly; see _position_combined_premium/_position_combined_entry."""
     contracts = _load_aliceblue_contracts()
     contracts_by_strike_type = {(int(float(c['strike_price'])), c['option_type']): c for c in contracts}
     zerodha_options = _load_zerodha_current_week_options()
-    atm_premium, _atm_ce_ltp, _atm_pe_ltp = _pinned_premium(zerodha_options, checkpoint)
+    atm_premium = ce_ltp + pe_ltp
     ce_strike, pe_strike = otm_strikes(checkpoint['strike'], CFG['strike_interval'])
     strikes = {'CE': ce_strike, 'PE': pe_strike}
-    ce_ltp = get_option_ltp(zerodha_options, ce_strike, 'CE')
-    pe_ltp = get_option_ltp(zerodha_options, pe_strike, 'PE')
+    strike = strikes[option_type]
     log.info(f'Spike buy: {SYMBOL} ATM tracking strike={checkpoint["strike"]} combined_premium='
              f'{atm_premium:.1f} (+{atm_premium - checkpoint["premium"]:.1f} vs checkpoint '
-             f'{checkpoint["premium"]:.1f}) - buying 1st-OTM strikes=CE:{ce_strike}/PE:{pe_strike}')
+             f'{checkpoint["premium"]:.1f}) - driver={trigger_driver} - buying 1st-OTM {option_type} strike={strike}'
+             + (f' (INVERT_DIRECTION: driver was {trigger_driver}, buying {option_type} instead)' if trigger_driver != option_type else ''))
 
-    instruments = {}
-    for opt, ltp in (('CE', ce_ltp), ('PE', pe_ltp)):
-        contract = contracts_by_strike_type[(strikes[opt], opt)]
-        instruments[opt] = (_to_instrument(contract), ltp)
-
-    entry_prices = _run_legs_in_parallel({
-        opt: (lambda instrument=instrument, ltp=ltp: buy_leg(instrument, instrument.lot_size * CFG['lots'], ltp))
-        for opt, (instrument, ltp) in instruments.items()
-    })
-    legs = {}
-    for opt, (instrument, _ltp) in instruments.items():
-        legs[opt] = {
-            'instrument': _instrument_to_dict(instrument), 'quantity': instrument.lot_size * CFG['lots'],
-            'strike': strikes[opt], 'entry': entry_prices[opt],
-        }
+    ltp = get_option_ltp(zerodha_options, strike, option_type)
+    contract = contracts_by_strike_type[(strike, option_type)]
+    instrument = _to_instrument(contract)
+    quantity = instrument.lot_size * CFG['lots']
+    entry_price = buy_leg(instrument, quantity, ltp)
 
     now = datetime.now()
     state['position'] = {
@@ -960,7 +1078,17 @@ def _enter_position(state, checkpoint):
         'deadline': (now + timedelta(minutes=HOLD_MINUTES)).isoformat(),
         'checkpoint_premium': checkpoint['premium'],
         'entry_atm_premium': atm_premium,
-        'legs': legs,
+        'option_type': option_type, 'trigger_driver': trigger_driver,
+        'legs': {option_type: {
+            'instrument': _instrument_to_dict(instrument), 'quantity': quantity,
+            'strike': strike, 'entry': entry_price,
+        }},
+        # both ATM legs' live premium at entry, for the combined stoploss only - NOT both bought,
+        # see module docstring / _position_combined_premium.
+        'atm_legs': {
+            'CE': {'strike': checkpoint['strike'], 'entry': ce_ltp},
+            'PE': {'strike': checkpoint['strike'], 'entry': pe_ltp},
+        },
     }
     state['checkpoint_used'] = True
     _save_state(state)
@@ -984,7 +1112,7 @@ def _close_position(state, reason):
     })
     pnl = sum(exit_prices[opt] - leg['entry'] for opt, leg in position['legs'].items())  # long: profit when exit > entry
 
-    log.info(f'Closed {SYMBOL} spike-buy straddle ({reason}) - pnl ~{pnl:.1f} pts')
+    log.info(f'Closed {SYMBOL} spike-buy {position["option_type"]} leg ({reason}) - pnl ~{pnl:.1f} pts')
     state['position'] = None
     _save_state(state)
 
@@ -994,6 +1122,13 @@ def run_day():
     _order_book_cache.start()  # shared poller backing every _wait_for_fill_price/_force_exit_leg
     _positions_cache.start()   # order-book/positions read for the rest of the day - see _PollingCache
     state = _load_state()
+    # the pinned checkpoint strike's ATM CE/PE premium one minute ago - used to judge which leg
+    # drove the trigger minute's rise (see run_day's signal check below and
+    # Data/backtests/backtest_atm_spike_v3.py's ce_last_candle_spike/pe_last_candle_spike). Reset to
+    # None every time a fresh checkpoint pins a new strike (that strike has no "one minute ago"
+    # reading yet under this process). Restored from disk if available/fresh/matching the currently
+    # pinned strike (see _load_last_candle) so a restart mid-checkpoint-window doesn't lose it.
+    prev_pinned_ce, prev_pinned_pe = _load_last_candle(state['checkpoint'])
 
     now_t = datetime.now().time()
     if now_t >= EXIT_TIME and state['position'] is None and not [c for c in CHECK_TIMES if _label(c) not in state['checkpoints_done']]:
@@ -1081,6 +1216,7 @@ def run_day():
                 strike, ce_ltp, pe_ltp = _current_atm(zerodha_options)
                 state['checkpoint'] = {'strike': strike, 'premium': ce_ltp + pe_ltp}
                 state['checkpoint_used'] = False
+                prev_pinned_ce, prev_pinned_pe = None, None  # fresh strike - no "1 minute ago" yet
                 log.info(f'{label} checkpoint: {SYMBOL} pinned ATM strike={strike} '
                          f'baseline={state["checkpoint"]["premium"]:.1f}')
             except Exception:
@@ -1104,14 +1240,62 @@ def run_day():
                     _close_position(state, 'TIME_EXIT')
             elif state['checkpoint'] is not None and not state['checkpoint_used']:
                 zerodha_options = _load_zerodha_current_week_options()
-                current_premium, _, _ = _pinned_premium(zerodha_options, state['checkpoint'])
+                current_premium, ce_ltp, pe_ltp = _pinned_premium(zerodha_options, state['checkpoint'])
                 gap = current_premium - state['checkpoint']['premium']
-                log.info(f'{SYMBOL} pinned ATM strike={state["checkpoint"]["strike"]} '
-                         f'premium={current_premium:.1f} '
-                         f'baseline={state["checkpoint"]["premium"]:.1f} (+{gap:.1f}, '
-                         f'need +{SPIKE_POINTS} to trigger)', extra={'no_telegram': True})
+
+                # each leg's own move over just the last minute - pure arithmetic, no I/O, computed
+                # unconditionally (NOT inside the logging try/except below) so a logging hiccup can
+                # never affect the actual trigger_driver decision a few lines down.
+                ce_last_candle = (ce_ltp - prev_pinned_ce) if prev_pinned_ce is not None else None
+                pe_last_candle = (pe_ltp - prev_pinned_pe) if prev_pinned_pe is not None else None
+
+                # logged every tick (not just on a trigger) so the full CE/PE split behind every
+                # direction decision - or non-decision - is on record, not just the combined number.
+                # Isolated in its own try/except, separate from the trading try/except this whole
+                # block already sits inside: a logging/formatting failure here must never prevent
+                # the actual gap/trigger_driver/_enter_position logic below from running.
+                try:
+                    prev_ce_str = 'n/a' if prev_pinned_ce is None else f'{prev_pinned_ce:.1f}'
+                    prev_pe_str = 'n/a' if prev_pinned_pe is None else f'{prev_pinned_pe:.1f}'
+                    ce_delta_str = 'n/a' if ce_last_candle is None else f'{ce_last_candle:+.1f}'
+                    pe_delta_str = 'n/a' if pe_last_candle is None else f'{pe_last_candle:+.1f}'
+                    log.info(
+                        f'{SYMBOL} pinned ATM strike={state["checkpoint"]["strike"]} '
+                        f'CE={ce_ltp:.1f} (prev {prev_ce_str}, {ce_delta_str} last candle) '
+                        f'PE={pe_ltp:.1f} (prev {prev_pe_str}, {pe_delta_str} last candle) '
+                        f'combined={current_premium:.1f} baseline={state["checkpoint"]["premium"]:.1f} '
+                        f'(+{gap:.1f}, need +{SPIKE_POINTS} to trigger)', extra={'no_telegram': True},
+                    )
+                except Exception as exc:
+                    print(f'CE/PE split logging failed ({exc}) - continuing regardless', file=sys.stderr)
+
                 if gap >= SPIKE_POINTS:
-                    _enter_position(state, state['checkpoint'])
+                    # which leg drove THIS minute's rise, not the whole checkpoint window's - only
+                    # a leg actually bought, see module docstring / _enter_position.
+                    trigger_driver = None
+                    if ce_last_candle is not None and pe_last_candle is not None:
+                        if ce_last_candle > pe_last_candle:
+                            trigger_driver = 'CE'
+                        elif pe_last_candle > ce_last_candle:
+                            trigger_driver = 'PE'
+                        # else: tie - no clear driver, no trade (checkpoint stays live, retried next minute)
+                    if trigger_driver is None:
+                        try:
+                            log.info(f'{SYMBOL} spike condition met (+{gap:.1f}) but no clear last-candle '
+                                      f'driver (CE {ce_last_candle}, PE {pe_last_candle}) - '
+                                      f'skipping this minute, checkpoint stays live', extra={'no_telegram': True})
+                        except Exception as exc:
+                            print(f'no-driver logging failed ({exc}) - continuing regardless', file=sys.stderr)
+                    else:
+                        option_type = _direction_for_driver(trigger_driver)
+                        try:
+                            log.info(f'{SYMBOL} last-candle split: CE {ce_last_candle:+.1f}, PE {pe_last_candle:+.1f} '
+                                     f'-> driver={trigger_driver}')
+                        except Exception as exc:
+                            print(f'driver-decision logging failed ({exc}) - continuing regardless', file=sys.stderr)
+                        _enter_position(state, state['checkpoint'], option_type, trigger_driver, ce_ltp, pe_ltp)
+                prev_pinned_ce, prev_pinned_pe = ce_ltp, pe_ltp
+                _save_last_candle(state['checkpoint'], ce_ltp, pe_ltp)  # already fails safe internally - see its own docstring
             elif state['checkpoint'] is not None and state['checkpoint_used']:
                 log.info(f'{SYMBOL} pinned ATM strike={state["checkpoint"]["strike"]} baseline='
                          f'{state["checkpoint"]["premium"]:.1f} already used - waiting for next '

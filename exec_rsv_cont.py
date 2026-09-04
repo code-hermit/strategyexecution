@@ -13,8 +13,8 @@ resting per-leg STOPLOSS_PCT stoploss. Every CHECKPOINT_INTERVAL thereafter:
   - else: re-enter any leg that isn't currently open (its resting stoploss got hit and closed the
     position) at the same strike; leave already-open legs alone.
 
-NIFTY gets a CHECKPOINT_INTERVAL of 2 hours on Fridays instead of 1 - ported verbatim from the
-backtest's own Friday special-case.
+NIFTY's Friday special-case is carried over from the backtest too, but it's a no-op: the backtest
+sets a 1-hour CHECKPOINT_INTERVAL on Fridays, same as every other day, so this file does the same.
 
 On "continuous": the backtest's _continuous variant exists to fix a *backtesting* limitation - a
 close-only, once-a-minute stoploss check can miss (or overshoot) a fast intrabar move, so it
