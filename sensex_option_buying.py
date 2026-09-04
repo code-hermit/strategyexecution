@@ -1,11 +1,15 @@
 """
-What it is: a standalone ATM-straddle buy strategy — no short leg anywhere in this file.
+What it is: a standalone premium-spike buy strategy — no short leg anywhere in this file.
+Tracking (the checkpoint baseline and the spike signal) is done purely on the ATM straddle;
+execution (the strikes actually bought when a spike fires) buys the 1st-OTM strangle instead -
+CE strike = ATM + strike_interval, PE strike = ATM - strike_interval, both derived from the same
+pinned ATM strike. See _enter_position.
 
 Window: 10:15 (ENTRY_TIME) → 15:13 (EXIT_TIME, forced day-end square-off).
 
 Checkpoints: 10:15, 11:15, 12:15, 13:15, 14:15 (CHECK_TIMES). At each one, the combined ATM straddle premium (ATM CE close + ATM PE close) is recorded as the current baseline, overwriting whatever baseline the previous checkpoint set.
 
-Signal (checked every minute, not just at checkpoints): if the live combined ATM premium has risen SPIKE_POINTS = 50 points or more above the latest checkpoint's baseline, buy the ATM straddle (CE+PE) right then.
+Signal (checked every minute, not just at checkpoints): if the live combined ATM premium has risen SPIKE_POINTS = 50 points or more above the latest checkpoint's baseline, buy the 1st-OTM strangle (CE+PE) right then.
 
 Exit: hold for HOLD_MINUTES = 15 minutes, then exit at the first minute at/after that deadline (TIME_EXIT), or at day end if 15:13 arrives first (EOD).
 
@@ -26,11 +30,13 @@ Underlying handling: defaults to NIFTY; pass an underlying as the first CLI arg 
 Live version of Data/backtests/backtest_atm_premium_spike_buy_v2.py, SENSEX only. Ported rule-for-rule
 from that backtest's run_day(): checkpoints refresh the baseline regardless of whether a position is
 open (so the baseline is current the moment a position closes, and re-armed since nothing has
-traded off the fresh value yet); unlike v1, each checkpoint *pins* the exact strike (CE+PE) tagged
-ATM at that moment, and the spike check and the straddle actually bought both track that same pinned
-strike's premium for the rest of the hour - even after spot moves on and a different strike becomes
-the new ATM - so a strike roll can never masquerade as a premium spike, or vice versa; a still-open
-position is force-closed at day end even if its hold deadline hasn't arrived.
+traded off the fresh value yet); unlike v1, each checkpoint *pins* the exact ATM strike tagged at
+that moment, and the spike check keeps tracking that same pinned strike's ATM premium for the rest
+of the hour - even after spot moves on and a different strike becomes the new ATM - so a strike roll
+can never masquerade as a premium spike, or vice versa. When a spike fires, the strangle actually
+bought is the 1st-OTM pair derived from that same pinned ATM strike (not whatever's ATM/1st-OTM at
+that instant), for the same reason; a still-open position is force-closed at day end even if its
+hold deadline hasn't arrived.
 
 Progress (today's checkpoints already applied, the current baseline, whether it's used up, and any
 open position's legs/entry prices/deadline) is persisted to STATE_FILE after every change, so a
@@ -237,6 +243,13 @@ def atm_strike(spot, strike_interval):
     return round(spot / strike_interval) * strike_interval
 
 
+def otm_strikes(spot, strike_interval):
+    """1st-out-of-the-money strike for each leg: CE strike one interval above ATM (OTM for a
+    call), PE strike one interval below ATM (OTM for a put)."""
+    atm = atm_strike(spot, strike_interval)
+    return atm + strike_interval, atm - strike_interval
+
+
 # ── Zerodha (REST, Kite Connect) - market data only ─────────────────────────
 ZERODHA_API_KEY = os.getenv('ZERODHA_API_KEY')
 ZERODHA_TOKEN_FILE = os.path.join(os.path.dirname(__file__), 'zerodha_token.json')
@@ -377,6 +390,9 @@ def get_option_ltp(zerodha_options, strike, option_type):
 
 
 def _current_atm(zerodha_options):
+    """ATM strike/premium - what the checkpoint baseline and spike signal are tracked against.
+    Execution (the strikes actually bought) uses the 1st-OTM strikes derived from this same
+    pinned ATM strike instead - see _enter_position/otm_strikes."""
     spot = get_spot_ltp()
     strike = atm_strike(spot, CFG['strike_interval'])
     ce_ltp = get_option_ltp(zerodha_options, strike, 'CE')
@@ -822,10 +838,10 @@ def sell_leg(instrument, quantity, get_fresh_ltp):
 def _fresh_state():
     return {
         'date': _today_str(),
-        'checkpoint': None,  # {'strike', 'premium'} - the exact strike pinned at the last checkpoint
+        'checkpoint': None,  # {'strike', 'premium'} - the exact ATM strike pinned at the last checkpoint
         'checkpoint_used': False,
         'checkpoints_done': [],
-        'position': None,  # {'entry_time', 'deadline', 'checkpoint_premium', 'entry_premium', 'legs': {'CE': {...}, 'PE': {...}}}
+        'position': None,  # {'entry_time', 'deadline', 'checkpoint_premium', 'entry_atm_premium', 'legs': {'CE': {...}, 'PE': {...}}}
     }
 
 
@@ -834,12 +850,13 @@ def _load_state():
         with open(STATE_FILE) as f:
             state = json.load(f)
         if state.get('date') == _today_str():
-            if 'checkpoint' not in state:
-                # pre-pinned-strike (v1) schema left over from an old checkpoint_premium-only state
-                # file - the strike that set that baseline was never recorded, so it can't be
-                # migrated; drop it and let the bootstrap logic below re-pin a fresh (approximate)
-                # baseline from the current checkpoint window.
-                log.warning(f'Persisted state uses the old schema (no pinned strike) - discarding '
+            if 'checkpoint' not in state or (state.get('checkpoint') and 'strike' not in state['checkpoint']):
+                # pre-pinned-strike (v1, no 'checkpoint' key at all) or pre-ATM-tracking (e.g. a
+                # transient 'ce_strike'/'pe_strike'-only schema) left over from an older run -
+                # either way the exact strike that set that baseline can't be migrated; drop it
+                # and let the bootstrap logic below re-pin a fresh (approximate) baseline from the
+                # current checkpoint window.
+                log.warning(f'Persisted state uses an old/incompatible schema - discarding '
                             f'stale baseline {state.pop("checkpoint_premium", None)}, will re-pin fresh')
                 state['checkpoint'] = None
                 state['checkpoint_used'] = False
@@ -858,9 +875,10 @@ def _save_state(state):
 
 # ── Strategy ──────────────────────────────────────────────────────────────
 def _pinned_premium(zerodha_options, checkpoint):
-    """Live combined premium of the checkpoint's pinned strike - the SAME strike pinned at the
+    """Live combined ATM premium of the checkpoint's pinned strike - the SAME strike pinned at the
     checkpoint, tracked directly by strike/type rather than via the ATM tag, which may have moved
-    off this strike by now."""
+    off this strike by now. This is the tracking signal only - execution buys the 1st-OTM strikes
+    derived from this same pinned strike, see _enter_position."""
     ce_ltp = get_option_ltp(zerodha_options, checkpoint['strike'], 'CE')
     pe_ltp = get_option_ltp(zerodha_options, checkpoint['strike'], 'PE')
     return ce_ltp + pe_ltp, ce_ltp, pe_ltp
@@ -875,7 +893,7 @@ def _position_combined_premium(zerodha_options, position):
 
 def _position_combined_entry(position):
     """Combined actual fill price the open position was bought at - sum of each leg's own entry
-    fill (not the pre-fill LTP-based 'entry_premium' snapshot taken before orders were placed),
+    fill (not the pre-fill LTP-based 'entry_atm_premium' snapshot taken before orders were placed),
     matching how _close_position computes realized pnl."""
     return sum(leg['entry'] for leg in position['legs'].values())
 
@@ -903,19 +921,26 @@ def _run_legs_in_parallel(tasks):
 
 
 def _enter_position(state, checkpoint):
-    """Buy the checkpoint's pinned strike's straddle - the same strike/leg symbols pinned at the
-    checkpoint that set `checkpoint['premium']`, not whatever's ATM right now."""
+    """Buy the 1st-OTM strangle derived from the checkpoint's pinned ATM strike - the tracking
+    signal (checkpoint['strike']/checkpoint['premium']) stays ATM throughout, but the strikes
+    actually bought are one interval either side of it (CE = ATM+interval, PE = ATM-interval),
+    via otm_strikes. So the logged spike is against the ATM premium; the fill prices below are
+    each OTM leg's own live LTP."""
     contracts = _load_aliceblue_contracts()
     contracts_by_strike_type = {(int(float(c['strike_price'])), c['option_type']): c for c in contracts}
     zerodha_options = _load_zerodha_current_week_options()
-    strike = checkpoint['strike']
-    entry_premium, ce_ltp, pe_ltp = _pinned_premium(zerodha_options, checkpoint)
-    log.info(f'Spike buy: {SYMBOL} pinned_strike={strike} combined_premium={entry_premium:.1f} '
-             f'(+{entry_premium - checkpoint["premium"]:.1f} vs checkpoint {checkpoint["premium"]:.1f})')
+    atm_premium, _atm_ce_ltp, _atm_pe_ltp = _pinned_premium(zerodha_options, checkpoint)
+    ce_strike, pe_strike = otm_strikes(checkpoint['strike'], CFG['strike_interval'])
+    strikes = {'CE': ce_strike, 'PE': pe_strike}
+    ce_ltp = get_option_ltp(zerodha_options, ce_strike, 'CE')
+    pe_ltp = get_option_ltp(zerodha_options, pe_strike, 'PE')
+    log.info(f'Spike buy: {SYMBOL} ATM tracking strike={checkpoint["strike"]} combined_premium='
+             f'{atm_premium:.1f} (+{atm_premium - checkpoint["premium"]:.1f} vs checkpoint '
+             f'{checkpoint["premium"]:.1f}) - buying 1st-OTM strikes=CE:{ce_strike}/PE:{pe_strike}')
 
     instruments = {}
     for opt, ltp in (('CE', ce_ltp), ('PE', pe_ltp)):
-        contract = contracts_by_strike_type[(strike, opt)]
+        contract = contracts_by_strike_type[(strikes[opt], opt)]
         instruments[opt] = (_to_instrument(contract), ltp)
 
     entry_prices = _run_legs_in_parallel({
@@ -926,7 +951,7 @@ def _enter_position(state, checkpoint):
     for opt, (instrument, _ltp) in instruments.items():
         legs[opt] = {
             'instrument': _instrument_to_dict(instrument), 'quantity': instrument.lot_size * CFG['lots'],
-            'strike': strike, 'entry': entry_prices[opt],
+            'strike': strikes[opt], 'entry': entry_prices[opt],
         }
 
     now = datetime.now()
@@ -934,7 +959,7 @@ def _enter_position(state, checkpoint):
         'entry_time': now.isoformat(),
         'deadline': (now + timedelta(minutes=HOLD_MINUTES)).isoformat(),
         'checkpoint_premium': checkpoint['premium'],
-        'entry_premium': entry_premium,
+        'entry_atm_premium': atm_premium,
         'legs': legs,
     }
     state['checkpoint_used'] = True
@@ -991,8 +1016,8 @@ def run_day():
             state['checkpoint_used'] = False
             state['checkpoints_done'].append(_label(recent[-1]))
             log.info(f'Started after {recent[-1]} with no baseline recorded - bootstrapping pinned '
-                     f'strike={strike} baseline={state["checkpoint"]["premium"]:.1f} from the current '
-                     f'premium (approximate)')
+                     f'ATM strike={strike} baseline={state["checkpoint"]["premium"]:.1f} from the '
+                     f'current premium (approximate)')
             _save_state(state)
 
     checkpoint_failure_count = 0
@@ -1056,7 +1081,8 @@ def run_day():
                 strike, ce_ltp, pe_ltp = _current_atm(zerodha_options)
                 state['checkpoint'] = {'strike': strike, 'premium': ce_ltp + pe_ltp}
                 state['checkpoint_used'] = False
-                log.info(f'{label} checkpoint: {SYMBOL} pinned_strike={strike} baseline={state["checkpoint"]["premium"]:.1f}')
+                log.info(f'{label} checkpoint: {SYMBOL} pinned ATM strike={strike} '
+                         f'baseline={state["checkpoint"]["premium"]:.1f}')
             except Exception:
                 checkpoint_failure_count += 1
                 _log_failure_throttled(
@@ -1080,13 +1106,14 @@ def run_day():
                 zerodha_options = _load_zerodha_current_week_options()
                 current_premium, _, _ = _pinned_premium(zerodha_options, state['checkpoint'])
                 gap = current_premium - state['checkpoint']['premium']
-                log.info(f'{SYMBOL} pinned_strike={state["checkpoint"]["strike"]} premium={current_premium:.1f} '
+                log.info(f'{SYMBOL} pinned ATM strike={state["checkpoint"]["strike"]} '
+                         f'premium={current_premium:.1f} '
                          f'baseline={state["checkpoint"]["premium"]:.1f} (+{gap:.1f}, '
                          f'need +{SPIKE_POINTS} to trigger)', extra={'no_telegram': True})
                 if gap >= SPIKE_POINTS:
                     _enter_position(state, state['checkpoint'])
             elif state['checkpoint'] is not None and state['checkpoint_used']:
-                log.info(f'{SYMBOL} pinned strike={state["checkpoint"]["strike"]} baseline='
+                log.info(f'{SYMBOL} pinned ATM strike={state["checkpoint"]["strike"]} baseline='
                          f'{state["checkpoint"]["premium"]:.1f} already used - waiting for next '
                          f'checkpoint ({_label(EXIT_TIME)} EOD if none left today)',
                          extra={'no_telegram': True})
