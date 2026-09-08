@@ -454,7 +454,11 @@ def _aliceblue_post(path, payload):
     resp = requests.post(
         ALICEBLUE_BASE_URL + path, json=payload, headers=_aliceblue_headers(ALICEBLUE_SESSION_ID), timeout=REQUEST_TIMEOUT,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        # raise_for_status() alone discards the response body - AliceBlue's actual rejection
+        # reason (e.g. why /orders/modify 400s) lives there, not in the bare "400 Client Error"
+        # message, so surface it before raising.
+        raise RuntimeError(f'AliceBlue POST {path} failed ({resp.status_code}): {resp.text}')
     return _aliceblue_result(path, resp.json())
 
 
@@ -544,26 +548,26 @@ def _cancel_order(broker_order_id):
 
 
 def _modify_order(broker_order_id, instrument, quantity, order_type, price, trigger_price=None):
-    """Reprices a resting order in place via AliceBlue's /orders/modifyorder, mirroring
-    _place_order's payload shape plus the brokerOrderId identifying which order to change.
-    CAUTION: mcx_option_buying.py and mcx_short_straddle_premium_stoploss.py elsewhere in this
-    folder both document this same endpoint returning a live 400 Bad Request against the payload
-    shape they sent, and fell back to cancel+place-new. This may hit the same wall - see
-    _exit_chase_fill below, which tries this first but falls back to cancel+place-new the first
-    time this raises, so a modify rejection can never leave a live exit stuck."""
+    """Reprices a resting order in place. Payload matches AliceBlue's documented POST /orders/modify
+    exactly - see https://v2api.aliceblueonline.com/orders%20Management/ ('brokerOrderId' required;
+    quantity/orderType/price/slTriggerPrice/validity optional - no exchange/instrumentId/
+    transactionType/product needed, unlike /orders/placeorder). This supersedes the wider payload
+    this function used to send against /orders/modifyorder - the wrong endpoint entirely - which is
+    what mcx_option_buying.py and mcx_short_straddle_premium_stoploss.py elsewhere in this folder
+    document AliceBlue 400ing on, and which sensex_option_buying.py's own _modify_order already
+    fixed the same way. `instrument` is accepted but unused - kept so callers don't need to change -
+    AliceBlue's modify endpoint identifies the order purely by brokerOrderId.
+    _exit_chase_fill below still falls back to cancel+place-new if a modify call ever fails, so a
+    broker-side rejection can never leave a live exit stuck."""
     payload = {
         'brokerOrderId': broker_order_id,
-        'exchange': instrument.exchange,
-        'instrumentId': str(instrument.token),
         'quantity': quantity,
-        'product': 'INTRADAY',
-        'orderComplexity': 'REGULAR',
         'orderType': order_type,
-        'validity': 'DAY',
         'price': str(price),
         'slTriggerPrice': str(trigger_price) if trigger_price is not None else '',
+        'validity': 'DAY',
     }
-    return _aliceblue_post('/orders/modifyorder', payload)
+    return _aliceblue_post('/orders/modify', payload)
 
 
 def _wait_for_fill_price(broker_order_id):
