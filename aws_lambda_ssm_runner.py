@@ -138,7 +138,6 @@ def _run(ip_address):
                 "chown -R ec2-user:ec2-user /home/ec2-user/trading",
                 "chmod +x /home/ec2-user/trading/exec_rsv_cont.sh "
                 "/home/ec2-user/trading/exec_rsv_cont_sensex.sh "
-                "/home/ec2-user/trading/exec_rs_ps.sh "
                 "/home/ec2-user/trading/sensex_buying.sh "
                 "/home/ec2-user/trading/zerodha_ticker_service.sh",
                 # One cron line per weekday's strategy, rather than one daily line for
@@ -158,7 +157,6 @@ def _run(ip_address):
                     "echo \"42 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s zerodha_ticker '/home/ec2-user/trading/zerodha_ticker_service.sh'\"; "
                     "echo \"45 9 * * 1,5 /usr/bin/tmux new-session -d -s option_selling '/home/ec2-user/trading/exec_rsv_cont.sh'\"; "
                     "echo \"45 9 * * 3,4 /usr/bin/tmux new-session -d -s option_selling_sensex '/home/ec2-user/trading/exec_rsv_cont_sensex.sh'\"; "
-                    "echo \"45 9 * * 2 /usr/bin/tmux new-session -d -s option_selling_tn '/home/ec2-user/trading/exec_rs_ps.sh'\"; "
                     "echo \"15 10 * * * /usr/bin/tmux new-session -d -s sensex_buying '/home/ec2-user/trading/sensex_buying.sh'\") | crontab -u ec2-user -"
                 ),
 

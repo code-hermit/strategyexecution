@@ -1,20 +1,49 @@
 """
-Live execution of Data/backtests/backtest_rolling_straddle_variation_continuous.py: short a
+Live execution of a "chop" variant of exec_rsv_cont.py (which this file retires/replaces) - short a
 first-OTM strangle (FIRST_OTM_STRIKES away from ATM; 0 = ATM itself) at ENTRY_TIME, each leg with a
 resting per-leg STOPLOSS_PCT stoploss. Every CHECKPOINT_INTERVAL thereafter:
 
   - if the current ATM straddle premium (CE+PE at the true ATM strike, not the first-OTM legs
     actually traded) is HIGHER than it was at the previous checkpoint: take no new trade this
-    hour; if either leg is still open, close it outright.
-  - else if a leg's stoploss fired earlier this hour (see below): stay flat for this leg for the
-    rest of the hour - consumed here, not re-entered immediately.
+    hour; if either leg is still open, close it outright; cancel any resting chop reentry too (see
+    below) - a leg meant to stay flat for this reason stays GENUINELY flat, no lingering order.
   - else if either open leg has drifted off today's first-OTM strike (spot moved): roll the whole
-    strangle - close whatever's open, re-enter fresh at the new first-OTM strikes.
-  - else: re-enter any leg that isn't currently open (its resting stoploss got hit and closed the
-    position) at the same strike; leave already-open legs alone.
+    strangle - close whatever's open, cancel any resting chop reentry (the old strikes are gone),
+    re-enter fresh at the new first-OTM strikes.
+  - else (no premium rise, no drift - "the same legs can continue"): leave already-open legs alone;
+    leave any resting chop reentry order alone too, riding it straight through this checkpoint
+    boundary rather than disturbing it (see the CHOP section below) - only reopen a leg that's flat
+    with NO chop order resting either (chop placement itself failed earlier, or it never got a
+    first entry at all).
 
 NIFTY's Friday special-case is carried over from the backtest too, but it's a no-op: the backtest
 sets a 1-hour CHECKPOINT_INTERVAL on Fridays, same as every other day, so this file does the same.
+
+CHOP (this file's one behavioral addition over exec_rsv_cont.py, ported from
+Data/backtests/backtest_rs_var_chop_continuous.py "chop" backtest): when a leg's resting protective
+stoploss fires, instead of just staying flat until the next checkpoint reopens it, a resting AliceBlue
+SL order with transactionType SELL is placed immediately - triggerPrice at that leg's ORIGINAL entry
+price for the current checkpoint window (pinned once when the leg opened fresh/rolled/reopened, NOT
+this stoploss's own exit price), limit price a touch below the trigger so it's marketable the instant
+price actually falls back to that level. If price comes back down to it, this order fills and the
+leg is short again right there; a fresh protective BUY-side STOPLOSS_PCT stoploss is placed off
+wherever it ACTUALLY refilled (not necessarily exactly the pinned level). If that new stoploss fires
+again, another chop SELL order goes in at the SAME original pinned level - unlimited re-entries, no
+cap on how many times one leg can chop in and out (hence the name) - as long as nothing has forced a
+"stay flat" decision (ATM_PREMIUM_RISE, ROLL_OTM_DRIFT, the optional premium stoplosses,
+DAILY_LOSS_LIMIT, EOD - every one of these cancels any resting chop order outright, not just the
+open legs). Detected via the same fast SL_WATCH_INTERVAL_SECONDS-cadence background thread that
+already detects protective-SL fills (broker-side truth), extended to also poll the order book for a
+resting chop order's own status - a resting order that hasn't triggered yet never shows up in
+AliceBlue's positions endpoint, unlike a filled one.
+
+Crucially, per the "same legs can continue" checkpoint rule above, a chop watch is NOT forced to
+reset every hour the way a naive port of the backtest's per-checkpoint pinning might suggest: as
+long as the checkpoint's own decision is "nothing changed" (no roll, no premium rise), a leg that's
+mid-chop keeps watching the exact same original level straight through the checkpoint boundary,
+potentially for the rest of the day. Only ROLL_OTM_DRIFT and ATM_PREMIUM_RISE (which each mean the
+old level is no longer relevant) - plus the optional premium stoplosses, DAILY_LOSS_LIMIT, and EOD -
+actually cancel a resting chop order.
 
 On "continuous": the backtest's _continuous variant exists to fix a *backtesting* limitation - a
 close-only, once-a-minute stoploss check can miss (or overshoot) a fast intrabar move, so it
@@ -25,9 +54,10 @@ continuous than any minute-sampled backtest could simulate. So porting the *_con
 rules here means exactly what porting the plain (non-continuous) backtest's rules would have meant:
 a resting SL order per leg, same as execution_rolling_straddle_variation_mn_hs_fn.py's per-leg
 stoploss. Unlike that script, this one does NOT add the SENSEX flat-points stoploss override or the
-COMBINED_STOPLOSS_POINTS check - neither is part of backtest_rolling_straddle_variation_continuous.py's
-rules, so this stays a straight STOPLOSS_PCT-of-entry-premium stoploss on every underlying, matching
-the backtest exactly.
+COMBINED_STOPLOSS_POINTS check - neither is part of backtest_rs_var_chop_continuous.py's rules, so
+this stays a straight STOPLOSS_PCT-of-entry-premium stoploss on every underlying, matching the
+backtest exactly (chop reentries included - each reentry's own protective stoploss is the same flat
+STOPLOSS_PCT off wherever it refilled).
 
 Between checkpoints, polls every POLL_INTERVAL_SECONDS (not just once an hour) to:
   - notice a leg's resting stoploss has filled (broker-side truth, via AliceBlue positions) and
@@ -37,6 +67,8 @@ Between checkpoints, polls every POLL_INTERVAL_SECONDS (not just once an hour) t
   - halt trading for the day (square everything off, no more re-entries) once realized+unrealized
     pnl crosses -daily_loss_limit (points, unscaled by lot size; per-underlying via CFG - SENSEX 100
     matches the backtest, NIFTY overridden tighter at 40).
+The fast SL_WATCH_INTERVAL_SECONDS-cadence background thread additionally watches for a resting
+chop order's own fill (see CHOP above) independent of this slower poll cadence.
 
 EXIT_TIME is 15:13, not the backtest's literal 15:15 - a 2-minute live-trading safety buffer before
 the hard close, matching every other live script in this folder's convention (see
@@ -52,21 +84,21 @@ weekday codes, default every weekday - matching the backtest's own default). Lot
 both NIFTY and SENSEX (informational CFG below); pass a different symbol/weekday-codes pair on the
 command line to override.
 
-State (today's checkpoints, pinned baseline premium, open legs, realized pnl, halted flag) is
-persisted to STATE_FILE after every change, so a restart mid-day resumes instead of losing track of
-an open position. On startup with positions already open (mid-day restart, or legs placed
-manually), each leg's actual entry price is reconstructed from the AliceBlue order book's completed
-SELL fills where possible, falling back to live LTP (logged clearly as an approximation) only if
-that reconstruction fails - same approach as execution_rolling_straddle_variation_mn_hs_fn.py. A
-late start (process comes up after ENTRY_TIME with no positions open) always fires the initial entry
-immediately - there's no honor-checkpoints mode here.
+On startup with positions already open (mid-day restart, or legs placed manually), each leg's actual
+entry price is reconstructed from the AliceBlue order book's completed SELL fills where possible,
+falling back to live LTP (logged clearly as an approximation) only if that reconstruction fails -
+same approach as execution_rolling_straddle_variation_mn_hs_fn.py - and that reconstructed price is
+pinned as the leg's checkpoint-original entry price for chop purposes too. A late start (process
+comes up after ENTRY_TIME with no positions open) always fires the initial entry immediately -
+there's no honor-checkpoints mode here.
 
-Logging: goes to exec_rsv_cont.log and stdout. Lifecycle events (day start/skip, entries, exits,
-rolls, stoploss fills, halts, day summary) are additionally pushed to Telegram via alert() below,
-and any WARNING+ log record is pushed automatically as a safety net. A HEARTBEAT_INTERVAL "still
-running" ping goes out with the current legs, day pnl so far, and the last real event/timestamp.
-Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env; if either is missing, Telegram alerts
-(including heartbeats) are skipped (logged as a one-time warning) but trading proceeds normally.
+Logging: goes to exec_rsv_cont_chop.log and stdout. Lifecycle events (day start/skip, entries,
+exits, rolls, stoploss fills, chop reentries, halts, day summary) are additionally pushed to
+Telegram via alert() below, and any WARNING+ log record is pushed automatically as a safety net. A
+HEARTBEAT_INTERVAL "still running" ping goes out with the current legs, day pnl so far, and the last
+real event/timestamp. Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env; if either is
+missing, Telegram alerts (including heartbeats) are skipped (logged as a one-time warning) but
+trading proceeds normally.
 """
 
 import csv
@@ -90,12 +122,12 @@ import zerodha_ltp_client
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 # ── Logging ──────────────────────────────────────────────────────────────────────────────────
-LOG_FILE = os.path.join(os.path.dirname(__file__), 'exec_rsv_cont.log')
+LOG_FILE = os.path.join(os.path.dirname(__file__), 'exec_rsv_cont_chop.log')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 TELEGRAM_TIMEOUT = 10
 
-log = logging.getLogger('exec_rsv_cont')
+log = logging.getLogger('exec_rsv_cont_chop')
 log.setLevel(logging.INFO)
 log.propagate = False
 _formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
@@ -823,23 +855,14 @@ def _new_state():
     return {opt: None for opt in OPTION_TYPES}  # None, or {'instrument','strike','entry_price','quantity'}
 
 
-def _short_leg_with_stoploss(instrument, quantity, ltp):
-    """SELL to open, then a resting BUY SL (stop-loss LIMIT) at entry_price * (1 + STOPLOSS_PCT) -
-    flat percentage across every underlying, matching the backtest exactly (see module docstring
-    on why there's no SENSEX points-based override here, unlike
-    execution_rolling_straddle_variation_mn_hs_fn.py). Returns the fill price."""
-    entry_price = _round_to_tick(ltp * (1 - LIMIT_OFFSET_PCT), instrument.tick_size)
-    tag = f'{"[DRY RUN] " if DRY_RUN else ""}SELL {quantity} x {instrument.name} LIMIT @ {entry_price} (ltp {ltp})'
-    log.info(tag)
-    if DRY_RUN:
-        return entry_price
-
-    entry = _place_order('SELL', instrument, quantity, 'LIMIT', price=str(entry_price), order_tag='rsv_cont_entry')
-    order_no = entry.get('brokerOrderId')
-    if not order_no:
-        raise RuntimeError(f'{instrument.name} entry order rejected: {entry}')
-
-    entry_price = _wait_for_fill_price(order_no)
+def _place_protective_sl(instrument, quantity, entry_price, order_tag):
+    """Resting BUY SL (stop-loss LIMIT) at entry_price * (1 + STOPLOSS_PCT) - flat percentage
+    across every underlying, matching the backtest exactly (see module docstring on why there's no
+    SENSEX points-based override here, unlike execution_rolling_straddle_variation_mn_hs_fn.py).
+    Shared by a leg's very first entry (_short_leg_with_stoploss) and every chop reentry after it
+    (_handle_chop_fill) - each gets its own fresh stoploss off wherever it actually filled, not off
+    the checkpoint's pinned original level. Returns the protective order's broker order id, or None
+    in DRY_RUN (nothing is actually placed)."""
     # Rounded to the nearest integer, not just a tick - the exchange rejects SL trigger
     # prices for these contracts with "STOP PRICE IS NOT REASONABLE" unless they're whole
     # rupees.
@@ -847,11 +870,54 @@ def _short_leg_with_stoploss(instrument, quantity, ltp):
     # Nearest integer, not a tick - same "STOP PRICE IS NOT REASONABLE" rejection applies to the
     # SL order's limit price as well as its trigger.
     sl_limit_price = round(trigger_price * (1 + LIMIT_OFFSET_PCT))
-    log.info(f'{instrument.name} entered @ {entry_price}, SL trigger {trigger_price} limit {sl_limit_price}')
-
-    sl = _place_order('BUY', instrument, quantity, 'SL', price=str(sl_limit_price), trigger_price=trigger_price, order_tag='rsv_cont_sl')
+    if DRY_RUN:
+        log.info(f'{instrument.name} @ {entry_price}, SL trigger {trigger_price} limit {sl_limit_price} [DRY RUN, not placed]')
+        return None
+    sl = _place_order('BUY', instrument, quantity, 'SL', price=str(sl_limit_price), trigger_price=trigger_price, order_tag=order_tag)
     if not sl.get('brokerOrderId'):
         raise RuntimeError(f'{instrument.name} filled at {entry_price} but SL order rejected: {sl}')
+    log.info(f'{instrument.name} @ {entry_price}, SL trigger {trigger_price} limit {sl_limit_price}')
+    return sl['brokerOrderId']
+
+
+def _place_chop_reentry(instrument, quantity, original_entry_price):
+    """Resting AliceBlue SL order with transactionType SELL at `original_entry_price` (this leg's
+    ORIGINAL entry price for the current checkpoint window - see _pin_checkpoint_info, NOT wherever
+    the stoploss that just fired actually exited) - fires the instant price comes back down to that
+    level, re-shorting this leg right there. triggerPrice/limit rounded to the nearest rupee for the
+    same "STOP PRICE IS NOT REASONABLE" reason as _place_protective_sl; the limit sits a touch BELOW
+    the trigger (mirroring the protective SL's limit sitting above its trigger) so the released
+    order is marketable the instant the trigger condition is met. Returns the broker order id, or
+    None in DRY_RUN (nothing is actually placed - the chop-fill watch below then has nothing to poll
+    for, same DRY_RUN limitation the rest of this file already has for fills)."""
+    trigger_price = round(original_entry_price)
+    limit_price = round(trigger_price * (1 - LIMIT_OFFSET_PCT))
+    tag = f'{"[DRY RUN] " if DRY_RUN else ""}SELL-SL (chop reentry) {quantity} x {instrument.name} trigger {trigger_price} limit {limit_price}'
+    log.info(tag)
+    if DRY_RUN:
+        return None
+    order = _place_order('SELL', instrument, quantity, 'SL', price=str(limit_price), trigger_price=trigger_price, order_tag='rsv_cont_chop_reentry')
+    order_no = order.get('brokerOrderId')
+    if not order_no:
+        raise RuntimeError(f'{instrument.name} chop reentry order rejected: {order}')
+    return order_no
+
+
+def _short_leg_with_stoploss(instrument, quantity, ltp):
+    """SELL to open, then hand off to _place_protective_sl. Returns the fill price."""
+    entry_price = _round_to_tick(ltp * (1 - LIMIT_OFFSET_PCT), instrument.tick_size)
+    tag = f'{"[DRY RUN] " if DRY_RUN else ""}SELL {quantity} x {instrument.name} LIMIT @ {entry_price} (ltp {ltp})'
+    log.info(tag)
+    if DRY_RUN:
+        return entry_price
+
+    entry = _place_order('SELL', instrument, quantity, 'LIMIT', price=str(entry_price), order_tag='rsv_cont_chop_entry')
+    order_no = entry.get('brokerOrderId')
+    if not order_no:
+        raise RuntimeError(f'{instrument.name} entry order rejected: {entry}')
+
+    entry_price = _wait_for_fill_price(order_no)
+    _place_protective_sl(instrument, quantity, entry_price, order_tag='rsv_cont_chop_sl')
     return entry_price
 
 
@@ -880,26 +946,74 @@ def _run_legs_in_parallel(tasks):
     return results
 
 
-def _enter_leg(state, opt, instrument, ltp, strike, cfg):
+def _pin_checkpoint_info(day, opt, leg):
+    """Records `leg`'s instrument/strike/entry_price/quantity as THIS checkpoint window's ORIGINAL
+    entry for `opt` - the level a later stoploss on this leg chops back in against (see module
+    docstring). Called whenever a leg opens fresh, via a roll, or via a checkpoint's own reopen of a
+    genuinely-flat leg - deliberately NOT called after a chop reentry itself (_handle_chop_fill),
+    since a reentry's actual fill can differ slightly from the pinned level and re-pinning to it
+    would let the chop level drift a little each time instead of staying fixed for the checkpoint
+    window (or, per the "same legs can continue" checkpoint rule, potentially well beyond it)."""
+    day['checkpoint_info'][opt] = dict(
+        instrument=leg['instrument'], strike=leg['strike'],
+        entry_price=leg['entry_price'], quantity=leg['quantity'],
+    )
+    day['awaiting_chop'][opt] = False
+    day['chop_order_id'][opt] = None
+
+
+def _cancel_pending_chop(day, opt):
+    """Cancels `opt`'s resting chop SELL order if one exists and clears the chop-watch flags - used
+    any time a leg is meant to go/stay genuinely flat for a reason OTHER than "wait for price to
+    come back" (ATM_PREMIUM_RISE, ROLL_OTM_DRIFT, the optional premium stoplosses,
+    DAILY_LOSS_LIMIT, EOD). Also clears `checkpoint_info` - none of those reasons should leave a
+    stale pinned level lying around for some later, unrelated leg-open to trip over. Best-effort:
+    the order may already be filled/cancelled/gone by the time this runs (a race against the watch
+    thread noticing a fill) - any failure here is logged, never raised, since this is hygiene, not
+    the primary control flow."""
+    order_id = day['chop_order_id'][opt]
+    day['awaiting_chop'][opt] = False
+    day['chop_order_id'][opt] = None
+    day['checkpoint_info'][opt] = None
+    if order_id is None or DRY_RUN:
+        return
+    try:
+        _cancel_order(order_id)
+        log.info(f'{opt}: cancelled resting chop order {order_id}')
+    except Exception as exc:
+        log.warning(f'{opt}: cancel of resting chop order {order_id} failed (may already be filled/gone): {exc}', extra={'no_telegram': True})
+
+
+def _cancel_pending_chops(day):
+    for opt in OPTION_TYPES:
+        _cancel_pending_chop(day, opt)
+
+
+def _enter_leg(state, day, opt, instrument, ltp, strike, cfg):
     quantity = instrument.lot_size * cfg['lots']
     entry_price = _short_leg_with_stoploss(instrument, quantity, ltp)
-    with _state_lock:  # see _state_lock's comment - races the SL-watch thread's own clear
-        state[opt] = dict(instrument=instrument, strike=strike, entry_price=entry_price, quantity=quantity)
+    leg = dict(instrument=instrument, strike=strike, entry_price=entry_price, quantity=quantity)
+    with _state_lock:  # see _state_lock's comment - races the watch thread's own clear
+        state[opt] = leg
+        _pin_checkpoint_info(day, opt, leg)
     alert(f'ENTER {opt} {instrument.name} x{quantity} @ ~{entry_price} (SL {STOPLOSS_PCT:.0%})')
 
 
-def _enter_legs_parallel(state, desired, cfg, only_missing=False):
+def _enter_legs_parallel(state, day, desired, cfg, only_missing=False, skip_chopping=False):
     """Enter every (or, with only_missing, every currently-flat) leg in `desired` at once rather
-    than one after another - see _run_legs_in_parallel."""
+    than one after another - see _run_legs_in_parallel. skip_chopping additionally excludes a leg
+    that's flat with a resting chop order out (day['awaiting_chop']) - used by the checkpoint's
+    "nothing changed" branch, which lets a mid-chop leg ride straight through the checkpoint
+    boundary instead of being superseded by a fresh market-price entry (see module docstring)."""
     tasks = {
-        opt: (lambda opt=opt, instrument=instrument, ltp=ltp, strike=strike: _enter_leg(state, opt, instrument, ltp, strike, cfg))
+        opt: (lambda opt=opt, instrument=instrument, ltp=ltp, strike=strike: _enter_leg(state, day, opt, instrument, ltp, strike, cfg))
         for opt, (instrument, ltp, strike) in desired.items()
-        if not only_missing or state[opt] is None
+        if (not only_missing or state[opt] is None) and not (skip_chopping and day['awaiting_chop'][opt])
     }
     _run_legs_in_parallel(tasks)
 
 
-def _close_leg(state, opt, market, cfg, reason):
+def _close_leg(state, day, opt, market, cfg, reason):
     leg = state[opt]
     if leg is None:
         return None
@@ -914,7 +1028,11 @@ def _close_leg(state, opt, market, cfg, reason):
     realized_exit = fill_price if fill_price is not None else exit_ltp
     pnl = leg['entry_price'] - realized_exit
     alert(f'EXIT {opt} {leg["instrument"].name} @ ~{realized_exit} (entry ~{leg["entry_price"]}) pnl~{pnl:+.2f} reason={reason}')
-    state[opt] = None
+    with _state_lock:
+        state[opt] = None
+        day['checkpoint_info'][opt] = None
+        day['awaiting_chop'][opt] = False
+        day['chop_order_id'][opt] = None
     return pnl
 
 
@@ -1004,33 +1122,92 @@ def _close_leg_order(instrument, quantity, fallback_ltp=None):
         if str(o.get('instrumentId')) == str(instrument.token) and str(o.get('orderStatus', '')).lower() not in TERMINAL_ORDER_STATUSES:
             _cancel_order(o['brokerOrderId'])
 
-    return _exit_chase_fill(instrument, 'BUY', quantity, _fresh_ltp, order_tag='rsv_cont_exit')
+    return _exit_chase_fill(instrument, 'BUY', quantity, _fresh_ltp, order_tag='rsv_cont_chop_exit')
 
 
-def _close_open_legs(state, market, cfg, reason):
+def _close_open_legs(state, day, market, cfg, reason):
     tasks = {
-        opt: (lambda opt=opt: _close_leg(state, opt, market, cfg, reason))
+        opt: (lambda opt=opt: _close_leg(state, day, opt, market, cfg, reason))
         for opt in OPTION_TYPES if state[opt] is not None
     }
     results = _run_legs_in_parallel(tasks)
     return sum(pnl for pnl in results.values() if pnl is not None)
 
 
-_state_lock = threading.Lock()  # guards state[opt] wherever a concurrent thread could race a
-# read-then-write against it - specifically _enter_leg's write vs. _sync_stopped_out_legs' below,
-# now that the latter runs on its own dedicated thread (see SL_WATCH_INTERVAL_SECONDS) rather than
-# only inline in the main loop. A plain dict read elsewhere doesn't need it (CPython's GIL already
-# makes a single read/write atomic; the only unsafe pattern is read-then-write across threads).
+_state_lock = threading.Lock()  # guards state[opt]/day['checkpoint_info'/'awaiting_chop'/
+# 'chop_order_id'] wherever a concurrent thread could race a read-then-write against them -
+# specifically _enter_leg's/_close_leg's writes vs. _sync_stopped_out_and_chopped_legs' below, now
+# that the latter runs on its own dedicated thread (see SL_WATCH_INTERVAL_SECONDS) rather than only
+# inline in the main loop. A plain dict read elsewhere doesn't need it (CPython's GIL already makes
+# a single read/write atomic; the only unsafe pattern is read-then-write across threads).
 
 
-def _sync_stopped_out_legs(state, market):
-    """Broker-side truth: a leg we believe is open but whose position has vanished means its
-    resting stoploss filled. This IS the live "continuous" stoploss check - a real resting order
-    fires the instant price touches it; polling here just notices promptly. Runs on its own
-    SL_WATCH_INTERVAL_SECONDS-cadence background thread (see _sl_watch_loop) as well as inline
-    each main-loop cycle - noticing a fill promptly matters on its own, independent of the main
-    loop's heavier market-data-fetching cadence (see notes.md)."""
+def _handle_stoploss_fill(day, opt, leg):
+    """A leg we believed open just vanished from broker positions - its resting protective SL
+    fired. Arms this leg's chop watch: places a fresh resting SELL-SL at the ORIGINAL entry price
+    pinned for the current checkpoint window (see _pin_checkpoint_info) - NOT this stoploss's own
+    exit price - simulating a resting SELL order left at the level price ran away from."""
+    info = day['checkpoint_info'][opt]
+    exit_hint = f"entry ~{leg['entry_price']}"
+    if info is None:
+        # shouldn't happen (an open leg always has checkpoint_info pinned) but be defensive -
+        # nothing pinned to chop back to, stay flat.
+        alert(f'STOPLOSS FILLED: {opt} {leg["instrument"].name} ({exit_hint}) - no pinned entry to chop back to, staying flat')
+        return
+    alert(f'STOPLOSS FILLED: {opt} {leg["instrument"].name} ({exit_hint}) - placing chop reentry at original entry ~{info["entry_price"]}')
+    try:
+        order_id = _place_chop_reentry(info['instrument'], info['quantity'], info['entry_price'])
+    except Exception as exc:
+        log.error(f'{opt}: failed to place chop reentry order ({exc}) - staying flat this window', exc_info=True)
+        return
+    with _state_lock:
+        day['awaiting_chop'][opt] = True
+        day['chop_order_id'][opt] = order_id
+
+
+def _handle_chop_fill(state, day, opt, order_id, fill_price):
+    """The resting chop SELL order for `opt` has filled at `fill_price` (its actual average traded
+    price - not necessarily exactly the pinned original level it was resting at) - the leg is short
+    again. Places a fresh protective BUY-side stoploss off THIS fill price (each reentry carries its
+    own stoploss, per the module docstring), and deliberately does NOT touch checkpoint_info: the
+    pinned original level for any FUTURE chop watch on this leg stays fixed at whatever it already
+    was, not wherever this reentry itself happened to fill."""
+    info = day['checkpoint_info'][opt]
+    if info is None:
+        log.warning(f'{opt}: chop order {order_id} filled but checkpoint info is gone - leaving position untracked, check manually!')
+        return
+    leg = dict(instrument=info['instrument'], strike=info['strike'], entry_price=fill_price, quantity=info['quantity'])
+    try:
+        _place_protective_sl(info['instrument'], info['quantity'], fill_price, order_tag='rsv_cont_chop_sl')
+    except Exception as exc:
+        alert(f'{opt}: chop reentry filled @ {fill_price} but protective SL failed to place ({exc}) - naked position, check manually!', level=logging.CRITICAL)
+    with _state_lock:
+        state[opt] = leg
+        day['awaiting_chop'][opt] = False
+        day['chop_order_id'][opt] = None
+    alert(f'CHOP REENTRY {opt} {info["instrument"].name} x{info["quantity"]} @ ~{fill_price} (SL {STOPLOSS_PCT:.0%})')
+
+
+def _sync_stopped_out_and_chopped_legs(state, day, market):
+    """Broker-side truth, checked every SL_WATCH_INTERVAL_SECONDS (own background thread, see
+    _watch_loop) as well as inline each main-loop cycle:
+
+      - a leg we believe OPEN whose position has vanished means its protective SL fired - this IS
+        the live "continuous" stoploss check, a real resting order fires the instant price touches
+        it, polling here just notices promptly - and arms the chop watch (_handle_stoploss_fill).
+      - a leg we believe FLAT with a resting chop order out (day['awaiting_chop']) whose order has
+        gone 'complete' in the order book means price came back to the pinned level - the leg is
+        open again (_handle_chop_fill). 'rejected'/'cancelled' just clears the chop watch (nothing
+        resting anymore) rather than retrying blindly.
+
+    The order book is only fetched when at least one leg has a real (non-DRY_RUN) chop order
+    resting - the common case (no leg currently mid-chop) costs nothing extra over the plain
+    positions check exec_rsv_cont.py already made every cycle."""
     open_tokens = set(_resilient_call(get_open_legs, market['contracts_by_token']))
+
+    pending_chop_ids = {opt: day['chop_order_id'][opt] for opt in OPTION_TYPES if day['awaiting_chop'][opt] and day['chop_order_id'][opt]}
+    order_book = _resilient_call(_order_book) if pending_chop_ids else []
+
     for opt in OPTION_TYPES:
         with _state_lock:
             leg = state[opt]
@@ -1038,27 +1215,48 @@ def _sync_stopped_out_legs(state, market):
             if stopped:
                 state[opt] = None
         if stopped:
-            alert(f'STOPLOSS FILLED: {opt} {leg["instrument"].name} (entry ~{leg["entry_price"]}) - flat until next checkpoint')
+            _handle_stoploss_fill(day, opt, leg)
+            continue
+
+        order_id = pending_chop_ids.get(opt)
+        if order_id is None:
+            continue
+        status, fill_price = None, None
+        for o in order_book:
+            if o.get('brokerOrderId') != order_id:
+                continue
+            status = str(o.get('orderStatus', '')).lower()
+            if status == 'complete':
+                fill_price = float(o.get('averageTradedPrice') or 0)
+            break
+        if status == 'complete' and fill_price:
+            _handle_chop_fill(state, day, opt, order_id, fill_price)
+        elif status in ('rejected', 'cancelled'):
+            log.warning(f'{opt}: resting chop order {order_id} is {status} - staying flat for the rest of this checkpoint window')
+            with _state_lock:
+                day['awaiting_chop'][opt] = False
+                day['chop_order_id'][opt] = None
 
 
-SL_WATCH_INTERVAL_SECONDS = 1  # dedicated cadence for noticing a resting stoploss fill -
+SL_WATCH_INTERVAL_SECONDS = 1  # dedicated cadence for noticing a resting stoploss/chop-order fill -
 # independent of POLL_INTERVAL_SECONDS (the main loop's cadence for market-data/checkpoint/
 # heartbeat work, which is naturally heavier and slower) - see notes.md.
 
 
-def _sl_watch_loop(state, contracts_box, stop_event):
+def _watch_loop(state, day, contracts_box, stop_event):
     """Runs for the whole trading day on its own thread: checks every SL_WATCH_INTERVAL_SECONDS
-    whether a resting stoploss has filled, independent of the main loop's own cadence.
-    `contracts_box` is a 1-item list holding the most recently known contracts_by_token map, kept
-    updated by the main loop each time it refreshes market data - this thread never fetches full
-    market data itself (no quotes needed here), only AliceBlue's positions endpoint."""
+    whether a resting stoploss or chop reentry has filled, independent of the main loop's own
+    cadence. `contracts_box` is a 1-item list holding the most recently known contracts_by_token
+    map, kept updated by the main loop each time it refreshes market data - this thread never
+    fetches full market data itself (no quotes needed here), only AliceBlue's positions/orders
+    endpoints."""
     while not stop_event.is_set():
         try:
             contracts_by_token = contracts_box[0]
             if contracts_by_token is not None:
-                _sync_stopped_out_legs(state, {'contracts_by_token': contracts_by_token})
+                _sync_stopped_out_and_chopped_legs(state, day, {'contracts_by_token': contracts_by_token})
         except Exception as exc:
-            log.warning(f'SL watch thread: check failed ({exc})', extra={'no_telegram': True})
+            log.warning(f'watch thread: check failed ({exc})', extra={'no_telegram': True})
         stop_event.wait(SL_WATCH_INTERVAL_SECONDS)
 
 
@@ -1132,9 +1330,12 @@ def run_checkpoint(state, market, cfg, day, symbol):
     if premium_increased:
         if state['CE'] is not None or state['PE'] is not None:
             alert('ATM premium rose vs previous checkpoint - closing any open legs, no new trade this hour')
-            day['realized_pnl'] += _close_open_legs(state, market, cfg, 'ATM_PREMIUM_RISE')
+            day['realized_pnl'] += _close_open_legs(state, day, market, cfg, 'ATM_PREMIUM_RISE')
         else:
             log.info('ATM premium rose vs previous checkpoint - no legs open, no new trade this hour')
+        # a leg already flat from an earlier stoploss stays flat too - cancel any resting chop
+        # order rather than let it keep watching a level that's no longer relevant this hour.
+        _cancel_pending_chops(day)
         return
 
     if day['suppress_reentry']:
@@ -1149,15 +1350,22 @@ def run_checkpoint(state, market, cfg, day, symbol):
     )
     if drifted:
         alert('first-OTM strike has moved - rolling both legs')
-        day['realized_pnl'] += _close_open_legs(state, market, cfg, 'ROLL_OTM_DRIFT')
-        _enter_legs_parallel(state, desired, cfg)
+        day['realized_pnl'] += _close_open_legs(state, day, market, cfg, 'ROLL_OTM_DRIFT')
+        _cancel_pending_chops(day)  # old strikes are gone - any resting chop order is stale
+        _enter_legs_parallel(state, day, desired, cfg)
         return
 
+    # Nothing changed (no drift, no premium rise) - "the same legs can continue": a leg that's
+    # open stays open, and a leg that's flat with a resting chop order out keeps watching that SAME
+    # original level straight through this checkpoint boundary (skip_chopping=True below), same as
+    # it would mid-hour - potentially for the rest of the day, until a roll/premium-rise/daily-loss/
+    # EOD actually cancels it. Only reopen a leg that's flat with NO chop order resting either
+    # (chop placement itself failed earlier, or it never got a first entry at all).
     for opt in desired:
         if state[opt] is None:
             continue
         log.info(f'{opt} still open at {state[opt]["strike"]}, leaving as is')
-    _enter_legs_parallel(state, desired, cfg, only_missing=True)
+    _enter_legs_parallel(state, day, desired, cfg, only_missing=True, skip_chopping=True)
 
 
 # ── Minute-level checks (every poll) ─────────────────────────────────────────────────────────
@@ -1171,7 +1379,8 @@ def run_minute_checks(state, market, cfg, day, now):
         prior_high = max((p for _, p in day['premium_history']), default=None)
         if prior_high is not None and current_premium > prior_high and any_open:
             alert(f'ATM premium {current_premium} above its {PREMIUM_HIGH_LOOKBACK} high {prior_high} - closing legs')
-            day['realized_pnl'] += _close_open_legs(state, market, cfg, 'ATM_PREMIUM_2H_HIGH')
+            day['realized_pnl'] += _close_open_legs(state, day, market, cfg, 'ATM_PREMIUM_2H_HIGH')
+            _cancel_pending_chops(day)
             day['suppress_reentry'] = True
         day['premium_history'].append((now, current_premium))
 
@@ -1192,7 +1401,8 @@ def run_minute_checks(state, market, cfg, day, now):
             f'<= -{daily_loss_limit} - halting for the day, squaring off',
             level=logging.CRITICAL,
         )
-        day['realized_pnl'] += _close_open_legs(state, market, cfg, 'DAILY_LOSS_LIMIT')
+        day['realized_pnl'] += _close_open_legs(state, day, market, cfg, 'DAILY_LOSS_LIMIT')
+        _cancel_pending_chops(day)
         day['halted'] = True
 
 
@@ -1240,12 +1450,17 @@ def run_day(symbol, trade_weekdays):
     if checkpoint_interval != CHECKPOINT_INTERVAL:
         log.info(f'{symbol} {today_name}: overriding checkpoint interval {CHECKPOINT_INTERVAL} -> {checkpoint_interval}')
 
-    alert(f'Rolling straddle (variation, continuous) starting for {symbol} - {today_name} {datetime.now():%Y-%m-%d}')
+    alert(f'Rolling straddle (variation, chop) starting for {symbol} - {today_name} {datetime.now():%Y-%m-%d}')
 
     state = _new_state()
     day = dict(
         realized_pnl=0.0, halted=False, suppress_reentry=False,
         prev_checkpoint_premium=None, premium_history=[],
+        checkpoint_info={opt: None for opt in OPTION_TYPES},  # opt -> {'instrument','strike',
+        # 'entry_price','quantity'} for THIS leg's pinned ORIGINAL entry - see _pin_checkpoint_info.
+        awaiting_chop={opt: False for opt in OPTION_TYPES},  # opt -> True while a resting chop
+        # SELL order is out, waiting for price to come back to checkpoint_info[opt]['entry_price'].
+        chop_order_id={opt: None for opt in OPTION_TYPES},  # opt -> that resting order's broker id.
     )
 
     _sleep_until(ENTRY_TIME, 'entry time')
@@ -1260,13 +1475,13 @@ def run_day(symbol, trade_weekdays):
     market = _fetch_market_until_success(symbol, cfg, state)
 
     contracts_box = [market['contracts_by_token']]  # kept updated below every time market data
-    # refreshes - see _sl_watch_loop's docstring on why this thread doesn't fetch its own.
-    sl_watch_stop = threading.Event()
-    sl_watch_thread = threading.Thread(
-        target=_sl_watch_loop, args=(state, contracts_box, sl_watch_stop),
-        daemon=True, name=f'sl-watch-{symbol}',
+    # refreshes - see _watch_loop's docstring on why this thread doesn't fetch its own.
+    watch_stop = threading.Event()
+    watch_thread = threading.Thread(
+        target=_watch_loop, args=(state, day, contracts_box, watch_stop),
+        daemon=True, name=f'watch-{symbol}',
     )
-    sl_watch_thread.start()
+    watch_thread.start()
 
     open_tokens = set(_resilient_call(get_open_legs, market['contracts_by_token']))
     if open_tokens:
@@ -1285,7 +1500,10 @@ def run_day(symbol, trade_weekdays):
                 else:
                     entry_price = market['price'].get((strike_opt[0], opt), 0.0)
                     log.warning(f"{opt} {strike_opt[0]}: couldn't reconstruct entry price from order book - falling back to live LTP {entry_price:.2f} (not the actual fill price)")
-                state[opt] = dict(instrument=instrument, strike=strike_opt[0], entry_price=entry_price, quantity=quantity)
+                leg = dict(instrument=instrument, strike=strike_opt[0], entry_price=entry_price, quantity=quantity)
+                state[opt] = leg
+                _pin_checkpoint_info(day, opt, leg)  # adopted leg's (possibly approximate)
+                # reconstructed entry becomes its checkpoint-original level for chop purposes too.
 
         adopted_premium = sum(leg['entry_price'] for leg in state.values() if leg is not None) or None
         day['prev_checkpoint_premium'] = adopted_premium
@@ -1298,7 +1516,7 @@ def run_day(symbol, trade_weekdays):
         day['prev_checkpoint_premium'] = entry_premium
         if entry_premium is not None:
             day['premium_history'] = [(datetime.now(), entry_premium)]
-        _enter_legs_parallel(state, _desired_legs(market, cfg), cfg)
+        _enter_legs_parallel(state, day, _desired_legs(market, cfg), cfg)
 
     reuse_entry_market = True
     poll_failure_count = 0
@@ -1314,7 +1532,7 @@ def run_day(symbol, trade_weekdays):
             else:
                 market = _fetch_market(symbol, cfg, state)
                 contracts_box[0] = market['contracts_by_token']
-            _sync_stopped_out_legs(state, market)
+            _sync_stopped_out_and_chopped_legs(state, day, market)
             run_minute_checks(state, market, cfg, day, now)
 
             if not day['halted'] and now >= next_checkpoint:
@@ -1335,23 +1553,25 @@ def run_day(symbol, trade_weekdays):
 
     if not day['halted']:
         log.info(f'{EXIT_TIME} reached - squaring off any open positions')
+    _cancel_pending_chops(day)  # the day is ending either way (halted or EXIT_TIME) - no resting
+    # chop order should carry over into tomorrow.
 
     for attempt in range(RETRY_MAX_ATTEMPTS):
         try:
             final_market = _fetch_market(symbol, cfg, state)
-            day['realized_pnl'] += _close_open_legs(state, final_market, cfg, 'EOD')
+            day['realized_pnl'] += _close_open_legs(state, day, final_market, cfg, 'EOD')
             break
         except Exception as exc:
             if attempt == RETRY_MAX_ATTEMPTS - 1:
-                sl_watch_stop.set()
+                watch_stop.set()
                 alert(f'{symbol}: final square-off failed after {RETRY_MAX_ATTEMPTS} attempts - positions may still be OPEN, check manually: {exc}', level=logging.CRITICAL)
                 raise
             delay = RETRY_BASE_DELAY * (2 ** attempt)
             log.warning(f'final square-off failed ({exc}) - retrying in {delay:.0f}s (attempt {attempt + 1}/{RETRY_MAX_ATTEMPTS})')
             time_module.sleep(delay)
 
-    sl_watch_stop.set()
-    alert(f'Rolling straddle (variation, continuous) done for {symbol} - realized pnl {day["realized_pnl"]:+.2f} points')
+    watch_stop.set()
+    alert(f'Rolling straddle (variation, chop) done for {symbol} - realized pnl {day["realized_pnl"]:+.2f} points')
 
 
 if __name__ == '__main__':
