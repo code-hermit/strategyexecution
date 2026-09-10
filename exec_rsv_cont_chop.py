@@ -230,7 +230,13 @@ for _sig in (signal.SIGTERM, signal.SIGHUP):
 DRY_RUN = os.getenv('DRY_RUN', 'true').lower() != 'false'  # set DRY_RUN=false to place real orders
 
 # ── Strategy config (mirrors backtest_rolling_straddle_variation_continuous.py) ────────────────
-ENTRY_TIME = dtime(9, 45)
+WARMUP_TIME = dtime(9, 44)  # process (and its cron trigger) starts here, a minute ahead of ENTRY_TIME,
+# purely so the once-a-day instrument/contract-dump caches (_zerodha_options_cache,
+# _aliceblue_contracts_cache, ...) and the Redis LTP feed are already hot by ENTRY_TIME - see the
+# warm-up loop in run_day. No orders are placed and no price is recorded as "the entry price" during
+# this minute; it exists only to absorb the first-fetch latency ahead of time.
+ENTRY_TIME = dtime(9, 45)  # spot/ATM premium is snapshotted here (as close to exactly 9:45 as the
+# warm-up loop can land it) and that same snapshot's legs are what get bought - see run_day.
 EXIT_TIME = dtime(15, 13)  # 2-min live-trading safety buffer before the backtest's literal 15:15
 CHECKPOINT_INTERVAL = timedelta(hours=1)
 POLL_INTERVAL_SECONDS = 15  # was 30 - halved after the 31 Aug 2026 review found up to ~30s of pure
@@ -238,6 +244,9 @@ POLL_INTERVAL_SECONDS = 15  # was 30 - halved after the 31 Aug 2026 review found
 # fill-wait/retry delays into multi-minute-late exits (see notes.md) - 15s roughly halves that
 # worst case while staying well above the API throttle floor below (DEFAULT_MIN_CALL_INTERVAL).
 HEARTBEAT_INTERVAL = timedelta(minutes=30)
+WARMUP_POLL_SECONDS = 2  # how often the warm-up loop (WARMUP_TIME -> ENTRY_TIME) re-fetches market
+# data just to keep caches/connections hot; short enough that the fetch which finally crosses
+# ENTRY_TIME lands within ~2s of it.
 
 FIRST_OTM_STRIKES = 0  # 0 = ATM; n = n strikes OTM (CE up, PE down)
 STOPLOSS_PCT = 0.25  # per-leg resting stoploss, flat across every underlying - matches the backtest exactly
@@ -1071,7 +1080,25 @@ def _close_leg(state, day, opt, market, cfg, reason):
     if exit_ltp is None:
         log.warning(f'{opt} {leg["strike"]}: no live quote to close against, leaving position open')
         return None
-    fill_price = _close_leg_order(leg['instrument'], leg['quantity'], fallback_ltp=exit_ltp)
+    # Flagged BEFORE the close order goes in (not just after it fills) - closes this leg's race
+    # window against the watch thread's own independent poll (_sync_stopped_out_and_chopped_legs,
+    # up to SL_WATCH_INTERVAL_SECONDS old). Without it, the watch thread can observe this leg's
+    # broker position vanish (the close order having just filled) before this function reaches the
+    # `with _state_lock` below and clears state[opt] itself - misreading a perfectly deliberate
+    # close as an unexpected stoploss fire, and then (since checkpoint_info may already have been
+    # repinned to whatever leg replaces this one - see run_checkpoint) placing a bogus chop-reentry
+    # SELL against that NEW leg, doubling it. See notes.md, "duplicate SENSEX PE reentry".
+    with _state_lock:
+        day['closing'][opt] = True
+    try:
+        fill_price = _close_leg_order(leg['instrument'], leg['quantity'], fallback_ltp=exit_ltp)
+    except Exception:
+        # leg stays open (matches the pre-existing behaviour of any close failure) - but the flag
+        # must still come back down, or this leg's genuine future stoploss fills would be silently
+        # ignored by _sync_stopped_out_and_chopped_legs for the rest of the day.
+        with _state_lock:
+            day['closing'][opt] = False
+        raise
     # prefer the ACTUAL fill price for pnl/alert once we have one - the exit chase (see
     # _close_leg_order) can land well away from `exit_ltp`, the price at the moment we merely
     # decided to close, so reporting off that decision-time snapshot would misstate the real pnl.
@@ -1083,6 +1110,7 @@ def _close_leg(state, day, opt, market, cfg, reason):
         day['checkpoint_info'][opt] = None
         day['awaiting_chop'][opt] = False
         day['chop_order_id'][opt] = None
+        day['closing'][opt] = False
     return pnl
 
 
@@ -1185,7 +1213,7 @@ def _close_open_legs(state, day, market, cfg, reason):
 
 
 _state_lock = threading.Lock()  # guards state[opt]/day['checkpoint_info'/'awaiting_chop'/
-# 'chop_order_id'] wherever a concurrent thread could race a read-then-write against them -
+# 'chop_order_id'/'closing'] wherever a concurrent thread could race a read-then-write against them -
 # specifically _enter_leg's/_close_leg's writes vs. _sync_stopped_out_and_chopped_legs' below, now
 # that the latter runs on its own dedicated thread (see SL_WATCH_INTERVAL_SECONDS) rather than only
 # inline in the main loop. A plain dict read elsewhere doesn't need it (CPython's GIL already makes
@@ -1278,7 +1306,13 @@ def _sync_stopped_out_and_chopped_legs(state, day, market):
     for opt in OPTION_TYPES:
         with _state_lock:
             leg = state[opt]
-            stopped = leg is not None and leg['instrument'].token not in open_tokens
+            # day['closing'][opt] means a deliberate close (run_checkpoint/EOD/daily-loss-limit) is
+            # already underway for this leg - see _close_leg. Its broker position can vanish before
+            # _close_leg itself gets to clear state[opt], and this same check also runs on its own
+            # background thread (see _watch_loop) polling independently of that close - without this
+            # guard a deliberate close would misread as a stoploss fire and wrongly arm a chop
+            # reentry, possibly against whatever NEW leg checkpoint_info has since been repinned to.
+            stopped = leg is not None and not day['closing'][opt] and leg['instrument'].token not in open_tokens
             if stopped:
                 state[opt] = None
         if stopped:
@@ -1549,18 +1583,33 @@ def run_day(symbol, trade_weekdays):
         awaiting_chop={opt: False for opt in OPTION_TYPES},  # opt -> True while a resting chop
         # SELL order is out, waiting for price to come back to checkpoint_info[opt]['entry_price'].
         chop_order_id={opt: None for opt in OPTION_TYPES},  # opt -> that resting order's broker id.
+        closing={opt: False for opt in OPTION_TYPES},  # opt -> True while a deliberate _close_leg is
+        # in flight for this leg - see _close_leg / _sync_stopped_out_and_chopped_legs.
     )
 
-    _sleep_until(ENTRY_TIME, 'entry time')
+    # Warm-up (WARMUP_TIME, normally 9:44, up to ENTRY_TIME 9:45): keep re-fetching market data so the
+    # once-a-day instrument/contract caches are already populated and the Redis LTP feed already
+    # subscribed by the time ENTRY_TIME arrives - a cold first fetch right at 9:45 is what used to push
+    # the recorded entry price (and the orders placed off it) several seconds to minutes late. The
+    # fetch that finally observes the clock at/past ENTRY_TIME is used as-is for the entry snapshot,
+    # so no extra fetch (and its latency) happens after 9:45 - orders go out off that exact snapshot.
+    _sleep_until(WARMUP_TIME, 'warm-up start')
+    log.info(f'warm-up: pre-fetching market data every {WARMUP_POLL_SECONDS}s until {ENTRY_TIME} to keep caches/connections hot for the entry snapshot')
+    market = _fetch_market_until_success(symbol, cfg, state)
+    while datetime.now().time() < ENTRY_TIME:
+        time_module.sleep(WARMUP_POLL_SECONDS)
+        try:
+            market = _fetch_market(symbol, cfg, state)
+        except Exception as exc:
+            log.warning(f'warm-up market fetch failed ({exc}) - keeping previous snapshot, will retry')
     entry_time = datetime.now()
+    log.info(f'entry snapshot taken at {entry_time:%H:%M:%S.%f} - spot={market["spot"]} atm={market["atm"]}')
 
     scheduled_entry = datetime.combine(entry_time.date(), ENTRY_TIME)
     next_checkpoint = scheduled_entry + checkpoint_interval
     while next_checkpoint <= entry_time:
         next_checkpoint += checkpoint_interval
     next_heartbeat = entry_time + HEARTBEAT_INTERVAL
-
-    market = _fetch_market_until_success(symbol, cfg, state)
 
     contracts_box = [market['contracts_by_token']]  # kept updated below every time market data
     # refreshes - see _watch_loop's docstring on why this thread doesn't fetch its own.

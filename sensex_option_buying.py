@@ -6,7 +6,8 @@ PE) actually drove the trigger minute's rise (see "Direction" below). CE strike 
 strike_interval, PE strike = ATM - strike_interval, both derived from the same pinned ATM strike.
 See _enter_position.
 
-Window: 10:15 (ENTRY_TIME) → 15:13 (EXIT_TIME, forced day-end square-off).
+Window: 10:15 (ENTRY_TIME) → 15:13 (EXIT_TIME, forced day-end square-off). No NEW trade is opened
+at/after 15:08 (LAST_ENTRY_TIME) - an open position still runs to its own exit as normal.
 
 Checkpoints: 10:15, 11:15, 12:15, 13:15, 14:15 (CHECK_TIMES). At each one, the combined ATM straddle premium (ATM CE close + ATM PE close) is recorded as the current baseline, overwriting whatever baseline the previous checkpoint set.
 
@@ -220,8 +221,19 @@ LAST_CANDLE_MAX_AGE_SECONDS = 90  # a restored "1 minute ago" reading older than
 # driver decision until a new in-process reading lands, same as any other cold start) than compare
 # against a stale number and risk misjudging the driver.
 
+WARMUP_TIME = dtime(10, 14)  # process (and its cron trigger) starts here, a minute ahead of
+# ENTRY_TIME, purely to warm the once-a-day instrument-dump caches (_zerodha_options_cache,
+# _zerodha_spot_token_cache) and the Redis LTP feed - see the warm-up branch in run_day. No
+# checkpoint is recorded and no trade is placed during this minute; the actual 10:15 checkpoint
+# read (and everything downstream of it) still gates on ENTRY_TIME exactly as before.
 ENTRY_TIME = dtime(10, 15)  # strategy start
+WARMUP_POLL_SECONDS = 2  # how often the warm-up branch (WARMUP_TIME -> ENTRY_TIME) re-fetches
+# market data just to keep caches/connections hot; short enough that the 10:15 checkpoint read
+# right after ENTRY_TIME lands with no meaningful extra latency.
 EXIT_TIME = dtime(15, 13)  # day end / forced square-off
+LAST_ENTRY_TIME = dtime(15, 8)  # no NEW trade is opened at/after this - even a live spike signal
+# on an active checkpoint is skipped past this point (see run_day); an already-open position is
+# unaffected and still runs to its own TIME_EXIT/STOPLOSS/EOD as normal.
 CHECK_TIMES = (dtime(10, 15), dtime(11, 15), dtime(12, 15), dtime(13, 15), dtime(14, 15))
 SPIKE_POINTS = 50  # combined ATM premium rise above the latest checkpoint's baseline that triggers a buy
 HOLD_MINUTES = 5  # how long a triggered buy is held before being time-exited
@@ -1158,6 +1170,7 @@ def run_day():
     checkpoint_failure_count = 0
     tick_failure_count = 0
     stoploss_failure_count = 0
+    warmup_failure_count = 0
     last_evaluated_minute = None  # (hour, minute) of the last minute this loop actually acted on -
     # guards the per-minute body below so it runs exactly once per wall-clock minute, matching the
     # backtest's once-per-bar cadence (see module docstring), even though this loop itself now
@@ -1169,11 +1182,29 @@ def run_day():
         now = datetime.now()
         t = now.time()
 
-        if t < ENTRY_TIME:
-            wait_s = (datetime.combine(now.date(), ENTRY_TIME) - now).total_seconds()
-            log.info(f'Waiting for market open ({_label(ENTRY_TIME)}) - {wait_s / 60:.1f} min left',
+        if t < WARMUP_TIME:
+            wait_s = (datetime.combine(now.date(), WARMUP_TIME) - now).total_seconds()
+            log.info(f'Waiting for warm-up start ({_label(WARMUP_TIME)}) - {wait_s / 60:.1f} min left',
                      extra={'no_telegram': True})
             time_module.sleep(min(PRE_MARKET_POLL_SECONDS, wait_s))
+            continue
+
+        if t < ENTRY_TIME:
+            # Warm-up (WARMUP_TIME -> ENTRY_TIME): keep re-fetching market data - without recording a
+            # checkpoint or trading - purely so the once-a-day instrument-dump caches and the Redis
+            # LTP feed are already hot by ENTRY_TIME. The first real checkpoint read below, right at
+            # 10:15, is what actually gets recorded and traded off - see the CHECK_TIMES block.
+            try:
+                zerodha_options = _load_zerodha_current_week_options()
+                _current_atm(zerodha_options)
+                warmup_failure_count = 0
+            except Exception:
+                warmup_failure_count += 1
+                _log_failure_throttled('warm-up market fetch failed - will retry', warmup_failure_count)
+            wait_s = (datetime.combine(now.date(), ENTRY_TIME) - now).total_seconds()
+            log.info(f'Warming up - waiting for market open ({_label(ENTRY_TIME)}) - {wait_s / 60:.1f} min left',
+                     extra={'no_telegram': True})
+            time_module.sleep(min(WARMUP_POLL_SECONDS, wait_s))
             continue
 
         if t >= EXIT_TIME:
@@ -1269,7 +1300,13 @@ def run_day():
                 except Exception as exc:
                     print(f'CE/PE split logging failed ({exc}) - continuing regardless', file=sys.stderr)
 
-                if gap >= SPIKE_POINTS:
+                if gap >= SPIKE_POINTS and t > LAST_ENTRY_TIME:
+                    try:
+                        log.info(f'{SYMBOL} spike condition met (+{gap:.1f}) but at/after last entry time '
+                                  f'({_label(LAST_ENTRY_TIME)}) - no new trade, checkpoint stays live', extra={'no_telegram': True})
+                    except Exception as exc:
+                        print(f'last-entry-time logging failed ({exc}) - continuing regardless', file=sys.stderr)
+                elif gap >= SPIKE_POINTS:
                     # which leg drove THIS minute's rise, not the whole checkpoint window's - only
                     # a leg actually bought, see module docstring / _enter_position.
                     trigger_driver = None
