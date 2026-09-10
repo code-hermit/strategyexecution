@@ -205,7 +205,7 @@ for _sig in (signal.SIGTERM, signal.SIGHUP):
 DRY_RUN = os.getenv('DRY_RUN', 'true').lower() != 'false'  # set DRY_RUN=false to place real orders
 
 SYMBOL = 'SENSEX'
-CFG = dict(aliceblue_exchange='BFO', strike_interval=100, lots=3)
+CFG = dict(aliceblue_exchange='BFO', strike_interval=100, lots=2)
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), 'sensex_option_buying_state.json')
 LAST_CANDLE_FILE = os.path.join(os.path.dirname(__file__), 'sensex_option_buying_last_candle.json')

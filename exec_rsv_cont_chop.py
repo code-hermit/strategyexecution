@@ -10,11 +10,13 @@ resting per-leg STOPLOSS_PCT stoploss. Every CHECKPOINT_INTERVAL thereafter:
   - else if either open leg has drifted off today's first-OTM strike (spot moved): roll the whole
     strangle - close whatever's open, cancel any resting chop reentry (the old strikes are gone),
     re-enter fresh at the new first-OTM strikes.
-  - else (no premium rise, no drift - "the same legs can continue"): leave already-open legs alone;
-    leave any resting chop reentry order alone too, riding it straight through this checkpoint
-    boundary rather than disturbing it (see the CHOP section below) - only reopen a leg that's flat
-    with NO chop order resting either (chop placement itself failed earlier, or it never got a
-    first entry at all).
+  - else (no premium rise, no drift): leave already-open legs alone; any leg with a resting chop
+    reentry order is unconditionally cancelled first (see below - EVERY checkpoint tears down any
+    pending chop order, not just these two "stay flat" cases) and then immediately re-armed with a
+    FRESH order at the same pinned level, since the strike hasn't moved - "only live chop orders
+    will run if no ATM strike change" (see the CHOP section below). Only a leg that's flat with NO
+    chop order pending either (chop placement itself failed earlier, or it never got a first entry
+    at all) gets a normal fresh reopen instead.
 
 NIFTY's Friday special-case is carried over from the backtest too, but it's a no-op: the backtest
 sets a 1-hour CHECKPOINT_INTERVAL on Fridays, same as every other day, so this file does the same.
@@ -29,21 +31,21 @@ price actually falls back to that level. If price comes back down to it, this or
 leg is short again right there; a fresh protective BUY-side STOPLOSS_PCT stoploss is placed off
 wherever it ACTUALLY refilled (not necessarily exactly the pinned level). If that new stoploss fires
 again, another chop SELL order goes in at the SAME original pinned level - unlimited re-entries, no
-cap on how many times one leg can chop in and out (hence the name) - as long as nothing has forced a
-"stay flat" decision (ATM_PREMIUM_RISE, ROLL_OTM_DRIFT, the optional premium stoplosses,
-DAILY_LOSS_LIMIT, EOD - every one of these cancels any resting chop order outright, not just the
-open legs). Detected via the same fast SL_WATCH_INTERVAL_SECONDS-cadence background thread that
+cap on how many times one leg can chop in and out (hence the name).
+
+Any pending (unfilled) chop order is ALWAYS cancelled by the next checkpoint - no resting order is
+ever the same order carried across a checkpoint boundary, full stop. What happens after that
+cancellation depends on why the checkpoint is happening: if the strike hasn't moved and ATM premium
+hasn't risen, the checkpoint immediately re-arms the watch with a FRESH chop order at the exact same
+pinned level - so a leg's chop watch keeps effectively running hour after hour ("only live chop
+orders will run if no ATM strike change"), it just isn't literally the same resting order the whole
+time. If the strike HAS moved (ROLL_OTM_DRIFT) or ATM premium rose (ATM_PREMIUM_RISE) - or the
+optional premium stoplosses, DAILY_LOSS_LIMIT, or EOD fire mid-hour - the pinned level itself is
+also forgotten, not just the order: that leg's chop watch is genuinely over, not renewed at the next
+opportunity. Detected via the same fast SL_WATCH_INTERVAL_SECONDS-cadence background thread that
 already detects protective-SL fills (broker-side truth), extended to also poll the order book for a
 resting chop order's own status - a resting order that hasn't triggered yet never shows up in
 AliceBlue's positions endpoint, unlike a filled one.
-
-Crucially, per the "same legs can continue" checkpoint rule above, a chop watch is NOT forced to
-reset every hour the way a naive port of the backtest's per-checkpoint pinning might suggest: as
-long as the checkpoint's own decision is "nothing changed" (no roll, no premium rise), a leg that's
-mid-chop keeps watching the exact same original level straight through the checkpoint boundary,
-potentially for the rest of the day. Only ROLL_OTM_DRIFT and ATM_PREMIUM_RISE (which each mean the
-old level is no longer relevant) - plus the optional premium stoplosses, DAILY_LOSS_LIMIT, and EOD -
-actually cancel a resting chop order.
 
 On "continuous": the backtest's _continuous variant exists to fix a *backtesting* limitation - a
 close-only, once-a-minute stoploss check can miss (or overshoot) a fast intrabar move, so it
@@ -80,7 +82,7 @@ does NOT import execution_rolling_straddle_tn.py (which authenticates with Dhan 
 its market-data source); Dhan is never touched, imported, or authenticated by this file at all.
 
 Trades a single underlying (command-line arg, default NIFTY) on TRADE_WEEKDAYS (command-line
-weekday codes, default every weekday - matching the backtest's own default). Lots default to 5 for
+weekday codes, default every weekday - matching the backtest's own default). Lots default to 2 for
 both NIFTY and SENSEX (informational CFG below); pass a different symbol/weekday-codes pair on the
 command line to override.
 
@@ -122,15 +124,24 @@ import zerodha_ltp_client
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 # ── Logging ──────────────────────────────────────────────────────────────────────────────────
-LOG_FILE = os.path.join(os.path.dirname(__file__), 'exec_rsv_cont_chop.log')
+# Symbol is read from argv here (not just down in __main__) so the log file/logger name can be
+# namespaced by it below - this file is meant to run as two concurrent processes, one per
+# underlying (see CFG), and without this they'd both append to the exact same log file with no way
+# to tell NIFTY's lines from SENSEX's (most lines, e.g. the checkpoint log, don't mention the
+# symbol at all). __main__ re-derives SYMBOL from the same argv for the CFG-membership check/
+# run_day call - this early parse is deliberately permissive (no validation) since its only job is
+# picking a log filename; the real validation still happens in __main__ before anything trades.
+_ARGV_SYMBOL = sys.argv[1].upper() if len(sys.argv) > 1 and sys.argv[1] else 'NIFTY'
+
+LOG_FILE = os.path.join(os.path.dirname(__file__), f'exec_rsv_cont_chop_{_ARGV_SYMBOL}.log')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 TELEGRAM_TIMEOUT = 10
 
-log = logging.getLogger('exec_rsv_cont_chop')
+log = logging.getLogger(f'exec_rsv_cont_chop.{_ARGV_SYMBOL}')
 log.setLevel(logging.INFO)
 log.propagate = False
-_formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+_formatter = logging.Formatter(f'%(asctime)s %(levelname)s [{_ARGV_SYMBOL}] %(message)s')
 for _handler in (logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)):
     _handler.setFormatter(_formatter)
     log.addHandler(_handler)
@@ -244,12 +255,12 @@ DAY_CODE_TO_WEEKDAY = {'m': 'Monday', 't': 'Tuesday', 'w': 'Wednesday', 'h': 'Th
 # underlying (matching the backtest's convention); now set per-underlying instead.
 CFG = {
     'NIFTY': dict(
-        strike_interval=50, lots=3, aliceblue_exchange='NFO',
+        strike_interval=50, lots=2, aliceblue_exchange='NFO',
         zerodha_options_exchange='NFO', zerodha_spot_instrument='NSE:NIFTY 50',
         daily_loss_limit=40,
     ),
     'SENSEX': dict(
-        strike_interval=100, lots=3, aliceblue_exchange='BFO',
+        strike_interval=100, lots=2, aliceblue_exchange='BFO',
         zerodha_options_exchange='BFO', zerodha_spot_instrument='BSE:SENSEX',
         daily_loss_limit=100,
     ),
@@ -962,19 +973,20 @@ def _pin_checkpoint_info(day, opt, leg):
     day['chop_order_id'][opt] = None
 
 
-def _cancel_pending_chop(day, opt):
-    """Cancels `opt`'s resting chop SELL order if one exists and clears the chop-watch flags - used
-    any time a leg is meant to go/stay genuinely flat for a reason OTHER than "wait for price to
-    come back" (ATM_PREMIUM_RISE, ROLL_OTM_DRIFT, the optional premium stoplosses,
-    DAILY_LOSS_LIMIT, EOD). Also clears `checkpoint_info` - none of those reasons should leave a
-    stale pinned level lying around for some later, unrelated leg-open to trip over. Best-effort:
+def _cancel_pending_chop_order(day, opt):
+    """Cancels `opt`'s resting chop SELL order if one exists and clears the chop-watch flags
+    (awaiting_chop/chop_order_id) - but leaves `checkpoint_info` (the pinned original level) alone.
+    This is the lightweight teardown: called UNCONDITIONALLY at the top of every checkpoint (see
+    run_checkpoint) - a resting chop order is never carried across a checkpoint boundary as the
+    SAME order. If the watch is still warranted (no drift, no premium rise), run_checkpoint
+    re-arms it right back with a FRESH order at the same pinned level (_renew_chop_watch); if not,
+    the checkpoint additionally abandons the level itself (_abandon_chop_watch below). Best-effort:
     the order may already be filled/cancelled/gone by the time this runs (a race against the watch
     thread noticing a fill) - any failure here is logged, never raised, since this is hygiene, not
     the primary control flow."""
     order_id = day['chop_order_id'][opt]
     day['awaiting_chop'][opt] = False
     day['chop_order_id'][opt] = None
-    day['checkpoint_info'][opt] = None
     if order_id is None or DRY_RUN:
         return
     try:
@@ -986,7 +998,45 @@ def _cancel_pending_chop(day, opt):
 
 def _cancel_pending_chops(day):
     for opt in OPTION_TYPES:
-        _cancel_pending_chop(day, opt)
+        _cancel_pending_chop_order(day, opt)
+
+
+def _abandon_chop_watch(day, opt):
+    """Full teardown: cancels any resting chop order (_cancel_pending_chop_order) AND forgets the
+    pinned `checkpoint_info` - used any time a leg is meant to go/stay genuinely flat for a reason
+    OTHER than "wait for price to come back" (ATM_PREMIUM_RISE, ROLL_OTM_DRIFT, the optional
+    premium stoplosses, DAILY_LOSS_LIMIT, EOD). None of those reasons should leave a stale pinned
+    level lying around for some later, unrelated leg-open to trip over."""
+    _cancel_pending_chop_order(day, opt)
+    day['checkpoint_info'][opt] = None
+
+
+def _abandon_chop_watches(day):
+    for opt in OPTION_TYPES:
+        _abandon_chop_watch(day, opt)
+
+
+def _renew_chop_watch(day, opt):
+    """Re-arms `opt`'s chop watch with a FRESH resting order at its already-pinned
+    checkpoint-original level - called from run_checkpoint when the strike hasn't moved: every
+    checkpoint boundary tears down whatever chop order was resting (_cancel_pending_chop_order,
+    called unconditionally before this), and if the leg's watch is still warranted, this
+    immediately replaces it with a new order rather than leaving the leg flat with nothing
+    resting. checkpoint_info itself is untouched by either step, so the level being watched never
+    moves as long as the strike doesn't."""
+    info = day['checkpoint_info'][opt]
+    if info is None:
+        log.warning(f'{opt}: was awaiting chop but has no pinned checkpoint info - cannot renew, staying flat')
+        return
+    try:
+        order_id = _place_chop_reentry(info['instrument'], info['quantity'], info['entry_price'])
+    except Exception as exc:
+        log.error(f'{opt}: failed to renew chop reentry order at checkpoint ({exc}) - staying flat this window', exc_info=True)
+        return
+    with _state_lock:
+        day['awaiting_chop'][opt] = True
+        day['chop_order_id'][opt] = order_id
+    log.info(f'{opt}: chop watch renewed at checkpoint (no strike change) - order {order_id}')
 
 
 def _enter_leg(state, day, opt, instrument, ltp, strike, cfg):
@@ -1144,11 +1194,28 @@ _state_lock = threading.Lock()  # guards state[opt]/day['checkpoint_info'/'await
 
 def _handle_stoploss_fill(day, opt, leg):
     """A leg we believed open just vanished from broker positions - its resting protective SL
-    fired. Arms this leg's chop watch: places a fresh resting SELL-SL at the ORIGINAL entry price
+    fired. Credits this leg's realized pnl into day['realized_pnl'] FIRST, before anything else -
+    this is the one exit path that doesn't go through _close_leg/_close_open_legs (those cover
+    ROLL_OTM_DRIFT/ATM_PREMIUM_RISE/ATM_PREMIUM_2H_HIGH/DAILY_LOSS_LIMIT/EOD), so without this the
+    daily loss limit check in run_minute_checks silently never sees the pnl of an ordinary per-leg
+    STOPLOSS_PCT exit - which is the single most common exit reason live - and can go on comparing
+    against a realized_pnl that's missing most of the day's actual losses. The fill price is
+    reconstructed from the order book (_infer_fill_price_from_orderbook); if that comes up empty
+    (DRY_RUN, or the order book hasn't caught up yet), falls back to the nominal STOPLOSS_PCT
+    trigger price rather than skipping the credit entirely.
+
+    Then arms this leg's chop watch: places a fresh resting SELL-SL at the ORIGINAL entry price
     pinned for the current checkpoint window (see _pin_checkpoint_info) - NOT this stoploss's own
     exit price - simulating a resting SELL order left at the level price ran away from."""
+    exit_price = _infer_fill_price_from_orderbook(leg['instrument'].token, leg['quantity'], 'BUY')
+    if exit_price is None:
+        exit_price = round(leg['entry_price'] * (1 + STOPLOSS_PCT))
+    pnl = leg['entry_price'] - exit_price
+    with _state_lock:
+        day['realized_pnl'] += pnl
+
     info = day['checkpoint_info'][opt]
-    exit_hint = f"entry ~{leg['entry_price']}"
+    exit_hint = f"entry ~{leg['entry_price']} exit ~{exit_price} pnl~{pnl:+.2f}"
     if info is None:
         # shouldn't happen (an open leg always has checkpoint_info pinned) but be defensive -
         # nothing pinned to chop back to, stay flat.
@@ -1271,25 +1338,28 @@ def _order_sort_key(order):
     return order.get('brokerOrderId', '')
 
 
-def _infer_entry_price_from_orderbook(token, open_quantity):
-    """Best-effort reconstruction of a short leg's actual average fill price from AliceBlue's
-    order book - see execution_rolling_straddle_variation_mn_hs_fn.py's version of this for the
-    full rationale. Returns None (caller falls back to live LTP) if not confident."""
+def _infer_fill_price_from_orderbook(token, quantity, transaction_type):
+    """Best-effort weighted-average fill price for the most recent `quantity` units of complete
+    `transaction_type` ('SELL' or 'BUY') orders against `token` in AliceBlue's order book - shared
+    by _infer_entry_price_from_orderbook (SELL, startup adoption) and _handle_stoploss_fill (BUY,
+    pricing a leg's resting protective stoploss the instant it's noticed as fired - see that
+    function's docstring for why this matters). Returns None (caller falls back to a nominal price)
+    if not confident."""
     try:
         orders = _resilient_call(_order_book)
     except Exception as exc:
-        log.warning(f'could not fetch order book to infer entry price for token {token}: {exc}')
+        log.warning(f'could not fetch order book to infer {transaction_type} fill price for token {token}: {exc}')
         return None
 
     fills = [
         o for o in orders
         if str(o.get('instrumentId')) == str(token)
-        and str(o.get('transactionType', '')).upper() == 'SELL'
+        and str(o.get('transactionType', '')).upper() == transaction_type
         and str(o.get('orderStatus', '')).lower() == 'complete'
     ]
     fills.sort(key=_order_sort_key, reverse=True)
 
-    remaining = open_quantity
+    remaining = quantity
     weighted_sum = 0.0
     covered = 0
     for o in fills:
@@ -1309,13 +1379,30 @@ def _infer_entry_price_from_orderbook(token, open_quantity):
 
     if covered == 0:
         return None
-    if covered < open_quantity:
-        log.warning(f'order book only accounted for {covered}/{open_quantity} of open quantity for token {token} - using the weighted average of what it did find')
+    if covered < quantity:
+        log.warning(f'order book only accounted for {covered}/{quantity} of {transaction_type} fills for token {token} - using the weighted average of what it did find')
     return weighted_sum / covered
+
+
+def _infer_entry_price_from_orderbook(token, open_quantity):
+    """Best-effort reconstruction of a short leg's actual average fill price from AliceBlue's
+    order book - see execution_rolling_straddle_variation_mn_hs_fn.py's version of this for the
+    full rationale. Returns None (caller falls back to live LTP) if not confident."""
+    return _infer_fill_price_from_orderbook(token, open_quantity, 'SELL')
 
 
 # ── Checkpoint (hourly) ──────────────────────────────────────────────────────────────────────
 def run_checkpoint(state, market, cfg, day, symbol):
+    # Every checkpoint boundary tears down ANY pending chop order outright, unconditionally, before
+    # this checkpoint's own decision even runs - a resting chop order is NEVER the same order
+    # carried across checkpoints. `was_awaiting_chop` snapshots which legs had one pending
+    # beforehand, so the "nothing changed" branch below knows which to immediately re-arm with a
+    # FRESH order at the same pinned level (_renew_chop_watch) - "only live chop orders will run
+    # if no ATM strike change". checkpoint_info (the pinned level itself) is untouched here; it's
+    # only forgotten in the branches below that mean a genuine "stay flat" (premium rise/drift).
+    was_awaiting_chop = {opt: day['awaiting_chop'][opt] for opt in OPTION_TYPES}
+    _cancel_pending_chops(day)
+
     prev_premium = day['prev_checkpoint_premium']
     current_premium = _atm_premium(market)
     premium_increased = (
@@ -1333,9 +1420,9 @@ def run_checkpoint(state, market, cfg, day, symbol):
             day['realized_pnl'] += _close_open_legs(state, day, market, cfg, 'ATM_PREMIUM_RISE')
         else:
             log.info('ATM premium rose vs previous checkpoint - no legs open, no new trade this hour')
-        # a leg already flat from an earlier stoploss stays flat too - cancel any resting chop
-        # order rather than let it keep watching a level that's no longer relevant this hour.
-        _cancel_pending_chops(day)
+        # a leg already flat from an earlier stoploss stays flat too - forget its pinned level, not
+        # just the resting order already cancelled above.
+        _abandon_chop_watches(day)
         return
 
     if day['suppress_reentry']:
@@ -1351,20 +1438,21 @@ def run_checkpoint(state, market, cfg, day, symbol):
     if drifted:
         alert('first-OTM strike has moved - rolling both legs')
         day['realized_pnl'] += _close_open_legs(state, day, market, cfg, 'ROLL_OTM_DRIFT')
-        _cancel_pending_chops(day)  # old strikes are gone - any resting chop order is stale
+        _abandon_chop_watches(day)  # old strikes are gone - forget any pinned level too
         _enter_legs_parallel(state, day, desired, cfg)
         return
 
-    # Nothing changed (no drift, no premium rise) - "the same legs can continue": a leg that's
-    # open stays open, and a leg that's flat with a resting chop order out keeps watching that SAME
-    # original level straight through this checkpoint boundary (skip_chopping=True below), same as
-    # it would mid-hour - potentially for the rest of the day, until a roll/premium-rise/daily-loss/
-    # EOD actually cancels it. Only reopen a leg that's flat with NO chop order resting either
-    # (chop placement itself failed earlier, or it never got a first entry at all).
-    for opt in desired:
-        if state[opt] is None:
-            continue
-        log.info(f'{opt} still open at {state[opt]["strike"]}, leaving as is')
+    # Nothing changed (no strike change, no premium rise): a leg that's open stays open; a leg
+    # that had a chop watch pending gets it immediately renewed - a FRESH order at the SAME pinned
+    # level (checkpoint_info untouched above) - rather than left with nothing resting. Only a leg
+    # with no prior chop watch and no open position gets a normal fresh reopen (only_missing +
+    # skip_chopping below - awaiting_chop is already True again for anything just renewed, so
+    # _enter_legs_parallel correctly leaves it alone).
+    for opt in OPTION_TYPES:
+        if state[opt] is not None:
+            log.info(f'{opt} still open at {state[opt]["strike"]}, leaving as is')
+        elif was_awaiting_chop[opt]:
+            _renew_chop_watch(day, opt)
     _enter_legs_parallel(state, day, desired, cfg, only_missing=True, skip_chopping=True)
 
 
@@ -1380,7 +1468,7 @@ def run_minute_checks(state, market, cfg, day, now):
         if prior_high is not None and current_premium > prior_high and any_open:
             alert(f'ATM premium {current_premium} above its {PREMIUM_HIGH_LOOKBACK} high {prior_high} - closing legs')
             day['realized_pnl'] += _close_open_legs(state, day, market, cfg, 'ATM_PREMIUM_2H_HIGH')
-            _cancel_pending_chops(day)
+            _abandon_chop_watches(day)
             day['suppress_reentry'] = True
         day['premium_history'].append((now, current_premium))
 
@@ -1402,7 +1490,7 @@ def run_minute_checks(state, market, cfg, day, now):
             level=logging.CRITICAL,
         )
         day['realized_pnl'] += _close_open_legs(state, day, market, cfg, 'DAILY_LOSS_LIMIT')
-        _cancel_pending_chops(day)
+        _abandon_chop_watches(day)
         day['halted'] = True
 
 
@@ -1553,8 +1641,8 @@ def run_day(symbol, trade_weekdays):
 
     if not day['halted']:
         log.info(f'{EXIT_TIME} reached - squaring off any open positions')
-    _cancel_pending_chops(day)  # the day is ending either way (halted or EXIT_TIME) - no resting
-    # chop order should carry over into tomorrow.
+    _abandon_chop_watches(day)  # the day is ending either way (halted or EXIT_TIME) - no resting
+    # chop order or pinned level should carry over into tomorrow.
 
     for attempt in range(RETRY_MAX_ATTEMPTS):
         try:
@@ -1575,7 +1663,8 @@ def run_day(symbol, trade_weekdays):
 
 
 if __name__ == '__main__':
-    SYMBOL = sys.argv[1].upper() if len(sys.argv) > 1 and sys.argv[1] else 'NIFTY'
+    SYMBOL = _ARGV_SYMBOL  # already parsed above (see the Logging section) so the log file/logger
+    # name could be namespaced by it - re-used here rather than re-derived, so the two can't drift.
     if SYMBOL not in CFG:
         raise ValueError(f'unknown symbol {SYMBOL!r} - use one of {sorted(CFG)}')
     TRADE_WEEKDAYS = _parse_trade_weekdays(sys.argv[2] if len(sys.argv) > 2 else None)

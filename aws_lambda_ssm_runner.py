@@ -140,23 +140,20 @@ def _run(ip_address):
                 "/home/ec2-user/trading/exec_rsv_cont_sensex.sh "
                 "/home/ec2-user/trading/sensex_buying.sh "
                 "/home/ec2-user/trading/zerodha_ticker_service.sh",
-                # One cron line per weekday's strategy, rather than one daily line for
-                # exec_rsv_cont.sh - each script also refuses to trade outside its own
-                # day(s) if invoked on the wrong day, but restricting the cron
-                # day-of-week field too means the wrong tmux session never even spins up:
+                # One cron line per strategy, restricted to weekdays (1-5) at the day-of-week
+                # field too so the wrong tmux session never even spins up on a weekend:
                 #   Mon-Fri (1,2,3,4,5)   9:42 -> zerodha_ticker_service.sh (started first, so its
                 #                                 Redis feed is already warm by 9:45)
-                #   Mon/Fri (1,5)         9:45 -> exec_rsv_cont.sh (NIFTY, default lots)
-                #   Wed/Thu (3,4)         9:45 -> exec_rsv_cont_sensex.sh (SENSEX 3 lots,
-                #                                 restricted to Wed+Thu via its own "wh" arg)
-                #   Tue (2)               9:45 -> exec_rs_ps.sh
+                #   Mon-Fri (1,2,3,4,5)   9:45 -> exec_rsv_cont.sh (NIFTY, 2 lots)
+                #   Mon-Fri (1,2,3,4,5)   9:45 -> exec_rsv_cont_sensex.sh (SENSEX, 2 lots -
+                #                                 both underlyings now trade every weekday)
                 #   All days             10:15 -> sensex_buying.sh
                 (
                     "crontab -u ec2-user -l 2>/dev/null | grep -q option_selling || "
                     "(crontab -u ec2-user -l 2>/dev/null; "
                     "echo \"42 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s zerodha_ticker '/home/ec2-user/trading/zerodha_ticker_service.sh'\"; "
-                    "echo \"45 9 * * 1,5 /usr/bin/tmux new-session -d -s option_selling '/home/ec2-user/trading/exec_rsv_cont.sh'\"; "
-                    "echo \"45 9 * * 3,4 /usr/bin/tmux new-session -d -s option_selling_sensex '/home/ec2-user/trading/exec_rsv_cont_sensex.sh'\"; "
+                    "echo \"45 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s option_selling '/home/ec2-user/trading/exec_rsv_cont.sh'\"; "
+                    "echo \"45 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s option_selling_sensex '/home/ec2-user/trading/exec_rsv_cont_sensex.sh'\"; "
                     "echo \"15 10 * * * /usr/bin/tmux new-session -d -s sensex_buying '/home/ec2-user/trading/sensex_buying.sh'\") | crontab -u ec2-user -"
                 ),
 
