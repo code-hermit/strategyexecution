@@ -1,4 +1,24 @@
 """
+Live execution of Data/backtests/backtest_rs_adjust_sl.py - a variant of exec_rsv_cont_chop.py
+(everything below through the CHOP section is carried over from it unchanged) with ONE addition on
+top: at every checkpoint, any leg that is "old" - already open coming into that checkpoint and left
+alone by it (not rolled via ROLL_OTM_DRIFT, not closed via ATM_PREMIUM_RISE, not a fresh reopen) -
+has its resting protective BUY-side stoploss order RE-PRICED off that checkpoint's current LTP,
+instead of staying pinned to wherever the leg originally entered. Concretely: if a leg entered at
+100 (initial SL trigger 125) and by the next checkpoint the premium has dropped to 90, that resting
+SL order is modified in place to trigger at round(90 * (1 + STOPLOSS_PCT)) = 112 (not left at 125).
+This simulates cancelling and replacing that leg's stop each checkpoint to sit STOPLOSS_PCT above
+wherever the premium actually is *now* - see _reprice_leg_stoploss below and backtest_rs_adjust_sl.py's
+own docstring for the exact same rule ported from a backtest to live orders. pnl bookkeeping
+(leg['entry_price']) is completely untouched by this - only the live stop order and leg['sl_ref_price']
+(the reference used to estimate a stoploss fill's price if the order book can't confirm it - see
+_handle_stoploss_fill) move. A leg that's freshly entered, rolled, or chop-reentered has its
+sl_ref_price seeded to its own entry price as usual (nothing to adjust yet) - only a leg that
+survived a checkpoint boundary untouched gets repriced.
+
+Everything else below - including the "chop" reentry mechanism and its own docstring passages - is
+otherwise unchanged from exec_rsv_cont_chop.py:
+
 Live execution of a "chop" variant of exec_rsv_cont.py (which this file retires/replaces) - short a
 first-OTM strangle (FIRST_OTM_STRIKES away from ATM; 0 = ATM itself) at ENTRY_TIME, each leg with a
 resting per-leg STOPLOSS_PCT stoploss. Every CHECKPOINT_INTERVAL thereafter:
@@ -94,7 +114,7 @@ pinned as the leg's checkpoint-original entry price for chop purposes too. A lat
 comes up after ENTRY_TIME with no positions open) always fires the initial entry immediately -
 there's no honor-checkpoints mode here.
 
-Logging: goes to exec_rsv_cont_chop.log and stdout. Lifecycle events (day start/skip, entries,
+Logging: goes to exec_rsv_adjust_sl.log and stdout. Lifecycle events (day start/skip, entries,
 exits, rolls, stoploss fills, chop reentries, halts, day summary) are additionally pushed to
 Telegram via alert() below, and any WARNING+ log record is pushed automatically as a safety net. A
 HEARTBEAT_INTERVAL "still running" ping goes out with the current legs, day pnl so far, and the last
@@ -133,12 +153,12 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 # picking a log filename; the real validation still happens in __main__ before anything trades.
 _ARGV_SYMBOL = sys.argv[1].upper() if len(sys.argv) > 1 and sys.argv[1] else 'NIFTY'
 
-LOG_FILE = os.path.join(os.path.dirname(__file__), f'exec_rsv_cont_chop_{_ARGV_SYMBOL}.log')
+LOG_FILE = os.path.join(os.path.dirname(__file__), f'exec_rsv_adjust_sl_{_ARGV_SYMBOL}.log')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 TELEGRAM_TIMEOUT = 10
 
-log = logging.getLogger(f'exec_rsv_cont_chop.{_ARGV_SYMBOL}')
+log = logging.getLogger(f'exec_rsv_adjust_sl.{_ARGV_SYMBOL}')
 log.setLevel(logging.INFO)
 log.propagate = False
 _formatter = logging.Formatter(f'%(asctime)s %(levelname)s [{_ARGV_SYMBOL}] %(message)s')
@@ -916,7 +936,7 @@ def _place_chop_reentry(instrument, quantity, original_entry_price):
     log.info(tag)
     if DRY_RUN:
         return None
-    order = _place_order('SELL', instrument, quantity, 'SL', price=str(limit_price), trigger_price=trigger_price, order_tag='rsv_cont_chop_reentry')
+    order = _place_order('SELL', instrument, quantity, 'SL', price=str(limit_price), trigger_price=trigger_price, order_tag='rsv_adjust_sl_chop_reentry')
     order_no = order.get('brokerOrderId')
     if not order_no:
         raise RuntimeError(f'{instrument.name} chop reentry order rejected: {order}')
@@ -924,21 +944,24 @@ def _place_chop_reentry(instrument, quantity, original_entry_price):
 
 
 def _short_leg_with_stoploss(instrument, quantity, ltp):
-    """SELL to open, then hand off to _place_protective_sl. Returns the fill price."""
+    """SELL to open, then hand off to _place_protective_sl. Returns (fill_price, sl_order_id) -
+    sl_order_id (None in DRY_RUN) is kept by the caller so a later checkpoint can MODIFY this same
+    resting order in place (see _reprice_leg_stoploss) rather than track the stoploss by trigger
+    price alone."""
     entry_price = _round_to_tick(ltp * (1 - LIMIT_OFFSET_PCT), instrument.tick_size)
     tag = f'{"[DRY RUN] " if DRY_RUN else ""}SELL {quantity} x {instrument.name} LIMIT @ {entry_price} (ltp {ltp})'
     log.info(tag)
     if DRY_RUN:
-        return entry_price
+        return entry_price, None
 
-    entry = _place_order('SELL', instrument, quantity, 'LIMIT', price=str(entry_price), order_tag='rsv_cont_chop_entry')
+    entry = _place_order('SELL', instrument, quantity, 'LIMIT', price=str(entry_price), order_tag='rsv_adjust_sl_entry')
     order_no = entry.get('brokerOrderId')
     if not order_no:
         raise RuntimeError(f'{instrument.name} entry order rejected: {entry}')
 
     entry_price = _wait_for_fill_price(order_no)
-    _place_protective_sl(instrument, quantity, entry_price, order_tag='rsv_cont_chop_sl')
-    return entry_price
+    sl_order_id = _place_protective_sl(instrument, quantity, entry_price, order_tag='rsv_adjust_sl_sl')
+    return entry_price, sl_order_id
 
 
 def _run_legs_in_parallel(tasks):
@@ -1050,8 +1073,14 @@ def _renew_chop_watch(day, opt):
 
 def _enter_leg(state, day, opt, instrument, ltp, strike, cfg):
     quantity = instrument.lot_size * cfg['lots']
-    entry_price = _short_leg_with_stoploss(instrument, quantity, ltp)
-    leg = dict(instrument=instrument, strike=strike, entry_price=entry_price, quantity=quantity)
+    entry_price, sl_order_id = _short_leg_with_stoploss(instrument, quantity, ltp)
+    leg = dict(
+        instrument=instrument, strike=strike, entry_price=entry_price, quantity=quantity,
+        sl_order_id=sl_order_id, sl_ref_price=entry_price,  # sl_ref_price: the price this leg's
+        # live SL trigger is currently measured off - starts equal to entry_price, then gets
+        # re-pinned to the checkpoint LTP each time _reprice_leg_stoploss moves the live order -
+        # see that function and the module docstring.
+    )
     with _state_lock:  # see _state_lock's comment - races the watch thread's own clear
         state[opt] = leg
         _pin_checkpoint_info(day, opt, leg)
@@ -1200,7 +1229,7 @@ def _close_leg_order(instrument, quantity, fallback_ltp=None):
         if str(o.get('instrumentId')) == str(instrument.token) and str(o.get('orderStatus', '')).lower() not in TERMINAL_ORDER_STATUSES:
             _cancel_order(o['brokerOrderId'])
 
-    return _exit_chase_fill(instrument, 'BUY', quantity, _fresh_ltp, order_tag='rsv_cont_chop_exit')
+    return _exit_chase_fill(instrument, 'BUY', quantity, _fresh_ltp, order_tag='rsv_adjust_sl_exit')
 
 
 def _close_open_legs(state, day, market, cfg, reason):
@@ -1237,7 +1266,10 @@ def _handle_stoploss_fill(day, opt, leg):
     exit price - simulating a resting SELL order left at the level price ran away from."""
     exit_price = _infer_fill_price_from_orderbook(leg['instrument'].token, leg['quantity'], 'BUY')
     if exit_price is None:
-        exit_price = round(leg['entry_price'] * (1 + STOPLOSS_PCT))
+        # sl_ref_price, not entry_price - the live trigger may have been re-priced at a checkpoint
+        # since this leg entered (see _reprice_leg_stoploss), so that's the accurate reference for
+        # what the resting order was actually about to fire at.
+        exit_price = round(leg['sl_ref_price'] * (1 + STOPLOSS_PCT))
     pnl = leg['entry_price'] - exit_price
     with _state_lock:
         day['realized_pnl'] += pnl
@@ -1271,11 +1303,16 @@ def _handle_chop_fill(state, day, opt, order_id, fill_price):
     if info is None:
         log.warning(f'{opt}: chop order {order_id} filled but checkpoint info is gone - leaving position untracked, check manually!')
         return
-    leg = dict(instrument=info['instrument'], strike=info['strike'], entry_price=fill_price, quantity=info['quantity'])
+    sl_order_id = None
     try:
-        _place_protective_sl(info['instrument'], info['quantity'], fill_price, order_tag='rsv_cont_chop_sl')
+        sl_order_id = _place_protective_sl(info['instrument'], info['quantity'], fill_price, order_tag='rsv_adjust_sl_sl')
     except Exception as exc:
         alert(f'{opt}: chop reentry filled @ {fill_price} but protective SL failed to place ({exc}) - naked position, check manually!', level=logging.CRITICAL)
+    leg = dict(
+        instrument=info['instrument'], strike=info['strike'], entry_price=fill_price, quantity=info['quantity'],
+        sl_order_id=sl_order_id, sl_ref_price=fill_price,  # fresh leg - nothing to adjust yet, see
+        # _enter_leg's comment.
+    )
     with _state_lock:
         state[opt] = leg
         day['awaiting_chop'][opt] = False
@@ -1425,7 +1462,65 @@ def _infer_entry_price_from_orderbook(token, open_quantity):
     return _infer_fill_price_from_orderbook(token, open_quantity, 'SELL')
 
 
+def _find_resting_sl_order_id(token):
+    """Broker order id of a still-resting (non-terminal) BUY SL order against `token`, if any -
+    this file's own addition, used only at startup adoption (mid-day restart with positions already
+    open) so an adopted leg's existing protective SL can later be re-priced in place by
+    _reprice_leg_stoploss, the same as one this process placed itself. Same order-book scan
+    _convert_resting_sl_to_market_exit already does elsewhere for the same purpose. Returns None
+    (caller falls back to sl_order_id=None, same as DRY_RUN - _reprice_leg_stoploss just logs the
+    intended reprice instead of placing it) if nothing resting is found."""
+    try:
+        orders = _resilient_call(_order_book)
+    except Exception as exc:
+        log.warning(f'could not fetch order book to find resting SL for token {token}: {exc}')
+        return None
+    for o in orders:
+        if (
+            str(o.get('instrumentId')) == str(token)
+            and str(o.get('transactionType', '')).upper() == 'BUY'
+            and str(o.get('orderStatus', '')).lower() not in TERMINAL_ORDER_STATUSES
+        ):
+            return o.get('brokerOrderId')
+    return None
+
+
 # ── Checkpoint (hourly) ──────────────────────────────────────────────────────────────────────
+def _reprice_leg_stoploss(state, opt, market):
+    """This file's own addition over exec_rsv_cont_chop.py (see module docstring / matches
+    backtest_rs_adjust_sl.py): `opt` is an "old" leg - already open coming into this checkpoint and
+    left alone by it (no roll, no premium-rise close, no fresh reopen) - so its resting protective
+    BUY SL order gets MODIFIED in place to trigger off THIS checkpoint's current LTP instead of
+    wherever it originally entered. e.g. entry 100 (initial trigger 125); premium has since dropped
+    to 90 -> trigger re-priced to round(90 * 1.25) = 112 (int-rounded, same "STOP PRICE IS NOT
+    REASONABLE" rule _place_protective_sl already follows). leg['entry_price'] (pnl bookkeeping) is
+    untouched - only the live order and leg['sl_ref_price'] (the reference _handle_stoploss_fill
+    falls back to if it can't read the fill price straight off the order book) move."""
+    leg = state[opt]
+    current_ltp = market['price'].get((leg['strike'], opt))
+    if current_ltp is None:
+        log.warning(f'{opt} {leg["instrument"].name}: no live quote at checkpoint - leaving existing SL as is')
+        return
+    trigger_price = round(current_ltp * (1 + STOPLOSS_PCT))
+    sl_limit_price = round(trigger_price * (1 + LIMIT_OFFSET_PCT))
+    if leg['sl_order_id'] is None:
+        # DRY_RUN, or the resting order id couldn't be recovered (e.g. a startup-adoption
+        # reconstruction miss) - nothing live to modify; still move the in-memory reference on so
+        # the STOPLOSS fallback estimate in _handle_stoploss_fill stays accurate.
+        log.info(f'{opt} {leg["instrument"].name}: SL would be re-priced to trigger {trigger_price} limit {sl_limit_price} (ltp {current_ltp}) [no live order to modify]')
+        with _state_lock:
+            leg['sl_ref_price'] = current_ltp
+        return
+    try:
+        _modify_order(leg['sl_order_id'], leg['instrument'], leg['quantity'], 'SL', sl_limit_price, trigger_price=trigger_price)
+    except Exception as exc:
+        log.warning(f'{opt} {leg["instrument"].name}: failed to reprice resting SL order {leg["sl_order_id"]} at checkpoint ({exc}) - leaving previous SL in place')
+        return
+    log.info(f'{opt} {leg["instrument"].name}: SL re-priced at checkpoint {leg["sl_ref_price"]} -> {current_ltp} (trigger {trigger_price}, limit {sl_limit_price})')
+    with _state_lock:
+        leg['sl_ref_price'] = current_ltp
+
+
 def run_checkpoint(state, market, cfg, day, symbol):
     # Every checkpoint boundary tears down ANY pending chop order outright, unconditionally, before
     # this checkpoint's own decision even runs - a resting chop order is NEVER the same order
@@ -1476,15 +1571,18 @@ def run_checkpoint(state, market, cfg, day, symbol):
         _enter_legs_parallel(state, day, desired, cfg)
         return
 
-    # Nothing changed (no strike change, no premium rise): a leg that's open stays open; a leg
-    # that had a chop watch pending gets it immediately renewed - a FRESH order at the SAME pinned
-    # level (checkpoint_info untouched above) - rather than left with nothing resting. Only a leg
-    # with no prior chop watch and no open position gets a normal fresh reopen (only_missing +
-    # skip_chopping below - awaiting_chop is already True again for anything just renewed, so
-    # _enter_legs_parallel correctly leaves it alone).
+    # Nothing changed (no strike change, no premium rise): a leg that's open stays open - but,
+    # this file's own addition, its resting SL gets re-priced off this checkpoint's current LTP
+    # (_reprice_leg_stoploss - see module docstring); a leg that had a chop watch pending gets it
+    # immediately renewed - a FRESH order at the SAME pinned level (checkpoint_info untouched
+    # above) - rather than left with nothing resting. Only a leg with no prior chop watch and no
+    # open position gets a normal fresh reopen (only_missing + skip_chopping below - awaiting_chop
+    # is already True again for anything just renewed, so _enter_legs_parallel correctly leaves it
+    # alone).
     for opt in OPTION_TYPES:
         if state[opt] is not None:
             log.info(f'{opt} still open at {state[opt]["strike"]}, leaving as is')
+            _reprice_leg_stoploss(state, opt, market)
         elif was_awaiting_chop[opt]:
             _renew_chop_watch(day, opt)
     _enter_legs_parallel(state, day, desired, cfg, only_missing=True, skip_chopping=True)
@@ -1572,7 +1670,7 @@ def run_day(symbol, trade_weekdays):
     if checkpoint_interval != CHECKPOINT_INTERVAL:
         log.info(f'{symbol} {today_name}: overriding checkpoint interval {CHECKPOINT_INTERVAL} -> {checkpoint_interval}')
 
-    alert(f'Rolling straddle (variation, chop) starting for {symbol} - {today_name} {datetime.now():%Y-%m-%d}')
+    alert(f'Rolling straddle (variation, chop, adjust-SL) starting for {symbol} - {today_name} {datetime.now():%Y-%m-%d}')
 
     state = _new_state()
     day = dict(
@@ -1637,7 +1735,14 @@ def run_day(symbol, trade_weekdays):
                 else:
                     entry_price = market['price'].get((strike_opt[0], opt), 0.0)
                     log.warning(f"{opt} {strike_opt[0]}: couldn't reconstruct entry price from order book - falling back to live LTP {entry_price:.2f} (not the actual fill price)")
-                leg = dict(instrument=instrument, strike=strike_opt[0], entry_price=entry_price, quantity=quantity)
+                sl_order_id = _find_resting_sl_order_id(token)  # so a later checkpoint can
+                # re-price this adopted leg's existing SL in place too - see _reprice_leg_stoploss.
+                if sl_order_id is None:
+                    log.warning(f'{opt} {strike_opt[0]}: no resting SL order found to adopt - future checkpoint SL reprices will be log-only until this leg exits and re-enters')
+                leg = dict(
+                    instrument=instrument, strike=strike_opt[0], entry_price=entry_price, quantity=quantity,
+                    sl_order_id=sl_order_id, sl_ref_price=entry_price,
+                )
                 state[opt] = leg
                 _pin_checkpoint_info(day, opt, leg)  # adopted leg's (possibly approximate)
                 # reconstructed entry becomes its checkpoint-original level for chop purposes too.
@@ -1708,7 +1813,7 @@ def run_day(symbol, trade_weekdays):
             time_module.sleep(delay)
 
     watch_stop.set()
-    alert(f'Rolling straddle (variation, chop) done for {symbol} - realized pnl {day["realized_pnl"]:+.2f} points')
+    alert(f'Rolling straddle (variation, chop, adjust-SL) done for {symbol} - realized pnl {day["realized_pnl"]:+.2f} points')
 
 
 if __name__ == '__main__':

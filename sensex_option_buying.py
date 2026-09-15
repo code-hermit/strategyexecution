@@ -742,13 +742,19 @@ FORCE_EXIT_STUCK_ALERT_EVERY = 30  # attempts between "still not squared off" es
 
 def _force_exit_leg(instrument, quantity, get_fresh_ltp, order_tag, log_prefix):
     """Force a bought leg closed using only SL (stop-loss LIMIT) SELL orders - MARKET/SLM orders are
-    never used, they are not permitted for this account/strategy. Places a SELL SL order and
-    repeatedly MODIFIES it (never cancel+replace) so trigger and limit both bracket the current
-    LTP - trigger = ltp+5% (already breached from below, since a SELL SL fires once price falls TO
-    OR BELOW the trigger - setting it above current price means that's already true), limit =
-    ltp-5% (marketable), so it should fill immediately. If that order can't be found/modified
-    (rejected, already filled/cancelled by something else) a brand new SL order is placed instead
-    and the same retry loop continues working that one. There is NO attempt cap and NO MARKET
+    never used, they are not permitted for this account/strategy. A brand new SL order is placed
+    with trigger/limit on the natural, unbreached side of LTP (trigger below LTP, limit further
+    below still) - a fresh order whose trigger is already past LTP gets rejected outright by the
+    exchange as "STOP PRICE IS NOT REASONABLE", so the first placement has to be one it will
+    actually accept, even though that means it just rests there rather than filling immediately.
+    Every attempt after that repeatedly MODIFIES it (never cancel+replace) so trigger and limit
+    both bracket the current LTP - trigger = ltp+3% (already breached from below, since a SELL SL
+    fires once price falls TO OR BELOW the trigger - setting it above current price means that's
+    already true), limit = ltp-3% (marketable) - the exchange accepts this on a MODIFY of an
+    order it has already accepted (unlike on a fresh placement), so it should fill immediately. If
+    that order can't be found/modified (rejected, already filled/cancelled by something else) a
+    brand new SL order is placed instead (again on the natural side first) and the same retry loop
+    continues working that one. There is NO attempt cap and NO MARKET
     fallback: this loops forever, re-pricing every FORCE_EXIT_POLL_INTERVAL, until the position is
     actually confirmed squared off - escalating to a CRITICAL alert every
     FORCE_EXIT_STUCK_ALERT_EVERY attempts so a stuck close doesn't go unnoticed, but it keeps
@@ -771,6 +777,15 @@ def _force_exit_leg(instrument, quantity, get_fresh_ltp, order_tag, log_prefix):
         # Rounded to the nearest integer, not just a tick - the exchange rejects SL trigger
         # prices for these contracts with "STOP PRICE IS NOT REASONABLE" unless they're whole
         # rupees.
+        #
+        # A SELL SL trigger already past LTP (i.e. above it) is what forces an immediate release -
+        # but the exchange only accepts that on a MODIFY of an order it has already accepted, not
+        # on a brand new placement (a fresh SL whose trigger is already breached gets rejected
+        # outright as "STOP PRICE IS NOT REASONABLE" - see _convert_resting_sl_to_market_exit in
+        # exec_rsv_cont_chop.py, which relies on the same modify-only exception for the BUY side).
+        # So a brand new order has to go in on the natural, unbreached side of LTP first (it just
+        # rests there, trigger not yet hit) - only once it exists do we push its trigger past LTP
+        # via modify to force it through.
         trigger_price = round(ltp * (1 + LIMIT_OFFSET_PCT))
         # Nearest integer, not a tick - same rejection applies to the SL order's limit price.
         limit_price = round(ltp * (1 - LIMIT_OFFSET_PCT))
@@ -788,9 +803,11 @@ def _force_exit_leg(instrument, quantity, get_fresh_ltp, order_tag, log_prefix):
                 working_order_id = None
 
         if working_order_id is None:
-            log.info(f'{log_prefix}: attempt {attempt} - placing a new SL order, trigger={trigger_price} limit={limit_price} (ltp {ltp})', extra={'no_telegram': True})
+            new_trigger_price = round(ltp * (1 - LIMIT_OFFSET_PCT))
+            new_limit_price = round(new_trigger_price * (1 - LIMIT_OFFSET_PCT))
+            log.info(f'{log_prefix}: attempt {attempt} - placing a new SL order, trigger={new_trigger_price} limit={new_limit_price} (ltp {ltp})', extra={'no_telegram': True})
             try:
-                new_order = _place_order('SELL', instrument, quantity, 'SL', price=str(limit_price), trigger_price=trigger_price, order_tag=order_tag)
+                new_order = _place_order('SELL', instrument, quantity, 'SL', price=str(new_limit_price), trigger_price=new_trigger_price, order_tag=order_tag)
                 working_order_id = new_order.get('brokerOrderId')
                 if not working_order_id:
                     log.warning(f'{log_prefix}: new SL order rejected on attempt {attempt}: {new_order}', extra={'no_telegram': True})
