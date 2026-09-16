@@ -1068,7 +1068,7 @@ def _run_legs_in_parallel(tasks):
     return results
 
 
-def _enter_position(state, checkpoint, option_type, trigger_driver, ce_ltp, pe_ltp):
+def _enter_position(state, checkpoint, option_type, trigger_driver, ce_ltp, pe_ltp, trigger_time):
     """Buy ONE first-OTM leg derived from the checkpoint's pinned ATM strike - the tracking signal
     (checkpoint['strike']/checkpoint['premium']) stays ATM throughout, but the strike actually
     bought is one interval to that leg's OTM side (CE = ATM+interval, PE = ATM-interval), via
@@ -1082,7 +1082,15 @@ def _enter_position(state, checkpoint, option_type, trigger_driver, ce_ltp, pe_l
     STOPLOSS_POINTS still tracks the COMBINED ATM premium (both CE and PE, snapshotted below as
     position['atm_legs']) as if the whole straddle were held, even though only `option_type` is
     ever actually bought - matching Data/backtests/backtest_atm_spike_v3.py's 'combined'
-    STOPLOSS_MODE exactly; see _position_combined_premium/_position_combined_entry."""
+    STOPLOSS_MODE exactly; see _position_combined_premium/_position_combined_entry.
+
+    `trigger_time` is the once-a-minute tick timestamp the spike was detected on (the caller's loop
+    `now`, captured before this function's own order-placement/broker-fetch calls), truncated to
+    the minute. entry_time/deadline below are anchored to that truncated minute rather than to
+    datetime.now() after the order fills, so the few seconds of order-placement latency don't push
+    the deadline past the once-a-minute TIME_EXIT check grid it's compared against in run_day -
+    without this, a deadline landing a few seconds after :00 needs a full extra minute to be
+    detected, turning a 5-minute hold into up to ~6."""
     contracts = _load_aliceblue_contracts()
     contracts_by_strike_type = {(int(float(c['strike_price'])), c['option_type']): c for c in contracts}
     zerodha_options = _load_zerodha_current_week_options()
@@ -1101,10 +1109,10 @@ def _enter_position(state, checkpoint, option_type, trigger_driver, ce_ltp, pe_l
     quantity = instrument.lot_size * CFG['lots']
     entry_price = buy_leg(instrument, quantity, ltp)
 
-    now = datetime.now()
+    entry_time = trigger_time.replace(second=0, microsecond=0)
     state['position'] = {
-        'entry_time': now.isoformat(),
-        'deadline': (now + timedelta(minutes=HOLD_MINUTES)).isoformat(),
+        'entry_time': entry_time.isoformat(),
+        'deadline': (entry_time + timedelta(minutes=HOLD_MINUTES)).isoformat(),
         'checkpoint_premium': checkpoint['premium'],
         'entry_atm_premium': atm_premium,
         'option_type': option_type, 'trigger_driver': trigger_driver,
@@ -1347,7 +1355,7 @@ def run_day():
                                      f'-> driver={trigger_driver}')
                         except Exception as exc:
                             print(f'driver-decision logging failed ({exc}) - continuing regardless', file=sys.stderr)
-                        _enter_position(state, state['checkpoint'], option_type, trigger_driver, ce_ltp, pe_ltp)
+                        _enter_position(state, state['checkpoint'], option_type, trigger_driver, ce_ltp, pe_ltp, now)
                 prev_pinned_ce, prev_pinned_pe = ce_ltp, pe_ltp
                 _save_last_candle(state['checkpoint'], ce_ltp, pe_ltp)  # already fails safe internally - see its own docstring
             elif state['checkpoint'] is not None and state['checkpoint_used']:
