@@ -154,12 +154,32 @@ def _run(ip_address):
                 #                                 warm its own instrument caches; sensex_option_
                 #                                 buying.py's own ENTRY_TIME (10:15) still gates the
                 #                                 actual checkpoint/entry)
+                # Each job is added independently, keyed on its own exact "-s <session-name> " tmux
+                # flag (not a loose substring like "option_selling", which also matches
+                # "option_selling_sensex") - a single shared "does crontab mention option_selling at
+                # all" guard used to gate ALL four lines at once, so an instance whose crontab was
+                # provisioned by an older version of this script (e.g. before sensex_buying.sh or
+                # zerodha_ticker_service.sh had cron lines here) would see that guard already
+                # satisfied by its existing option_selling line and skip adding the newer/missing
+                # ones forever, on every subsequent run.
                 (
-                    "crontab -u ec2-user -l 2>/dev/null | grep -q option_selling || "
+                    "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s zerodha_ticker ' || "
                     "(crontab -u ec2-user -l 2>/dev/null; "
-                    "echo \"42 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s zerodha_ticker '/home/ec2-user/trading/zerodha_ticker_service.sh'\"; "
-                    "echo \"44 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s option_selling '/home/ec2-user/trading/exec_rsv_cont.sh'\"; "
-                    "echo \"44 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s option_selling_sensex '/home/ec2-user/trading/exec_rsv_cont_sensex.sh'\"; "
+                    "echo \"42 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s zerodha_ticker '/home/ec2-user/trading/zerodha_ticker_service.sh'\") | crontab -u ec2-user -"
+                ),
+                (
+                    "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s option_selling ' || "
+                    "(crontab -u ec2-user -l 2>/dev/null; "
+                    "echo \"44 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s option_selling '/home/ec2-user/trading/exec_rsv_cont.sh'\") | crontab -u ec2-user -"
+                ),
+                (
+                    "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s option_selling_sensex ' || "
+                    "(crontab -u ec2-user -l 2>/dev/null; "
+                    "echo \"44 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s option_selling_sensex '/home/ec2-user/trading/exec_rsv_cont_sensex.sh'\") | crontab -u ec2-user -"
+                ),
+                (
+                    "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s sensex_buying ' || "
+                    "(crontab -u ec2-user -l 2>/dev/null; "
                     "echo \"14 10 * * * /usr/bin/tmux new-session -d -s sensex_buying '/home/ec2-user/trading/sensex_buying.sh'\") | crontab -u ec2-user -"
                 ),
 
