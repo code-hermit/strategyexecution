@@ -166,7 +166,7 @@ def main():
                 continue
 
             if job.get("track_mode") == "seen":
-                message = f"ALARM: '{name}' is not running but should be."
+                message = f"ALARM: SERVER ERROR"
             else:
                 message = (
                     f"ALARM: '{name}' is not running but should be "
