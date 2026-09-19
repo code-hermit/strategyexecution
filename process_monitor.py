@@ -82,16 +82,16 @@ def job_should_be_running(job, now):
     return window_start <= now <= window_end
 
 
-def make_test_job(match_pattern, duration_minutes, grace_seconds):
-    now = datetime.now(IST)
-    end = now + timedelta(minutes=duration_minutes)
+DEFAULT_TEST_PATTERN = "test_strategy.py"
+
+
+def make_test_job(match_pattern):
+    # No schedule: it arms itself the first time the process is seen running, then alarms
+    # if that process later disappears. Nothing to configure time-wise.
     return {
         "name": f"test: {match_pattern}",
         "match": match_pattern,
-        "start": now.time(),
-        "end": end.time(),
-        "weekdays": {now.weekday()},
-        "grace": timedelta(seconds=grace_seconds),
+        "track_mode": "seen",
     }
 
 
@@ -99,27 +99,18 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--test",
+        nargs="?",
+        const=DEFAULT_TEST_PATTERN,
+        default=None,
         metavar="PATTERN",
         help=(
-            "Watch a single ad-hoc process instead of the real schedule, so the alarm path "
-            "can be exercised by hand. PATTERN is matched with `pgrep -f`, so a script "
-            "filename works, e.g. `--test test_strategy.py`. Start the script normally "
-            "(`python3 test_strategy.py &` or in another terminal), leave this running, "
-            "then kill it (`pkill -f test_strategy.py` or Ctrl+C the other terminal) and "
-            "confirm the alarm fires."
+            "Watch a single ad-hoc process instead of the real schedule, with no time "
+            f"window: defaults to '{DEFAULT_TEST_PATTERN}' if given with no value. PATTERN "
+            "is matched with `pgrep -f`, so a script filename works. It starts tracking as "
+            "soon as it first sees the process running, then alarms if that process "
+            "disappears - start the script (`python3 test_strategy.py`), confirm the "
+            "monitor logs that it's now tracking it, then kill it and watch for the alarm."
         ),
-    )
-    parser.add_argument(
-        "--duration",
-        type=float,
-        default=15,
-        help="Minutes the --test process is considered 'should be running' for (default: 15).",
-    )
-    parser.add_argument(
-        "--grace-seconds",
-        type=float,
-        default=5,
-        help="Startup grace for --test, in seconds, instead of the real 3-minute grace (default: 5).",
     )
     parser.add_argument(
         "--poll-interval",
@@ -134,39 +125,53 @@ def main():
     args = parse_args()
 
     if args.test:
-        jobs = [make_test_job(args.test, args.duration, args.grace_seconds)]
+        jobs = [make_test_job(args.test)]
         print(
-            f"TEST MODE: watching processes matching '{args.test}' for {args.duration} min "
-            f"(grace {args.grace_seconds}s). Start it, then kill it, and watch for the alarm."
+            f"TEST MODE: watching for processes matching '{args.test}' (no time window). "
+            "Start it, wait for tracking to arm, then kill it and watch for the alarm."
         )
     else:
         jobs = JOBS
         print("process_monitor started, watching:", ", ".join(j["name"] for j in jobs))
 
     last_alarmed_at = {job["name"]: None for job in jobs}
+    armed = {job["name"]: False for job in jobs}
 
     while True:
         now = datetime.now(IST)
 
         for job in jobs:
             name = job["name"]
+            alive = process_alive(job["match"])
 
-            if not job_should_be_running(job, now):
-                last_alarmed_at[name] = None
-                continue
-
-            if process_alive(job["match"]):
-                last_alarmed_at[name] = None
-                continue
+            if job.get("track_mode") == "seen":
+                if alive:
+                    if not armed[name]:
+                        armed[name] = True
+                        print(f"'{name}' seen running - now tracking it.")
+                    last_alarmed_at[name] = None
+                    continue
+                if not armed[name]:
+                    continue  # never started yet, nothing to track
+            else:
+                if not job_should_be_running(job, now):
+                    last_alarmed_at[name] = None
+                    continue
+                if alive:
+                    last_alarmed_at[name] = None
+                    continue
 
             last = last_alarmed_at[name]
             if last is not None and now - last < RENOTIFY_INTERVAL:
                 continue
 
-            message = (
-                f"ALARM: '{name}' is not running but should be "
-                f"(scheduled {job['start']}-{job['end']} IST)."
-            )
+            if job.get("track_mode") == "seen":
+                message = f"ALARM: '{name}' is not running but should be."
+            else:
+                message = (
+                    f"ALARM: '{name}' is not running but should be "
+                    f"(scheduled {job['start']}-{job['end']} IST)."
+                )
             print(message)
             try:
                 raise_alarm(message)
