@@ -58,9 +58,6 @@ JOBS = [
 # before we treat it missing as a crash.
 STARTUP_GRACE = timedelta(minutes=3)
 
-# Once alarmed, keep nagging at this interval until the process comes back.
-RENOTIFY_INTERVAL = timedelta(minutes=10)
-
 DEFAULT_POLL_INTERVAL_SECONDS = 1
 
 
@@ -134,7 +131,7 @@ def main():
         jobs = JOBS
         print("process_monitor started, watching:", ", ".join(j["name"] for j in jobs))
 
-    last_alarmed_at = {job["name"]: None for job in jobs}
+    alarmed = {job["name"]: False for job in jobs}
     armed = {job["name"]: False for job in jobs}
 
     while True:
@@ -149,21 +146,20 @@ def main():
                     if not armed[name]:
                         armed[name] = True
                         print(f"'{name}' seen running - now tracking it.")
-                    last_alarmed_at[name] = None
+                    alarmed[name] = False
                     continue
                 if not armed[name]:
                     continue  # never started yet, nothing to track
             else:
                 if not job_should_be_running(job, now):
-                    last_alarmed_at[name] = None
+                    alarmed[name] = False
                     continue
                 if alive:
-                    last_alarmed_at[name] = None
+                    alarmed[name] = False
                     continue
 
-            last = last_alarmed_at[name]
-            if last is not None and now - last < RENOTIFY_INTERVAL:
-                continue
+            if alarmed[name]:
+                continue  # already sent the one alarm for this outage
 
             if job.get("track_mode") == "seen":
                 message = f"ALARM: SERVER ERROR"
@@ -177,7 +173,7 @@ def main():
                 raise_alarm(message)
             except Exception as exc:
                 print(f"failed to send alarm for {name}: {exc}")
-            last_alarmed_at[name] = now
+            alarmed[name] = True
 
         time.sleep(args.poll_interval)
 
