@@ -32,11 +32,10 @@ resting per-leg STOPLOSS_PCT stoploss. Every CHECKPOINT_INTERVAL thereafter:
     re-enter fresh at the new first-OTM strikes.
   - else (no premium rise, no drift): leave already-open legs alone; any leg with a resting chop
     reentry order is unconditionally cancelled first (see below - EVERY checkpoint tears down any
-    pending chop order, not just these two "stay flat" cases) and then immediately re-armed with a
-    FRESH order at the same pinned level, since the strike hasn't moved - "only live chop orders
-    will run if no ATM strike change" (see the CHOP section below). Only a leg that's flat with NO
-    chop order pending either (chop placement itself failed earlier, or it never got a first entry
-    at all) gets a normal fresh reopen instead.
+    pending chop order, not just these two "stay flat" cases) and is NOT re-armed - a chop watch's
+    life is at most one checkpoint window. Any leg that's flat at this point - whether it never had
+    a chop watch, or had one that just got torn down without ever filling - gets a normal fresh
+    reopen at this checkpoint's current market price.
 
 NIFTY's Friday special-case is carried over from the backtest too, but it's a no-op: the backtest
 sets a 1-hour CHECKPOINT_INTERVAL on Fridays, same as every other day, so this file does the same.
@@ -54,15 +53,15 @@ again, another chop SELL order goes in at the SAME original pinned level - unlim
 cap on how many times one leg can chop in and out (hence the name).
 
 Any pending (unfilled) chop order is ALWAYS cancelled by the next checkpoint - no resting order is
-ever the same order carried across a checkpoint boundary, full stop. What happens after that
-cancellation depends on why the checkpoint is happening: if the strike hasn't moved and ATM premium
-hasn't risen, the checkpoint immediately re-arms the watch with a FRESH chop order at the exact same
-pinned level - so a leg's chop watch keeps effectively running hour after hour ("only live chop
-orders will run if no ATM strike change"), it just isn't literally the same resting order the whole
-time. If the strike HAS moved (ROLL_OTM_DRIFT) or ATM premium rose (ATM_PREMIUM_RISE) - or the
-optional premium stoplosses, DAILY_LOSS_LIMIT, or EOD fire mid-hour - the pinned level itself is
-also forgotten, not just the order: that leg's chop watch is genuinely over, not renewed at the next
-opportunity. Detected via the same fast SL_WATCH_INTERVAL_SECONDS-cadence background thread that
+ever the same order carried across a checkpoint boundary, full stop - and it is never re-armed
+either: a chop watch's life is at most one checkpoint window. A leg whose chop order never filled
+by the time its checkpoint boundary arrives is simply flat going into that checkpoint's own
+decision, exactly like a leg that never had a chop watch at all - if the strike hasn't moved and
+ATM premium hasn't risen, that flat leg gets a normal fresh reopen at the checkpoint's current
+market price, not a renewed watch at the old pinned level. If the strike HAS moved (ROLL_OTM_DRIFT)
+or ATM premium rose (ATM_PREMIUM_RISE) - or the optional premium stoplosses, DAILY_LOSS_LIMIT, or
+EOD fire mid-hour - the pinned level itself is also forgotten, not just the order. Detected via the
+same fast SL_WATCH_INTERVAL_SECONDS-cadence background thread that
 already detects protective-SL fills (broker-side truth), extended to also poll the order book for a
 resting chop order's own status - a resting order that hasn't triggered yet never shows up in
 AliceBlue's positions endpoint, unlike a filled one.
@@ -1010,9 +1009,9 @@ def _cancel_pending_chop_order(day, opt):
     (awaiting_chop/chop_order_id) - but leaves `checkpoint_info` (the pinned original level) alone.
     This is the lightweight teardown: called UNCONDITIONALLY at the top of every checkpoint (see
     run_checkpoint) - a resting chop order is never carried across a checkpoint boundary as the
-    SAME order. If the watch is still warranted (no drift, no premium rise), run_checkpoint
-    re-arms it right back with a FRESH order at the same pinned level (_renew_chop_watch); if not,
-    the checkpoint additionally abandons the level itself (_abandon_chop_watch below). Best-effort:
+    SAME order, and a chop watch's life is at most one checkpoint window: run_checkpoint never
+    re-arms it, it just lets whichever legs are still flat fall through to a normal fresh reopen
+    at that checkpoint's current market price (see run_checkpoint). Best-effort:
     the order may already be filled/cancelled/gone by the time this runs (a race against the watch
     thread noticing a fill) - any failure here is logged, never raised, since this is hygiene, not
     the primary control flow."""
@@ -1048,29 +1047,6 @@ def _abandon_chop_watches(day):
         _abandon_chop_watch(day, opt)
 
 
-def _renew_chop_watch(day, opt):
-    """Re-arms `opt`'s chop watch with a FRESH resting order at its already-pinned
-    checkpoint-original level - called from run_checkpoint when the strike hasn't moved: every
-    checkpoint boundary tears down whatever chop order was resting (_cancel_pending_chop_order,
-    called unconditionally before this), and if the leg's watch is still warranted, this
-    immediately replaces it with a new order rather than leaving the leg flat with nothing
-    resting. checkpoint_info itself is untouched by either step, so the level being watched never
-    moves as long as the strike doesn't."""
-    info = day['checkpoint_info'][opt]
-    if info is None:
-        log.warning(f'{opt}: was awaiting chop but has no pinned checkpoint info - cannot renew, staying flat')
-        return
-    try:
-        order_id = _place_chop_reentry(info['instrument'], info['quantity'], info['entry_price'])
-    except Exception as exc:
-        log.error(f'{opt}: failed to renew chop reentry order at checkpoint ({exc}) - staying flat this window', exc_info=True)
-        return
-    with _state_lock:
-        day['awaiting_chop'][opt] = True
-        day['chop_order_id'][opt] = order_id
-    log.info(f'{opt}: chop watch renewed at checkpoint (no strike change) - order {order_id}')
-
-
 def _enter_leg(state, day, opt, instrument, ltp, strike, cfg):
     quantity = instrument.lot_size * cfg['lots']
     entry_price, sl_order_id = _short_leg_with_stoploss(instrument, quantity, ltp)
@@ -1087,16 +1063,13 @@ def _enter_leg(state, day, opt, instrument, ltp, strike, cfg):
     alert(f'ENTER {opt} {instrument.name} x{quantity} @ ~{entry_price} (SL {STOPLOSS_PCT:.0%})')
 
 
-def _enter_legs_parallel(state, day, desired, cfg, only_missing=False, skip_chopping=False):
+def _enter_legs_parallel(state, day, desired, cfg, only_missing=False):
     """Enter every (or, with only_missing, every currently-flat) leg in `desired` at once rather
-    than one after another - see _run_legs_in_parallel. skip_chopping additionally excludes a leg
-    that's flat with a resting chop order out (day['awaiting_chop']) - used by the checkpoint's
-    "nothing changed" branch, which lets a mid-chop leg ride straight through the checkpoint
-    boundary instead of being superseded by a fresh market-price entry (see module docstring)."""
+    than one after another - see _run_legs_in_parallel."""
     tasks = {
         opt: (lambda opt=opt, instrument=instrument, ltp=ltp, strike=strike: _enter_leg(state, day, opt, instrument, ltp, strike, cfg))
         for opt, (instrument, ltp, strike) in desired.items()
-        if (not only_missing or state[opt] is None) and not (skip_chopping and day['awaiting_chop'][opt])
+        if not only_missing or state[opt] is None
     }
     _run_legs_in_parallel(tasks)
 
@@ -1523,13 +1496,11 @@ def _reprice_leg_stoploss(state, opt, market):
 
 def run_checkpoint(state, market, cfg, day, symbol):
     # Every checkpoint boundary tears down ANY pending chop order outright, unconditionally, before
-    # this checkpoint's own decision even runs - a resting chop order is NEVER the same order
-    # carried across checkpoints. `was_awaiting_chop` snapshots which legs had one pending
-    # beforehand, so the "nothing changed" branch below knows which to immediately re-arm with a
-    # FRESH order at the same pinned level (_renew_chop_watch) - "only live chop orders will run
-    # if no ATM strike change". checkpoint_info (the pinned level itself) is untouched here; it's
-    # only forgotten in the branches below that mean a genuine "stay flat" (premium rise/drift).
-    was_awaiting_chop = {opt: day['awaiting_chop'][opt] for opt in OPTION_TYPES}
+    # this checkpoint's own decision even runs - a chop watch's life is at most one checkpoint
+    # window, full stop: a resting chop order is NEVER carried across a checkpoint boundary, and
+    # it is NEVER re-armed here either. Whatever a leg's chop watch was doing, this checkpoint's
+    # own decision below (stay flat / roll / reopen) starts from a clean slate for it, exactly
+    # like a leg that was never awaiting chop at all.
     _cancel_pending_chops(day)
 
     prev_premium = day['prev_checkpoint_premium']
@@ -1573,19 +1544,14 @@ def run_checkpoint(state, market, cfg, day, symbol):
 
     # Nothing changed (no strike change, no premium rise): a leg that's open stays open - but,
     # this file's own addition, its resting SL gets re-priced off this checkpoint's current LTP
-    # (_reprice_leg_stoploss - see module docstring); a leg that had a chop watch pending gets it
-    # immediately renewed - a FRESH order at the SAME pinned level (checkpoint_info untouched
-    # above) - rather than left with nothing resting. Only a leg with no prior chop watch and no
-    # open position gets a normal fresh reopen (only_missing + skip_chopping below - awaiting_chop
-    # is already True again for anything just renewed, so _enter_legs_parallel correctly leaves it
-    # alone).
+    # (_reprice_leg_stoploss - see module docstring). Any leg that's flat - whether it never had a
+    # chop watch, or had one that never got touched before this checkpoint tore it down above -
+    # gets a normal fresh reopen at this checkpoint's current market price (only_missing below).
     for opt in OPTION_TYPES:
         if state[opt] is not None:
             log.info(f'{opt} still open at {state[opt]["strike"]}, leaving as is')
             _reprice_leg_stoploss(state, opt, market)
-        elif was_awaiting_chop[opt]:
-            _renew_chop_watch(day, opt)
-    _enter_legs_parallel(state, day, desired, cfg, only_missing=True, skip_chopping=True)
+    _enter_legs_parallel(state, day, desired, cfg, only_missing=True)
 
 
 # ── Minute-level checks (every poll) ─────────────────────────────────────────────────────────
