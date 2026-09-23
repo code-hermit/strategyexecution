@@ -86,8 +86,8 @@ Between checkpoints, polls every POLL_INTERVAL_SECONDS (not just once an hour) t
   - (optional, off by default) close both legs if the ATM premium is now above its own highest
     reading over the trailing PREMIUM_HIGH_LOOKBACK window.
   - halt trading for the day (square everything off, no more re-entries) once realized+unrealized
-    pnl crosses -daily_loss_limit (points, unscaled by lot size; per-underlying via CFG - SENSEX 100
-    matches the backtest, NIFTY overridden tighter at 40).
+    pnl crosses -daily_loss_limit (points, unscaled by lot size; per-underlying via CFG - SENSEX 120,
+    NIFTY 40).
 The fast SL_WATCH_INTERVAL_SECONDS-cadence background thread additionally watches for a resting
 chop order's own fill (see CHOP above) independent of this slower poll cadence.
 
@@ -290,7 +290,7 @@ CFG = {
     'SENSEX': dict(
         strike_interval=100, lots=2, aliceblue_exchange='BFO',
         zerodha_options_exchange='BFO', zerodha_spot_instrument='BSE:SENSEX',
-        daily_loss_limit=100,
+        daily_loss_limit=120,
     ),
 }
 

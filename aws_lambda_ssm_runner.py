@@ -130,7 +130,7 @@ def _run(ip_address):
                 f"git clone https://{github_pat}@github.com/code-hermit/strategyexecution.git /home/ec2-user/trading",
                 build_env_file_command("/home/ec2-user/trading/.env"),
                 "cd /home/ec2-user/trading && pip install -r requirements.txt",
-                "cd /home/ec2-user/trading && python3 dhan_generate_access_token.py",
+ 
                 # Everything up to here ran as root (SSM's default user), so
                 # /home/ec2-user/trading and the files inside it (including
                 # .env) are root-owned. Hand it back to ec2-user before wiring
@@ -139,7 +139,8 @@ def _run(ip_address):
                 "chmod +x /home/ec2-user/trading/exec_rsv_cont.sh "
                 "/home/ec2-user/trading/exec_rsv_cont_sensex.sh "
                 "/home/ec2-user/trading/sensex_buying.sh "
-                "/home/ec2-user/trading/zerodha_ticker_service.sh",
+                "/home/ec2-user/trading/zerodha_ticker_service.sh "
+                "/home/ec2-user/trading/process_monitor.sh",
                 # One cron line per strategy, restricted to weekdays (1-5) at the day-of-week
                 # field too so the wrong tmux session never even spins up on a weekend:
                 #   Mon-Fri (1,2,3,4,5)   9:42 -> zerodha_ticker_service.sh (started first, so its
@@ -154,6 +155,9 @@ def _run(ip_address):
                 #                                 warm its own instrument caches; sensex_option_
                 #                                 buying.py's own ENTRY_TIME (10:15) still gates the
                 #                                 actual checkpoint/entry)
+                #   Mon-Fri (1,2,3,4,5)   9:46 -> process_monitor.sh (watches the above jobs and
+                #                                 alarms if one dies; started last, after the jobs
+                #                                 it watches are already up)
                 # Each job is added independently, keyed on its own exact "-s <session-name> " tmux
                 # flag (not a loose substring like "option_selling", which also matches
                 # "option_selling_sensex") - a single shared "does crontab mention option_selling at
@@ -181,6 +185,11 @@ def _run(ip_address):
                     "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s sensex_buying ' || "
                     "(crontab -u ec2-user -l 2>/dev/null; "
                     "echo \"14 10 * * * /usr/bin/tmux new-session -d -s sensex_buying '/home/ec2-user/trading/sensex_buying.sh'\") | crontab -u ec2-user -"
+                ),
+                (
+                    "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s process_monitor ' || "
+                    "(crontab -u ec2-user -l 2>/dev/null; "
+                    "echo \"46 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s process_monitor '/home/ec2-user/trading/process_monitor.sh'\") | crontab -u ec2-user -"
                 ),
 
             ]
