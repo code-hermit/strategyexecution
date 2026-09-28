@@ -102,7 +102,7 @@ does NOT import execution_rolling_straddle_tn.py (which authenticates with Dhan 
 its market-data source); Dhan is never touched, imported, or authenticated by this file at all.
 
 Trades a single underlying (command-line arg, default NIFTY) on TRADE_WEEKDAYS (command-line
-weekday codes, default every weekday - matching the backtest's own default). Lots default to 2 for
+weekday codes, default every weekday - matching the backtest's own default). Lots default to 3 for
 both NIFTY and SENSEX (informational CFG below); pass a different symbol/weekday-codes pair on the
 command line to override.
 
@@ -296,12 +296,12 @@ DAY_CODE_TO_WEEKDAY = {'m': 'Monday', 't': 'Tuesday', 'w': 'Wednesday', 'h': 'Th
 # underlying (matching the backtest's convention); now set per-underlying instead.
 CFG = {
     'NIFTY': dict(
-        strike_interval=50, lots=2, aliceblue_exchange='NFO',
+        strike_interval=50, lots=3, aliceblue_exchange='NFO',
         zerodha_options_exchange='NFO', zerodha_spot_instrument='NSE:NIFTY 50',
         daily_loss_limit=40,
     ),
     'SENSEX': dict(
-        strike_interval=100, lots=2, aliceblue_exchange='BFO',
+        strike_interval=100, lots=3, aliceblue_exchange='BFO',
         zerodha_options_exchange='BFO', zerodha_spot_instrument='BSE:SENSEX',
         daily_loss_limit=120,
     ),
@@ -474,6 +474,16 @@ LIMIT_OFFSET_PCT = 0.05  # limit price offset from LTP: below LTP for SELL, abov
 # getting OUT fast is the priority once we've already decided to close, not getting a clean price.
 FILL_POLL_TIMEOUT = 10
 TERMINAL_ORDER_STATUSES = {'complete', 'rejected', 'cancelled'}
+
+
+def _status(o):
+    """An order-book entry's status, normalised: lowercased, and ANY cancel variant AliceBlue sends
+    ('CANCELED', 'Cancelled', 'cancel', 'cancelled by user', ...) mapped to 'cancelled' - every status
+    check in this file reads through here. 28 Sep 2026: AliceBlue spells it 'CANCELED' (one L);
+    comparing against 'cancelled' alone never matched, so exits sat re-cancelling an
+    already-cancelled SL (never seen as terminal) and never placed the exit order."""
+    status = str(o.get('orderStatus', '')).strip().lower()
+    return 'cancelled' if status.startswith('cancel') else status
 _ALICEBLUE_EMPTY_RESULT_STATUSES = {'EC920'}
 
 # Exit chase: once we've decided to close a leg, priority is getting OUT, not a clean fill price -
@@ -792,7 +802,7 @@ def _wait_for_fill_price(broker_order_id):
         for o in book or []:
             if o.get('brokerOrderId') != broker_order_id:
                 continue
-            status = str(o.get('orderStatus', '')).lower()
+            status = _status(o)
             if status == 'rejected':
                 raise RuntimeError(f'order {broker_order_id} rejected: {o.get("rejectionReason")}')
             if status == 'complete':
@@ -810,7 +820,7 @@ def _poll_order_status(broker_order_id, deadline):
         for o in book or []:
             if o.get('brokerOrderId') != broker_order_id:
                 continue
-            status = str(o.get('orderStatus', '')).lower()
+            status = _status(o)
             if status == 'rejected':
                 raise RuntimeError(f'order {broker_order_id} rejected: {o.get("rejectionReason")}')
             if status == 'complete':
@@ -1295,7 +1305,7 @@ def _close_leg(state, day, opt, market, cfg, reason):
 #     for o in _order_book():
 #         if (
 #             str(o.get('instrumentId')) == str(instrument.token) and _ours(o, opt, TAG_SL)
-#             and str(o.get('orderStatus', '')).lower() not in TERMINAL_ORDER_STATUSES
+#             and _status(o) not in TERMINAL_ORDER_STATUSES
 #         ):
 #             resting_order_id = o.get('brokerOrderId')
 #             break
@@ -1339,7 +1349,7 @@ def _cancel_and_confirm(order_id, label):
     while True:  # paced by the shared 2s gate - see _GatedFetch
         book = _read_order_book_or_none(f'{label} cancel check')
         o = _find_order(book, order_id) if book is not None else None
-        status = str(o.get('orderStatus', '')).lower() if o else None
+        status = _status(o) if o else None
         if status == 'complete':
             return status, float(o.get('averageTradedPrice') or 0) or None
         if status in TERMINAL_ORDER_STATUSES or time_module.time() >= deadline:
@@ -1498,7 +1508,7 @@ def _net_short_qty(order_book, token):
     _sync_stopped_out_and_chopped_legs for why)."""
     net = 0
     for o in order_book:
-        if str(o.get('instrumentId')) != str(token) or str(o.get('orderStatus', '')).lower() != 'complete' or not _counts_toward_position(o):
+        if str(o.get('instrumentId')) != str(token) or _status(o) != 'complete' or not _counts_toward_position(o):
             continue
         try:
             qty = int(o.get('quantity') or o.get('filledQuantity') or 0)
@@ -1568,7 +1578,7 @@ def _reconcile_leg(state, day, opt, leg, order_book, positions, now):
 
     sl_order_id = leg.get('sl_order_id')
     sl = None if (DRY_RUN or sl_order_id is None) else _find_order(order_book, sl_order_id)
-    sl_status = str(sl.get('orderStatus', '')).lower() if sl else None
+    sl_status = _status(sl) if sl else None
 
     if sl_status == 'complete':
         verdict = _agreed(day, opt, 'stop', pos_moved, now)
@@ -1668,7 +1678,7 @@ def _sync_stopped_out_and_chopped_legs(state, day, market):
         for o in order_book:
             if o.get('brokerOrderId') != order_id:
                 continue
-            status = str(o.get('orderStatus', '')).lower()
+            status = _status(o)
             if status == 'complete':
                 fill_price = float(o.get('averageTradedPrice') or 0)
             break
@@ -1755,7 +1765,7 @@ def _infer_fill_price_from_orderbook(token, quantity, transaction_type):
         o for o in orders
         if str(o.get('instrumentId')) == str(token) and _counts_toward_position(o)
         and str(o.get('transactionType', '')).upper() == transaction_type
-        and str(o.get('orderStatus', '')).lower() == 'complete'
+        and _status(o) == 'complete'
     ]
     fills.sort(key=_order_sort_key, reverse=True)
 
@@ -1804,12 +1814,22 @@ def _find_resting_sl_order_id(token):
     except Exception as exc:
         log.warning(f'could not fetch order book to find resting SL for token {token}: {exc}')
         return None
-    for o in orders:
-        if (
-            str(o.get('instrumentId')) == str(token) and _ours(o, roles=TAG_SL)
-            and str(o.get('transactionType', '')).upper() == 'BUY'
-            and str(o.get('orderStatus', '')).lower() not in TERMINAL_ORDER_STATUSES
-        ):
+    resting_buys = [
+        o for o in orders
+        if str(o.get('instrumentId')) == str(token)
+        and str(o.get('transactionType', '')).upper() == 'BUY'
+        and _status(o) not in TERMINAL_ORDER_STATUSES
+    ]
+    for o in resting_buys:
+        if _ours(o, roles=TAG_SL):
+            return o.get('brokerOrderId')
+    # none carrying our SL tag - e.g. the broker didn't echo the tag back in 'remarks'. Adopt an
+    # UNTAGGED resting BUY on this contract instead: leaving a live SL unknown to us would mean a
+    # later close places its exit without cancelling it, and that SL could then open a stray long.
+    # (Orders tagged by another strategy are still never adopted.)
+    for o in resting_buys:
+        if not _tag_of(o):
+            log.warning(f'token {token}: adopting untagged resting BUY order {o.get("brokerOrderId")} as this leg\'s SL (no order carrying our SL tag found)')
             return o.get('brokerOrderId')
     return None
 
@@ -1865,10 +1885,21 @@ def run_checkpoint(state, market, cfg, day, symbol):
         prev_premium is not None and current_premium is not None
         and current_premium > prev_premium
     )
+
+    log.info(f'checkpoint: spot={market["spot"]} atm={market["atm"]} atm_premium={current_premium} (prev={prev_premium}) day_pnl={day["realized_pnl"]:.2f}')
+    _checkpoint_act(state, market, cfg, day, premium_increased)
+    # Only now that this checkpoint's action went through does its premium become the next baseline.
+    # 28 Sep 2026: this used to be saved BEFORE acting - when the 10:45 SENSEX roll's close failed,
+    # every 15s retry compared against the premium from 15s earlier, so the decision flipped between
+    # "roll" and "premium rose -> close and stay flat" on noise. A failed checkpoint now retries
+    # against the same baseline it was first decided on.
     if current_premium is not None:
         day['prev_checkpoint_premium'] = current_premium
 
-    log.info(f'checkpoint: spot={market["spot"]} atm={market["atm"]} atm_premium={current_premium} (prev={prev_premium}) day_pnl={day["realized_pnl"]:.2f}')
+
+def _checkpoint_act(state, market, cfg, day, premium_increased):
+    """run_checkpoint's decision - raises if its close/entry fails, so run_checkpoint doesn't
+    advance the premium baseline and the main loop retries this same checkpoint."""
 
     if premium_increased:
         if state['CE'] is not None or state['PE'] is not None:
