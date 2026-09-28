@@ -81,7 +81,8 @@ backtest exactly (chop reentries included - each reentry's own protective stoplo
 STOPLOSS_PCT off wherever it refilled).
 
 Between checkpoints, polls every POLL_INTERVAL_SECONDS (not just once an hour) to:
-  - notice a leg's resting stoploss has filled (broker-side truth, via AliceBlue positions) and
+  - notice a leg's resting stoploss has filled (broker-side truth, via the leg's own tagged SL
+    order in AliceBlue's order book - see _reconcile_leg / _order_tag) and
     alert immediately rather than waiting for the next checkpoint to notice it's gone.
   - (optional, off by default) close both legs if the ATM premium is now above its own highest
     reading over the trailing PREMIUM_HIGH_LOOKBACK window.
@@ -120,6 +121,18 @@ HEARTBEAT_INTERVAL "still running" ping goes out with the current legs, day pnl 
 real event/timestamp. Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env; if either is
 missing, Telegram alerts (including heartbeats) are skipped (logged as a one-time warning) but
 trading proceeds normally.
+
+TODO (28 Sep 2026): replace the per-leg flags (state[opt] / day['awaiting_chop'] / 'chop_order_id' /
+'checkpoint_info' / 'closing') with an explicit per-leg state machine - OPEN, CLOSING, STOPPING,
+AWAITING_CHOP, FLAT - every transition made under one lock shared by the watch thread and the main
+loop, each with a defined failure path (e.g. chop order rejected -> FLAT). Known races this closes:
+  - stoploss -> chop is not atomic: the watch thread clears state[opt] before the chop order is
+    placed/recorded, so a checkpoint in that window can re-enter the leg (or roll/halt) and the late
+    chop order then lands on top of it - chop fill overwrites the fresh leg, position doubles.
+Also still open: a protective SL that fails to place after a fill (entry or chop) leaves a naked
+short - retry, else emergency exit, else halt; an exit that fails after its SL was cancelled should
+re-place the SL; the exit chase has no attempt cap; a contract also traded manually / by another
+strategy makes leg ownership ambiguous - detect it and alert instead of acting automatically.
 """
 
 import csv
@@ -460,7 +473,6 @@ LIMIT_OFFSET_PCT = 0.05  # limit price offset from LTP: below LTP for SELL, abov
 # SL still use this fixed offset unchanged - only EXITS chase (see EXIT_CHASE_* below), since
 # getting OUT fast is the priority once we've already decided to close, not getting a clean price.
 FILL_POLL_TIMEOUT = 10
-FILL_POLL_INTERVAL = 1
 TERMINAL_ORDER_STATUSES = {'complete', 'rejected', 'cancelled'}
 _ALICEBLUE_EMPTY_RESULT_STATUSES = {'EC920'}
 
@@ -472,7 +484,6 @@ _ALICEBLUE_EMPTY_RESULT_STATUSES = {'EC920'}
 # (by then effectively marketable, though still technically a LIMIT - the broker rejects MARKET
 # orders on these NFO options, EC965).
 EXIT_CHASE_WAIT_SECONDS = 2
-EXIT_CHASE_POLL_INTERVAL = 0.5
 EXIT_CHASE_OFFSET_STEP = 0.05
 EXIT_CHASE_MAX_OFFSET_PCT = 0.50
 
@@ -596,6 +607,139 @@ def _order_book():
     return _aliceblue_get('/orders/book')
 
 
+BROKER_FETCH_MIN_GAP_SECONDS = 2.0  # each of the order book and /positions is fetched at most once every
+# 2s by this whole process - NIFTY and SENSEX each run their own copy of this file, alongside other
+# strategy programs on the same AliceBlue account, so every process keeps its own load low enough
+# that none of them gets the account rate-limited for everyone.
+
+
+class _GatedFetch:
+    """The ONE way this file reads a broker endpoint (order book, positions): a shared snapshot per
+    process, fetched at most once every BROKER_FETCH_MIN_GAP_SECONDS across every thread (watch
+    thread, exit chases, fill/cancel polls) - concurrent callers reuse one fetch, never each their
+    own. get() returns the cached snapshot if it was fetched at/after `fresh_after` (default: within
+    the last gap); otherwise waits out the gap and fetches. Pass fresh_after=time() when you need a
+    snapshot taken after something you just did (placed/cancelled an order).
+
+    Fails fast: a failed fetch raises straight away (no retry/backoff while holding the lock - that
+    would freeze every other caller, exits included) and still counts toward the gap, so a failing
+    endpoint is never hammered. Callers poll in loops and just try again next pass."""
+
+    def __init__(self, name, fetch_fn):
+        self._name = name
+        self._fetch_fn = fetch_fn
+        self._lock = threading.Lock()  # held while fetching - concurrent callers wait, then reuse it
+        self._data = None
+        self._data_at = None  # when the cached snapshot's request started
+        self._attempt_at = None  # when the last request (success or failure) started
+
+    def get(self, fresh_after=None):
+        with self._lock:
+            now = time_module.time()
+            if fresh_after is None:
+                fresh_after = now - BROKER_FETCH_MIN_GAP_SECONDS
+            if self._data_at is not None and self._data_at >= fresh_after:
+                return self._data
+            if self._attempt_at is not None:
+                wait = self._attempt_at + BROKER_FETCH_MIN_GAP_SECONDS - now
+                if wait > 0:
+                    time_module.sleep(wait)
+            self._attempt_at = time_module.time()  # the snapshot reflects state at/after this
+            data = self._fetch_fn()
+            self._data, self._data_at = data, self._attempt_at
+            return data
+
+
+_order_book_fetch = _GatedFetch('order book', _order_book)
+_positions_fetch = _GatedFetch('positions', lambda: _aliceblue_get('/positions'))
+
+
+def _get_order_book(fresh_after=None):
+    return _order_book_fetch.get(fresh_after)
+
+
+def _read_order_book_or_none(label):
+    """A fresh order book for a polling loop, or None if this read failed - the loop treats that as
+    "unknown, try again next pass" (the gate paces the retry), never as a reason to abandon an exit
+    or an entry's fill check early."""
+    try:
+        return _get_order_book(fresh_after=time_module.time())
+    except Exception as exc:
+        log.warning(f'{label}: order book read failed ({exc}) - retrying', extra={'no_telegram': True})
+        return None
+
+
+# ── Order tags ──────────────────────────────────────────────────────────────────────────────────
+# Every order this file places carries a short orderTag so the order book can tell which leg and
+# which purpose each order belongs to - and tell ours apart from any other strategy trading the same
+# contract (e.g. sensex_option_buying.py). AliceBlue allows up to 25 chars; kept under 10 to be safe:
+#   'rv' + underlying (N/S) + option (C/P) + role + leg id (HHMM the leg opened), e.g. 'rvNCS1045' =
+#   NIFTY CE stoploss of the leg opened 10:45. A chop reentry order is its leg's entry, so the leg it
+#   opens reuses the reentry order's leg id for its own SL.
+_TAG_UNDERLYING = {'NIFTY': 'N', 'SENSEX': 'S'}
+TAG_PREFIX = 'rv' + _TAG_UNDERLYING.get(_ARGV_SYMBOL, _ARGV_SYMBOL[:1])
+TAG_ENTRY, TAG_SL, TAG_CHOP, TAG_EXIT = 'E', 'S', 'R', 'X'
+_warned_untagged_book = False
+# Long tags this file used before (e.g. 'rsv_adjust_sl_chop_reentry') - still recognised, so a
+# mid-day restart onto this version can adopt legs whose orders went in under the old tags.
+_LEGACY_TAG_PREFIX = 'rsv_adjust_sl_'
+_LEGACY_TAG_ROLES = {'entry': TAG_ENTRY, 'sl': TAG_SL, 'chop': TAG_CHOP, 'exit': TAG_EXIT}
+
+
+def _counts_toward_position(o):
+    """Whether order-book entry `o` belongs in this file's view of its net position: our own orders,
+    plus untagged ones - a manual trade from the broker app carries no tag, and a manual close must
+    still register as a close (see _reconcile_leg). Only orders tagged by SOMETHING ELSE (another
+    strategy on the same contract) are left out."""
+    return not _tag_of(o) or _ours(o)
+
+
+def _new_leg_id():
+    return datetime.now().strftime('%H%M')
+
+
+def _order_tag(opt, role, leg_id):
+    tag = f'{TAG_PREFIX}{opt[0]}{role}{leg_id or "0000"}'
+    assert len(tag) < 10, tag
+    return tag
+
+
+_EMPTY_TAG_VALUES = {'', '--', 'NA'}  # what AliceBlue's order book shows when no tag was set
+
+
+def _tag_of(o):
+    """The orderTag we placed `o` with - AliceBlue's order book returns it as 'remarks' (with
+    'orderTag' checked too, in case). '' if the order was placed untagged (e.g. manually from the
+    app); None if the order book carries neither field at all."""
+    for key in ('remarks', 'orderTag'):
+        if key in o:
+            tag = str(o.get(key) or '').strip()
+            return '' if tag in _EMPTY_TAG_VALUES else tag
+    return None
+
+
+def _ours(o, opt=None, roles=None):
+    """True if order-book entry `o` was placed by this file (for `opt`, with a role in `roles`, when
+    given). If the order book carries no tag field at all, falls back to True - matching orders by
+    instrument alone, the previous behaviour - and warns once."""
+    global _warned_untagged_book
+    tag = _tag_of(o)
+    if tag is None:
+        if not _warned_untagged_book:
+            _warned_untagged_book = True
+            log.warning("order book entries carry no 'remarks'/'orderTag' - matching orders by instrument alone")
+        return True
+    tag, n = tag.lower(), len(TAG_PREFIX)  # case-insensitive, in case the broker echoes it back re-cased
+    if tag.startswith(_LEGACY_TAG_PREFIX):  # placed before these short tags - no option code in it
+        role = next((r for suffix, r in _LEGACY_TAG_ROLES.items() if tag[len(_LEGACY_TAG_PREFIX):].startswith(suffix)), None)
+        return roles is None or role in roles
+    return (
+        tag.startswith(TAG_PREFIX.lower())
+        and (opt is None or tag[n:n + 1] == opt[0].lower())
+        and (roles is None or tag[n + 1:n + 2] in roles.lower())
+    )
+
+
 def _place_order(transaction_type, instrument, quantity, order_type, price='0', trigger_price=None, order_tag=None):
     payload = [{
         'exchange': instrument.exchange,
@@ -643,8 +787,9 @@ def _modify_order(broker_order_id, instrument, quantity, order_type, price, trig
 
 def _wait_for_fill_price(broker_order_id):
     deadline = time_module.time() + FILL_POLL_TIMEOUT
-    while time_module.time() < deadline:
-        for o in _order_book():
+    while time_module.time() < deadline:  # paced by the shared 2s gate - see _GatedFetch
+        book = _read_order_book_or_none(f'fill poll {broker_order_id}')
+        for o in book or []:
             if o.get('brokerOrderId') != broker_order_id:
                 continue
             status = str(o.get('orderStatus', '')).lower()
@@ -652,17 +797,17 @@ def _wait_for_fill_price(broker_order_id):
                 raise RuntimeError(f'order {broker_order_id} rejected: {o.get("rejectionReason")}')
             if status == 'complete':
                 return float(o.get('averageTradedPrice') or 0)
-        time_module.sleep(FILL_POLL_INTERVAL)
     raise TimeoutError(f'order {broker_order_id} not filled within {FILL_POLL_TIMEOUT}s')
 
 
 def _poll_order_status(broker_order_id, deadline):
-    """One EXIT_CHASE-style poll pass: checks the order book (at most once every
-    EXIT_CHASE_POLL_INTERVAL) until `deadline` (a time_module.time() value) for `broker_order_id`
+    """One EXIT_CHASE-style poll pass: checks the order book (through the shared 2s gate - see
+    _GatedFetch) until `deadline` (a time_module.time() value) for `broker_order_id`
     to go terminal. Returns the fill price on completion, raises on rejection, or returns None if
     `deadline` passed with the order still resting (caller decides whether to chase further)."""
     while time_module.time() < deadline:
-        for o in _order_book():
+        book = _read_order_book_or_none(f'exit poll {broker_order_id}')
+        for o in book or []:
             if o.get('brokerOrderId') != broker_order_id:
                 continue
             status = str(o.get('orderStatus', '')).lower()
@@ -670,7 +815,6 @@ def _poll_order_status(broker_order_id, deadline):
                 raise RuntimeError(f'order {broker_order_id} rejected: {o.get("rejectionReason")}')
             if status == 'complete':
                 return float(o.get('averageTradedPrice') or 0)
-        time_module.sleep(min(EXIT_CHASE_POLL_INTERVAL, max(0, deadline - time_module.time())))
     return None
 
 
@@ -739,20 +883,23 @@ def _exit_chase_fill(instrument, transaction_type, quantity, get_fresh_ltp, orde
             f'{instrument.name} exit not filled within {EXIT_CHASE_WAIT_SECONDS}s '
             f'(attempt {attempt}, offset {offset_pct:.0%}) - cancelling and re-pricing more aggressively',
         )
-        try:
-            _cancel_order(order_no)
-        except Exception as exc:
-            log.warning(f'{instrument.name}: cancel of unfilled exit order {order_no} failed ({exc}) - placing a fresh order anyway')
+        status, fill_price = _cancel_and_confirm(order_no, f'{instrument.name} exit')
+        if status == 'complete':  # filled before the cancel landed - done, placing another would go long
+            return fill_price
+        if status not in TERMINAL_ORDER_STATUSES:  # cancel didn't take - keep watching this same order
+            log.warning(f'{instrument.name}: exit order {order_no} still {status!r} after cancel - polling it again, not placing another')
+            continue
         order = _place_order(transaction_type, instrument, quantity, 'LIMIT', price=str(price), order_tag=order_tag)
         order_no = order.get('brokerOrderId')
         if not order_no:
             raise RuntimeError(f'{instrument.name} exit order rejected: {order}')
 
 
-def get_open_legs(contracts_by_token):
+def get_open_legs(contracts_by_token, fresh_after=None):
     """token -> position dict, restricted to currently open (nonzero net qty) legs among this
-    week's option contracts for the current underlying."""
-    positions = _aliceblue_get('/positions')
+    week's option contracts for the current underlying. Read through the shared 2s gate
+    (_positions_fetch) - see _GatedFetch."""
+    positions = _positions_fetch.get(fresh_after)
     return {
         int(p['instrumentId']): p for p in positions
         if int(p['instrumentId']) in contracts_by_token and int(p.get('netQuantity', 0)) != 0
@@ -919,7 +1066,7 @@ def _place_protective_sl(instrument, quantity, entry_price, order_tag):
     return sl['brokerOrderId']
 
 
-def _place_chop_reentry(instrument, quantity, original_entry_price):
+def _place_chop_reentry(instrument, quantity, original_entry_price, order_tag):
     """Resting AliceBlue SL order with transactionType SELL at `original_entry_price` (this leg's
     ORIGINAL entry price for the current checkpoint window - see _pin_checkpoint_info, NOT wherever
     the stoploss that just fired actually exited) - fires the instant price comes back down to that
@@ -935,14 +1082,14 @@ def _place_chop_reentry(instrument, quantity, original_entry_price):
     log.info(tag)
     if DRY_RUN:
         return None
-    order = _place_order('SELL', instrument, quantity, 'SL', price=str(limit_price), trigger_price=trigger_price, order_tag='rsv_adjust_sl_chop_reentry')
+    order = _place_order('SELL', instrument, quantity, 'SL', price=str(limit_price), trigger_price=trigger_price, order_tag=order_tag)
     order_no = order.get('brokerOrderId')
     if not order_no:
         raise RuntimeError(f'{instrument.name} chop reentry order rejected: {order}')
     return order_no
 
 
-def _short_leg_with_stoploss(instrument, quantity, ltp):
+def _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id):
     """SELL to open, then hand off to _place_protective_sl. Returns (fill_price, sl_order_id) -
     sl_order_id (None in DRY_RUN) is kept by the caller so a later checkpoint can MODIFY this same
     resting order in place (see _reprice_leg_stoploss) rather than track the stoploss by trigger
@@ -953,13 +1100,13 @@ def _short_leg_with_stoploss(instrument, quantity, ltp):
     if DRY_RUN:
         return entry_price, None
 
-    entry = _place_order('SELL', instrument, quantity, 'LIMIT', price=str(entry_price), order_tag='rsv_adjust_sl_entry')
+    entry = _place_order('SELL', instrument, quantity, 'LIMIT', price=str(entry_price), order_tag=_order_tag(opt, TAG_ENTRY, leg_id))
     order_no = entry.get('brokerOrderId')
     if not order_no:
         raise RuntimeError(f'{instrument.name} entry order rejected: {entry}')
 
     entry_price = _wait_for_fill_price(order_no)
-    sl_order_id = _place_protective_sl(instrument, quantity, entry_price, order_tag='rsv_adjust_sl_sl')
+    sl_order_id = _place_protective_sl(instrument, quantity, entry_price, order_tag=_order_tag(opt, TAG_SL, leg_id))
     return entry_price, sl_order_id
 
 
@@ -1049,13 +1196,16 @@ def _abandon_chop_watches(day):
 
 def _enter_leg(state, day, opt, instrument, ltp, strike, cfg):
     quantity = instrument.lot_size * cfg['lots']
-    entry_price, sl_order_id = _short_leg_with_stoploss(instrument, quantity, ltp)
+    leg_id = _new_leg_id()
+    entry_price, sl_order_id = _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id)
     leg = dict(
-        instrument=instrument, strike=strike, entry_price=entry_price, quantity=quantity,
+        instrument=instrument, strike=strike, entry_price=entry_price, quantity=quantity, leg_id=leg_id,
         sl_order_id=sl_order_id, sl_ref_price=entry_price,  # sl_ref_price: the price this leg's
         # live SL trigger is currently measured off - starts equal to entry_price, then gets
         # re-pinned to the checkpoint LTP each time _reprice_leg_stoploss moves the live order -
         # see that function and the module docstring.
+        opened_at=time_module.time(),  # see _sync_stopped_out_and_chopped_legs: a positions
+        # snapshot taken before this moment can't see this leg yet and must not count it as stopped.
     )
     with _state_lock:  # see _state_lock's comment - races the watch thread's own clear
         state[opt] = leg
@@ -1093,7 +1243,7 @@ def _close_leg(state, day, opt, market, cfg, reason):
     with _state_lock:
         day['closing'][opt] = True
     try:
-        fill_price = _close_leg_order(leg['instrument'], leg['quantity'], fallback_ltp=exit_ltp)
+        fill_price = _close_leg_order(leg['instrument'], leg['quantity'], opt, leg.get('leg_id'), leg.get('sl_order_id'), fallback_ltp=exit_ltp)
     except Exception:
         # leg stays open (matches the pre-existing behaviour of any close failure) - but the flag
         # must still come back down, or this leg's genuine future stoploss fills would be silently
@@ -1116,68 +1266,101 @@ def _close_leg(state, day, opt, market, cfg, reason):
     return pnl
 
 
-SL_TRIGGER_BELOW_LTP_PCT = 0.01  # how far below current LTP to drop a resting BUY SL's trigger -
-# guarantees the "price >= trigger" condition is already true (not marginal/racy against the next
-# tick), so the broker releases it immediately instead of continuing to wait for price to reach it
-SL_RELEASE_PRICE_MIN_ABOVE_LTP_PCT = 0.01  # the released order's own limit price floor, as a % above LTP
-SL_RELEASE_PRICE_MIN_POINTS_ABOVE_LTP = 10  # ...or this many points above LTP, whichever is higher
+# UNUSED since 28 Sep 2026 - converting the resting SL into a market-ish exit by modifying its
+# trigger/price did not work reliably live on AliceBlue; exits now cancel the SL, confirm it in the
+# order book and place a fresh exit order instead (see _close_leg_order). Kept for reference.
+# SL_TRIGGER_BELOW_LTP_PCT = 0.01  # how far below current LTP to drop a resting BUY SL's trigger -
+# # guarantees the "price >= trigger" condition is already true (not marginal/racy against the next
+# # tick), so the broker releases it immediately instead of continuing to wait for price to reach it
+# SL_RELEASE_PRICE_MIN_ABOVE_LTP_PCT = 0.01  # the released order's own limit price floor, as a % above LTP
+# SL_RELEASE_PRICE_MIN_POINTS_ABOVE_LTP = 10  # ...or this many points above LTP, whichever is higher
+#
+#
+# def _convert_resting_sl_to_market_exit(instrument, quantity, opt, get_fresh_ltp):
+#     """Every short leg here always has a resting BUY-side SL order protecting it from the moment
+#     it's entered (_short_leg_with_stoploss) - so closing it doesn't need to cancel that order and
+#     place a fresh one at all. Instead, MODIFY the SAME resting SL in place: drop its trigger price
+#     to just below the current LTP (the "price >= trigger" condition is then already satisfied, so
+#     the broker releases it immediately rather than waiting for price to actually reach it) and set
+#     its release price aggressively - max(1% above LTP, LTP+10 points) - so the released BUY LIMIT
+#     is priced well through the touch and fills essentially instantly. One modify call, and the leg
+#     is never left unprotected in between (no cancel-then-place gap) - see EXIT_CHASE_* elsewhere
+#     for the cancel+place-new fallback this is preferred over.
+#
+#     Returns the fill price if this worked, or None if there's no resting order to convert, the
+#     modify itself failed (see _modify_order's docstring - a documented risk with this broker), or
+#     it didn't fill within EXIT_CHASE_WAIT_SECONDS anyway - in every None case the caller falls back
+#     to the ordinary cancel+chase path in _close_leg_order below."""
+#     resting_order_id = None
+#     for o in _order_book():
+#         if (
+#             str(o.get('instrumentId')) == str(instrument.token) and _ours(o, opt, TAG_SL)
+#             and str(o.get('orderStatus', '')).lower() not in TERMINAL_ORDER_STATUSES
+#         ):
+#             resting_order_id = o.get('brokerOrderId')
+#             break
+#     if resting_order_id is None:
+#         return None
+#
+#     ltp = get_fresh_ltp()
+#     if ltp is None:
+#         return None
+#     # Rounded to the nearest integer, not just a tick - the exchange rejects SL trigger
+#     # prices for these contracts with "STOP PRICE IS NOT REASONABLE" unless they're whole
+#     # rupees.
+#     trigger_price = round(ltp * (1 - SL_TRIGGER_BELOW_LTP_PCT))
+#     # Nearest integer, not a tick - same rejection applies to the SL order's limit price.
+#     release_price = round(
+#         max(ltp * (1 + SL_RELEASE_PRICE_MIN_ABOVE_LTP_PCT), ltp + SL_RELEASE_PRICE_MIN_POINTS_ABOVE_LTP)
+#     )
+#
+#     try:
+#         _modify_order(resting_order_id, instrument, quantity, 'SL', release_price, trigger_price=trigger_price)
+#     except Exception as exc:
+#         log.warning(f'{instrument.name}: modify-to-market of resting SL order {resting_order_id} failed ({exc}) - falling back to cancel+place-new')
+#         return None
+#
+#     return _poll_order_status(resting_order_id, time_module.time() + EXIT_CHASE_WAIT_SECONDS)
 
 
-def _convert_resting_sl_to_market_exit(instrument, quantity, get_fresh_ltp):
-    """Every short leg here always has a resting BUY-side SL order protecting it from the moment
-    it's entered (_short_leg_with_stoploss) - so closing it doesn't need to cancel that order and
-    place a fresh one at all. Instead, MODIFY the SAME resting SL in place: drop its trigger price
-    to just below the current LTP (the "price >= trigger" condition is then already satisfied, so
-    the broker releases it immediately rather than waiting for price to actually reach it) and set
-    its release price aggressively - max(1% above LTP, LTP+10 points) - so the released BUY LIMIT
-    is priced well through the touch and fills essentially instantly. One modify call, and the leg
-    is never left unprotected in between (no cancel-then-place gap) - see EXIT_CHASE_* elsewhere
-    for the cancel+place-new fallback this is preferred over.
+CANCEL_CONFIRM_SECONDS = 6  # (~3 reads at the 2s gap) how long to wait for a cancelled order to show as terminal in the order book
 
-    Returns the fill price if this worked, or None if there's no resting order to convert, the
-    modify itself failed (see _modify_order's docstring - a documented risk with this broker), or
-    it didn't fill within EXIT_CHASE_WAIT_SECONDS anyway - in every None case the caller falls back
-    to the ordinary cancel+chase path in _close_leg_order below."""
-    resting_order_id = None
-    for o in _order_book():
-        if str(o.get('instrumentId')) == str(instrument.token) and str(o.get('orderStatus', '')).lower() not in TERMINAL_ORDER_STATUSES:
-            resting_order_id = o.get('brokerOrderId')
-            break
-    if resting_order_id is None:
-        return None
 
-    ltp = get_fresh_ltp()
-    if ltp is None:
-        return None
-    # Rounded to the nearest integer, not just a tick - the exchange rejects SL trigger
-    # prices for these contracts with "STOP PRICE IS NOT REASONABLE" unless they're whole
-    # rupees.
-    trigger_price = round(ltp * (1 - SL_TRIGGER_BELOW_LTP_PCT))
-    # Nearest integer, not a tick - same rejection applies to the SL order's limit price.
-    release_price = round(
-        max(ltp * (1 + SL_RELEASE_PRICE_MIN_ABOVE_LTP_PCT), ltp + SL_RELEASE_PRICE_MIN_POINTS_ABOVE_LTP)
-    )
-
+def _cancel_and_confirm(order_id, label):
+    """Cancel `order_id`, then read the order book until it shows terminal. Returns (status,
+    fill_price): 'cancelled'/'rejected' -> (status, None); 'complete' -> it filled before the cancel
+    landed, (status, its averageTradedPrice); still resting after CANCEL_CONFIRM_SECONDS -> (status,
+    None). A failed cancel call is only logged - the order book, not the cancel response, decides."""
     try:
-        _modify_order(resting_order_id, instrument, quantity, 'SL', release_price, trigger_price=trigger_price)
+        _cancel_order(order_id)
     except Exception as exc:
-        log.warning(f'{instrument.name}: modify-to-market of resting SL order {resting_order_id} failed ({exc}) - falling back to cancel+place-new')
-        return None
+        log.warning(f'{label}: cancel of order {order_id} failed ({exc}) - checking the order book')
+    deadline = time_module.time() + CANCEL_CONFIRM_SECONDS
+    while True:  # paced by the shared 2s gate - see _GatedFetch
+        book = _read_order_book_or_none(f'{label} cancel check')
+        o = _find_order(book, order_id) if book is not None else None
+        status = str(o.get('orderStatus', '')).lower() if o else None
+        if status == 'complete':
+            return status, float(o.get('averageTradedPrice') or 0) or None
+        if status in TERMINAL_ORDER_STATUSES or time_module.time() >= deadline:
+            return status, None
 
-    return _poll_order_status(resting_order_id, time_module.time() + EXIT_CHASE_WAIT_SECONDS)
 
-
-def _close_leg_order(instrument, quantity, fallback_ltp=None):
-    """Square off by converting the leg's existing resting SL order into an immediate market-ish
-    exit (_convert_resting_sl_to_market_exit above) - falls back to cancelling whatever's resting
-    and chasing a fresh LIMIT order (_exit_chase_fill) only if that didn't work (no resting order
-    found, the modify failed, or it didn't fill in time). Returns the actual average fill price
-    (None in DRY_RUN, where nothing is placed). Uses a fresh quote at close time rather than the
-    one passed in by the caller - avoids placing against a stale price if a retry happened - but
-    falls back to the caller's quote if the fresh fetch comes up empty. The broker rejects MARKET
-    orders on these NFO options (EC965), so we never place one - EXIT_CHASE_MAX_OFFSET_PCT is as
-    aggressive as the fallback path ever gets. If no LTP is available at all we leave the SL order
-    in place rather than touch it and be left with an unprotected naked leg."""
+def _close_leg_order(instrument, quantity, opt, leg_id, sl_order_id, fallback_ltp=None):
+    """Square off one short leg: cancel its resting protective SL, confirm in the order book what
+    became of it, and only then act -
+      - 'complete': the SL itself filled before the cancel landed - the leg is already closed, at
+        that fill price; nothing more is placed (a fresh exit here would open a long).
+      - 'cancelled'/'rejected' (or no SL at all): place a fresh exit BUY and chase it
+        (_exit_chase_fill).
+      - still resting: the cancel didn't take - raise, leaving the leg open and still protected.
+    Returns the actual average fill price (None in DRY_RUN, where nothing is placed). Uses a fresh
+    quote at close time rather than the one passed in by the caller, falling back to the caller's
+    quote if the fresh fetch comes up empty. The broker rejects MARKET orders on these NFO options
+    (EC965), so we never place one - EXIT_CHASE_MAX_OFFSET_PCT is as aggressive as the chase gets.
+    If no LTP is available at all we leave the SL order in place rather than touch it and be left
+    with an unprotected naked leg. (Converting the SL into the exit by modifying it in place was
+    tried before this and is commented out above - it didn't work reliably live.)"""
     tag = f'{"[DRY RUN] " if DRY_RUN else ""}BUY (square off) {quantity} x {instrument.name}'
     log.info(tag)
     if DRY_RUN:
@@ -1194,15 +1377,18 @@ def _close_leg_order(instrument, quantity, fallback_ltp=None):
     if _fresh_ltp() is None:
         raise RuntimeError(f'{instrument.name}: no LTP available to square off, leaving SL in place')
 
-    fill_price = _convert_resting_sl_to_market_exit(instrument, quantity, _fresh_ltp)
-    if fill_price is not None:
-        return fill_price
+    if sl_order_id is None:  # adoption miss - fall back to whichever SL of ours rests on this contract
+        sl_order_id = _find_resting_sl_order_id(instrument.token)
+    if sl_order_id is not None:
+        status, fill_price = _cancel_and_confirm(sl_order_id, f'{instrument.name} SL')
+        if status == 'complete':
+            log.info(f'{instrument.name}: SL {sl_order_id} filled before its cancel landed @ {fill_price} - leg already closed, no exit order placed')
+            return fill_price
+        if status not in TERMINAL_ORDER_STATUSES:
+            raise RuntimeError(f'{instrument.name}: SL order {sl_order_id} still {status!r} after cancel - leaving leg open and protected')
+        log.info(f'{instrument.name}: SL {sl_order_id} {status} - placing exit order')
 
-    for o in _order_book():
-        if str(o.get('instrumentId')) == str(instrument.token) and str(o.get('orderStatus', '')).lower() not in TERMINAL_ORDER_STATUSES:
-            _cancel_order(o['brokerOrderId'])
-
-    return _exit_chase_fill(instrument, 'BUY', quantity, _fresh_ltp, order_tag='rsv_adjust_sl_exit')
+    return _exit_chase_fill(instrument, 'BUY', quantity, _fresh_ltp, order_tag=_order_tag(opt, TAG_EXIT, leg_id))
 
 
 def _close_open_legs(state, day, market, cfg, reason):
@@ -1222,14 +1408,15 @@ _state_lock = threading.Lock()  # guards state[opt]/day['checkpoint_info'/'await
 # a single read/write atomic; the only unsafe pattern is read-then-write across threads).
 
 
-def _handle_stoploss_fill(day, opt, leg):
-    """A leg we believed open just vanished from broker positions - its resting protective SL
-    fired. Credits this leg's realized pnl into day['realized_pnl'] FIRST, before anything else -
+def _handle_stoploss_fill(day, opt, leg, exit_price=None):
+    """A leg we believed open was stopped out - its resting protective SL fired (see
+    _reconcile_leg). Credits this leg's realized pnl into day['realized_pnl'] FIRST, before anything else -
     this is the one exit path that doesn't go through _close_leg/_close_open_legs (those cover
     ROLL_OTM_DRIFT/ATM_PREMIUM_RISE/ATM_PREMIUM_2H_HIGH/DAILY_LOSS_LIMIT/EOD), so without this the
     daily loss limit check in run_minute_checks silently never sees the pnl of an ordinary per-leg
     STOPLOSS_PCT exit - which is the single most common exit reason live - and can go on comparing
     against a realized_pnl that's missing most of the day's actual losses. The fill price is
+    `exit_price` when the caller already has it (the SL order's own averageTradedPrice), else
     reconstructed from the order book (_infer_fill_price_from_orderbook); if that comes up empty
     (DRY_RUN, or the order book hasn't caught up yet), falls back to the nominal STOPLOSS_PCT
     trigger price rather than skipping the credit entirely.
@@ -1237,7 +1424,8 @@ def _handle_stoploss_fill(day, opt, leg):
     Then arms this leg's chop watch: places a fresh resting SELL-SL at the ORIGINAL entry price
     pinned for the current checkpoint window (see _pin_checkpoint_info) - NOT this stoploss's own
     exit price - simulating a resting SELL order left at the level price ran away from."""
-    exit_price = _infer_fill_price_from_orderbook(leg['instrument'].token, leg['quantity'], 'BUY')
+    if exit_price is None:
+        exit_price = _infer_fill_price_from_orderbook(leg['instrument'].token, leg['quantity'], 'BUY')
     if exit_price is None:
         # sl_ref_price, not entry_price - the live trigger may have been re-priced at a checkpoint
         # since this leg entered (see _reprice_leg_stoploss), so that's the accurate reference for
@@ -1256,13 +1444,15 @@ def _handle_stoploss_fill(day, opt, leg):
         return
     alert(f'STOPLOSS FILLED: {opt} {leg["instrument"].name} ({exit_hint}) - placing chop reentry at original entry ~{info["entry_price"]}')
     try:
-        order_id = _place_chop_reentry(info['instrument'], info['quantity'], info['entry_price'])
+        leg_id = _new_leg_id()
+        order_id = _place_chop_reentry(info['instrument'], info['quantity'], info['entry_price'], _order_tag(opt, TAG_CHOP, leg_id))
     except Exception as exc:
         log.error(f'{opt}: failed to place chop reentry order ({exc}) - staying flat this window', exc_info=True)
         return
     with _state_lock:
         day['awaiting_chop'][opt] = True
         day['chop_order_id'][opt] = order_id
+        day['chop_leg_id'][opt] = leg_id
 
 
 def _handle_chop_fill(state, day, opt, order_id, fill_price):
@@ -1276,15 +1466,17 @@ def _handle_chop_fill(state, day, opt, order_id, fill_price):
     if info is None:
         log.warning(f'{opt}: chop order {order_id} filled but checkpoint info is gone - leaving position untracked, check manually!')
         return
+    leg_id = day['chop_leg_id'][opt]  # the reentry order was this leg's entry - see _order_tag
     sl_order_id = None
     try:
-        sl_order_id = _place_protective_sl(info['instrument'], info['quantity'], fill_price, order_tag='rsv_adjust_sl_sl')
+        sl_order_id = _place_protective_sl(info['instrument'], info['quantity'], fill_price, order_tag=_order_tag(opt, TAG_SL, leg_id))
     except Exception as exc:
         alert(f'{opt}: chop reentry filled @ {fill_price} but protective SL failed to place ({exc}) - naked position, check manually!', level=logging.CRITICAL)
     leg = dict(
         instrument=info['instrument'], strike=info['strike'], entry_price=fill_price, quantity=info['quantity'],
-        sl_order_id=sl_order_id, sl_ref_price=fill_price,  # fresh leg - nothing to adjust yet, see
+        leg_id=leg_id, sl_order_id=sl_order_id, sl_ref_price=fill_price,  # fresh leg - nothing to adjust yet, see
         # _enter_leg's comment.
+        opened_at=time_module.time(),
     )
     with _state_lock:
         state[opt] = leg
@@ -1293,43 +1485,183 @@ def _handle_chop_fill(state, day, opt, order_id, fill_price):
     alert(f'CHOP REENTRY {opt} {info["instrument"].name} x{info["quantity"]} @ ~{fill_price} (SL {STOPLOSS_PCT:.0%})')
 
 
+def _find_order(order_book, order_id):
+    for o in order_book:
+        if o.get('brokerOrderId') == order_id:
+            return o
+    return None
+
+
+def _net_short_qty(order_book, token):
+    """Units `token` is net short per today's COMPLETE orders (SELL minus BUY) - the order book's own
+    view of the position, used by _reconcile_leg instead of /positions (see
+    _sync_stopped_out_and_chopped_legs for why)."""
+    net = 0
+    for o in order_book:
+        if str(o.get('instrumentId')) != str(token) or str(o.get('orderStatus', '')).lower() != 'complete' or not _counts_toward_position(o):
+            continue
+        try:
+            qty = int(o.get('quantity') or o.get('filledQuantity') or 0)
+        except (TypeError, ValueError):
+            continue
+        side = str(o.get('transactionType', '')).upper()
+        if side == 'SELL':
+            net += qty
+        elif side == 'BUY':
+            net -= qty
+    return net
+
+
+def _release_leg(state, day, opt, leg):
+    """Stop tracking `leg` - False if the main thread already replaced/cleared it or started a
+    deliberate close meanwhile (then it's not ours to act on)."""
+    with _state_lock:
+        if state[opt] is not leg or day['closing'][opt]:
+            return False
+        state[opt] = None
+        return True
+
+
+AGREE_TIMEOUT_SECONDS = 6  # (~3 checks at SL_WATCH_INTERVAL_SECONDS) how long the order book and /positions may disagree about a leg before
+# we alert (and, for fills the order book already records as done, act on the order book anyway).
+
+
+def _agreed(day, opt, key, agrees, now):
+    """Tracks how long the two sources have disagreed about `opt`'s `key` event. Returns
+    'agreed', 'waiting' (disagreeing for < AGREE_TIMEOUT_SECONDS - positions usually just lag the
+    order book by a moment), or 'timed_out' (reported once, then the wait restarts)."""
+    waits = day['disagree_since']
+    if agrees:
+        waits.pop((opt, key), None)
+        return 'agreed'
+    since = waits.setdefault((opt, key), now)
+    if now - since < AGREE_TIMEOUT_SECONDS:
+        return 'waiting'
+    waits.pop((opt, key), None)
+    return 'timed_out'
+
+
+def _reconcile_leg(state, day, opt, leg, order_book, positions, now):
+    """Decides what happened to an open `leg` from BOTH the order book and /positions - a status
+    change needs the two to agree; a disagreement lasting AGREE_TIMEOUT_SECONDS is alerted:
+
+      - its OWN protective SL order is 'complete' AND positions no longer show the leg's quantity ->
+        stoploss (_handle_stoploss_fill, priced off that order's own fill, chop watch armed). If
+        positions still show it after the timeout, the order book's record of the fill wins (it's
+        the broker's own record of our order) and we proceed - with a CRITICAL alert.
+      - order-book net flat AND no position, its SL NOT filled -> closed outside the strategy (e.g.
+        manually): stop tracking it WITHOUT a chop reentry, and cancel the still-resting BUY SL,
+        which on a flat instrument could only open an unwanted long (cf. 25 Sep 2026 SENSEX 73700
+        CE BUY @ 775.72 at 14:04 on a strike closed at 12:45). Never done on one source alone -
+        a disagreement here is only alerted, the leg and its SL are left in place.
+      - still short (both agree) but its SL is cancelled/rejected/missing -> unprotected: alert
+        (once per leg).
+
+    No sl_order_id (DRY_RUN / adoption miss): nothing of ours to look up - flat (both agreeing)
+    counts as a stoploss, the previous positions-only behaviour."""
+    token = leg['instrument'].token
+    pos = positions.get(token)
+    pos_open = pos is not None
+    pos_moved = pos is None or abs(int(pos.get('netQuantity', 0))) != leg['quantity']
+    book_short = _net_short_qty(order_book, token) > 0
+    name = leg['instrument'].name
+
+    sl_order_id = leg.get('sl_order_id')
+    sl = None if (DRY_RUN or sl_order_id is None) else _find_order(order_book, sl_order_id)
+    sl_status = str(sl.get('orderStatus', '')).lower() if sl else None
+
+    if sl_status == 'complete':
+        verdict = _agreed(day, opt, 'stop', pos_moved, now)
+        if verdict == 'waiting':
+            return
+        if verdict == 'timed_out':
+            alert(f'{opt} {name}: SL order {sl_order_id} is complete but positions still show the leg after '
+                  f'{AGREE_TIMEOUT_SECONDS}s - treating it as stopped out per the order book. Check manually!', level=logging.CRITICAL)
+        if _release_leg(state, day, opt, leg):
+            _handle_stoploss_fill(day, opt, leg, exit_price=float(sl.get('averageTradedPrice') or 0) or None)
+        return
+    day['disagree_since'].pop((opt, 'stop'), None)
+
+    verdict = _agreed(day, opt, 'position', book_short == pos_open, now)
+    if verdict == 'waiting':
+        return
+    if verdict == 'timed_out' and not leg.get('disagree_alerted'):
+        leg['disagree_alerted'] = True
+        alert(f'{opt} {name}: order book says {"short" if book_short else "flat"} but positions say '
+              f'{"open" if pos_open else "flat"} for {AGREE_TIMEOUT_SECONDS}s - leaving the leg and its SL as they are. '
+              f'Contract traded outside this strategy? Check manually!', level=logging.CRITICAL)
+    if verdict != 'agreed':
+        return
+
+    if pos_open:  # both agree: still short
+        if not DRY_RUN and sl_order_id is not None and (sl_status is None or sl_status in TERMINAL_ORDER_STATUSES) \
+                and not leg.get('unprotected_alerted'):
+            leg['unprotected_alerted'] = True
+            alert(f'{opt} {name}: still short but its SL order {sl_order_id} is {sl_status!r} - '
+                  f'position is UNPROTECTED. Check manually!', level=logging.CRITICAL)
+        return
+
+    # both agree: flat, and the leg's own SL did not fill
+    if DRY_RUN or sl_order_id is None:
+        if _release_leg(state, day, opt, leg):
+            _handle_stoploss_fill(day, opt, leg)
+        return
+    if not _release_leg(state, day, opt, leg):
+        return
+    with _state_lock:
+        day['checkpoint_info'][opt] = None
+        day['awaiting_chop'][opt] = False
+        day['chop_order_id'][opt] = None
+    if sl_status not in TERMINAL_ORDER_STATUSES:
+        try:
+            _cancel_order(sl_order_id)
+            log.info(f'{opt}: cancelled orphaned SL order {sl_order_id}')
+        except Exception as exc:
+            log.warning(f'{opt}: cancel of orphaned SL order {sl_order_id} failed: {exc}')
+    alert(f'{opt} {name}: position closed but its SL order {sl_order_id} is {sl_status!r}, '
+          f'not filled - treated as closed outside the strategy (no chop reentry), SL cancelled. Check manually!',
+          level=logging.CRITICAL)
+
+
 def _sync_stopped_out_and_chopped_legs(state, day, market):
-    """Broker-side truth, checked every SL_WATCH_INTERVAL_SECONDS (own background thread, see
-    _watch_loop) as well as inline each main-loop cycle:
+    """Broker-side truth, checked every SL_WATCH_INTERVAL_SECONDS on its own background thread (see
+    _watch_loop). Reads BOTH /positions and the order book every check (the order book through the
+    shared 2s gate, _GatedFetch) and only changes a leg's status when the two agree -
+    neither alone is trusted: positions can lag or predate a just-entered leg (25 Sep 2026 12:45
+    NIFTY roll: both fresh legs misread as stopped off positions alone, chop SELLs placed at their
+    own entry price, filled instantly, position doubled), and only the order book says WHY a
+    position went (stoploss vs. manual close):
 
-      - a leg we believe OPEN whose position has vanished means its protective SL fired - this IS
-        the live "continuous" stoploss check, a real resting order fires the instant price touches
-        it, polling here just notices promptly - and arms the chop watch (_handle_stoploss_fill).
+      - a leg we believe OPEN is reconciled against its own SL order, the token's net filled
+        quantity and its position - see _reconcile_leg.
       - a leg we believe FLAT with a resting chop order out (day['awaiting_chop']) whose order has
-        gone 'complete' in the order book means price came back to the pinned level - the leg is
-        open again (_handle_chop_fill). 'rejected'/'cancelled' just clears the chop watch (nothing
-        resting anymore) rather than retrying blindly.
-
-    The order book is only fetched when at least one leg has a real (non-DRY_RUN) chop order
-    resting - the common case (no leg currently mid-chop) costs nothing extra over the plain
-    positions check exec_rsv_cont.py already made every cycle."""
-    open_tokens = set(_resilient_call(get_open_legs, market['contracts_by_token']))
-
-    pending_chop_ids = {opt: day['chop_order_id'][opt] for opt in OPTION_TYPES if day['awaiting_chop'][opt] and day['chop_order_id'][opt]}
-    order_book = _resilient_call(_order_book) if pending_chop_ids else []
+        gone 'complete' - and whose position has appeared - means price came back to the pinned
+        level: the leg is open again (_handle_chop_fill). 'rejected'/'cancelled' just clears the
+        chop watch (nothing resting anymore) rather than retrying blindly."""
+    snapshot_at = time_module.time()  # taken BEFORE the fetches - see leg['opened_at'] below
+    # both read BEFORE any decision - if either fetch fails this raises and nothing is decided on
+    # half the picture (the watch loop logs it and tries again next check)
+    positions = get_open_legs(market['contracts_by_token'], fresh_after=snapshot_at)
+    order_book = _get_order_book(fresh_after=snapshot_at)
 
     for opt in OPTION_TYPES:
         with _state_lock:
             leg = state[opt]
             # day['closing'][opt] means a deliberate close (run_checkpoint/EOD/daily-loss-limit) is
-            # already underway for this leg - see _close_leg. Its broker position can vanish before
-            # _close_leg itself gets to clear state[opt], and this same check also runs on its own
-            # background thread (see _watch_loop) polling independently of that close - without this
-            # guard a deliberate close would misread as a stoploss fire and wrongly arm a chop
-            # reentry, possibly against whatever NEW leg checkpoint_info has since been repinned to.
-            stopped = leg is not None and not day['closing'][opt] and leg['instrument'].token not in open_tokens
-            if stopped:
-                state[opt] = None
-        if stopped:
-            _handle_stoploss_fill(day, opt, leg)
+            # already underway for this leg - see _close_leg. Its exit (or its SL converted to one)
+            # can fill before _close_leg itself clears state[opt]; without this guard that would
+            # misread as a stoploss fire and wrongly arm a chop reentry.
+            #
+            # opened_at: _enter_leg/_handle_chop_fill install a leg only after its entry filled and
+            # its SL was placed - a snapshot taken before that moment may not show that SL order yet,
+            # so the leg is skipped until the next check. Adopted legs have no opened_at -> 0.
+            check = leg is not None and not day['closing'][opt] and leg.get('opened_at', 0) < snapshot_at
+        if leg is not None:
+            if check:
+                _reconcile_leg(state, day, opt, leg, order_book, positions, snapshot_at)
             continue
 
-        order_id = pending_chop_ids.get(opt)
+        order_id = day['chop_order_id'][opt] if day['awaiting_chop'][opt] else None
         if order_id is None:
             continue
         status, fill_price = None, None
@@ -1341,6 +1673,14 @@ def _sync_stopped_out_and_chopped_legs(state, day, market):
                 fill_price = float(o.get('averageTradedPrice') or 0)
             break
         if status == 'complete' and fill_price:
+            info = day['checkpoint_info'][opt]
+            appeared = info is None or info['instrument'].token in positions
+            verdict = _agreed(day, opt, 'chop', appeared, snapshot_at)
+            if verdict == 'waiting':
+                continue
+            if verdict == 'timed_out':
+                alert(f'{opt}: chop order {order_id} is complete but no position has appeared after '
+                      f'{AGREE_TIMEOUT_SECONDS}s - tracking it as filled per the order book. Check manually!', level=logging.CRITICAL)
             _handle_chop_fill(state, day, opt, order_id, fill_price)
         elif status in ('rejected', 'cancelled'):
             log.warning(f'{opt}: resting chop order {order_id} is {status} - staying flat for the rest of this checkpoint window')
@@ -1349,9 +1689,12 @@ def _sync_stopped_out_and_chopped_legs(state, day, market):
                 day['chop_order_id'][opt] = None
 
 
-SL_WATCH_INTERVAL_SECONDS = 1  # dedicated cadence for noticing a resting stoploss/chop-order fill -
+SL_WATCH_INTERVAL_SECONDS = 2  # (matches BROKER_FETCH_MIN_GAP_SECONDS) dedicated cadence for noticing a resting stoploss/chop-order fill -
 # independent of POLL_INTERVAL_SECONDS (the main loop's cadence for market-data/checkpoint/
 # heartbeat work, which is naturally heavier and slower) - see notes.md.
+
+
+WATCH_OUTAGE_ALERT_SECONDS = 30  # failing broker reads for this long -> one CRITICAL alert (and one on recovery)
 
 
 def _watch_loop(state, day, contracts_box, stop_event):
@@ -1361,14 +1704,27 @@ def _watch_loop(state, day, contracts_box, stop_event):
     map, kept updated by the main loop each time it refreshes market data - this thread never
     fetches full market data itself (no quotes needed here), only AliceBlue's positions/orders
     endpoints."""
+    last_ok = time_module.time()
+    outage_alerted = False
     while not stop_event.is_set():
+        check_started = time_module.time()
         try:
             contracts_by_token = contracts_box[0]
             if contracts_by_token is not None:
                 _sync_stopped_out_and_chopped_legs(state, day, {'contracts_by_token': contracts_by_token})
+            last_ok = time_module.time()
+            if outage_alerted:
+                outage_alerted = False
+                alert('watch thread: broker reads working again - stoploss/chop monitoring resumed')
         except Exception as exc:
             log.warning(f'watch thread: check failed ({exc})', extra={'no_telegram': True})
-        stop_event.wait(SL_WATCH_INTERVAL_SECONDS)
+            if not outage_alerted and time_module.time() - last_ok >= WATCH_OUTAGE_ALERT_SECONDS:
+                outage_alerted = True
+                alert(f'watch thread: no successful broker check for {WATCH_OUTAGE_ALERT_SECONDS}s ({exc}) - '
+                      f'stoploss/chop fills are NOT being tracked. Check manually!', level=logging.CRITICAL)
+        # only the rest of the interval - a check that waited on the shared fetch gate shouldn't
+        # push the next one out further still
+        stop_event.wait(max(0, SL_WATCH_INTERVAL_SECONDS - (time_module.time() - check_started)))
 
 
 # ── Startup adoption: reconstruct entry price from the order book ──────────────────────────────
@@ -1390,14 +1746,14 @@ def _infer_fill_price_from_orderbook(token, quantity, transaction_type):
     function's docstring for why this matters). Returns None (caller falls back to a nominal price)
     if not confident."""
     try:
-        orders = _resilient_call(_order_book)
+        orders = _get_order_book()
     except Exception as exc:
         log.warning(f'could not fetch order book to infer {transaction_type} fill price for token {token}: {exc}')
         return None
 
     fills = [
         o for o in orders
-        if str(o.get('instrumentId')) == str(token)
+        if str(o.get('instrumentId')) == str(token) and _counts_toward_position(o)
         and str(o.get('transactionType', '')).upper() == transaction_type
         and str(o.get('orderStatus', '')).lower() == 'complete'
     ]
@@ -1440,17 +1796,17 @@ def _find_resting_sl_order_id(token):
     this file's own addition, used only at startup adoption (mid-day restart with positions already
     open) so an adopted leg's existing protective SL can later be re-priced in place by
     _reprice_leg_stoploss, the same as one this process placed itself. Same order-book scan
-    _convert_resting_sl_to_market_exit already does elsewhere for the same purpose. Returns None
+    _close_leg_order also uses for an adopted leg with no known SL order id. Returns None
     (caller falls back to sl_order_id=None, same as DRY_RUN - _reprice_leg_stoploss just logs the
     intended reprice instead of placing it) if nothing resting is found."""
     try:
-        orders = _resilient_call(_order_book)
+        orders = _get_order_book()
     except Exception as exc:
         log.warning(f'could not fetch order book to find resting SL for token {token}: {exc}')
         return None
     for o in orders:
         if (
-            str(o.get('instrumentId')) == str(token)
+            str(o.get('instrumentId')) == str(token) and _ours(o, roles=TAG_SL)
             and str(o.get('transactionType', '')).upper() == 'BUY'
             and str(o.get('orderStatus', '')).lower() not in TERMINAL_ORDER_STATUSES
         ):
@@ -1647,6 +2003,8 @@ def run_day(symbol, trade_weekdays):
         awaiting_chop={opt: False for opt in OPTION_TYPES},  # opt -> True while a resting chop
         # SELL order is out, waiting for price to come back to checkpoint_info[opt]['entry_price'].
         chop_order_id={opt: None for opt in OPTION_TYPES},  # opt -> that resting order's broker id.
+        chop_leg_id={opt: None for opt in OPTION_TYPES},  # opt -> leg id in that order's tag.
+        disagree_since={},  # (opt, event) -> when the order book and positions started disagreeing - see _agreed.
         closing={opt: False for opt in OPTION_TYPES},  # opt -> True while a deliberate _close_leg is
         # in flight for this leg - see _close_leg / _sync_stopped_out_and_chopped_legs.
     )
@@ -1740,7 +2098,9 @@ def run_day(symbol, trade_weekdays):
             else:
                 market = _fetch_market(symbol, cfg, state)
                 contracts_box[0] = market['contracts_by_token']
-            _sync_stopped_out_and_chopped_legs(state, day, market)
+            # no _sync_stopped_out_and_chopped_legs here any more - the watch thread is the only
+            # place legs are reconciled (running it on both threads let them race each other, and a
+            # failed broker read here used to skip the loss-limit check and checkpoint below)
             run_minute_checks(state, market, cfg, day, now)
 
             if not day['halted'] and now >= next_checkpoint:
