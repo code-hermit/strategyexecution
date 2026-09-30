@@ -465,6 +465,15 @@ LIMIT_OFFSET_PCT = 0.03  # was 0.01 - a 1% buffer on a strategy that specificall
 FILL_POLL_TIMEOUT = 10
 FILL_POLL_INTERVAL = 1
 TERMINAL_ORDER_STATUSES = {'complete', 'rejected', 'cancelled'}
+
+
+def _status(o):
+    """An order-book entry's status, normalised: lowercased, and ANY cancel variant AliceBlue sends
+    ('CANCELED', 'Cancelled', 'cancel', ...) mapped to 'cancelled' - every status check in this file
+    reads through here. AliceBlue spells it 'CANCELED' (one L), which a plain 'cancelled' check never
+    matches (see exec_rsv_adjust_sl.py's _status - 28 Sep 2026)."""
+    status = str(o.get('orderStatus', '')).strip().lower()
+    return 'cancelled' if status.startswith('cancel') else status
 # Status codes AliceBlue returns instead of 'Ok' to mean "the query is fine, there's just nothing
 # to return" - e.g. /positions returns EC920 rather than an empty list when there are no open
 # positions. Treat these as an empty result rather than an error.
@@ -727,7 +736,7 @@ def _wait_for_fill_price(broker_order_id):
             for o in book:
                 if o.get('brokerOrderId') != broker_order_id:
                     continue
-                status = str(o.get('orderStatus', '')).lower()
+                status = _status(o)
                 if status == 'rejected':
                     raise RuntimeError(f'order {broker_order_id} rejected: {o.get("rejectionReason")}')
                 if status == 'complete':
@@ -736,35 +745,181 @@ def _wait_for_fill_price(broker_order_id):
     raise TimeoutError(f'order {broker_order_id} not filled within {FILL_POLL_TIMEOUT}s')
 
 
-FORCE_EXIT_POLL_INTERVAL = 2  # seconds between exit-order re-price attempts while forcing a close
+# UNUSED since 29 Sep 2026 - forcing a SELL SL through by modifying its trigger past LTP did not
+# work live on AliceBlue: 12 modifies over 26s at 11:18 were all accepted but the order never
+# filled, and the position had to be closed manually (same finding as exec_rsv_adjust_sl.py on
+# 28 Sep). Exits now chase a plain LIMIT order instead - see _force_exit_leg below. Kept for reference.
+# FORCE_EXIT_POLL_INTERVAL = 2  # seconds between exit-order re-price attempts while forcing a close
+# FORCE_EXIT_STUCK_ALERT_EVERY = 30  # attempts between "still not squared off" escalation alerts (~1min at 2s cadence)
+#
+#
+# def _force_exit_leg(instrument, quantity, get_fresh_ltp, order_tag, log_prefix):
+#     """Force a bought leg closed using only SL (stop-loss LIMIT) SELL orders - MARKET/SLM orders are
+#     never used, they are not permitted for this account/strategy. A brand new SL order is placed
+#     with trigger/limit on the natural, unbreached side of LTP (trigger below LTP, limit further
+#     below still) - a fresh order whose trigger is already past LTP gets rejected outright by the
+#     exchange as "STOP PRICE IS NOT REASONABLE", so the first placement has to be one it will
+#     actually accept, even though that means it just rests there rather than filling immediately.
+#     Every attempt after that repeatedly MODIFIES it (never cancel+replace) so trigger and limit
+#     both bracket the current LTP - trigger = ltp+3% (already breached from below, since a SELL SL
+#     fires once price falls TO OR BELOW the trigger - setting it above current price means that's
+#     already true), limit = ltp-3% (marketable) - the exchange accepts this on a MODIFY of an
+#     order it has already accepted (unlike on a fresh placement), so it should fill immediately. If
+#     that order can't be found/modified (rejected, already filled/cancelled by something else) a
+#     brand new SL order is placed instead (again on the natural side first) and the same retry loop
+#     continues working that one. There is NO attempt cap and NO MARKET
+#     fallback: this loops forever, re-pricing every FORCE_EXIT_POLL_INTERVAL, until the position is
+#     actually confirmed squared off - escalating to a CRITICAL alert every
+#     FORCE_EXIT_STUCK_ALERT_EVERY attempts so a stuck close doesn't go unnoticed, but it keeps
+#     retrying regardless. Each attempt also checks the broker's actual position (_leg_still_open) -
+#     if it's already flat, the leg was closed some other way (manually, or by anything other than
+#     the order this loop is tracking), and this stops immediately rather than continuing to fire
+#     exit orders at a position that no longer exists. `get_fresh_ltp` is a zero-arg callable,
+#     re-fetched every attempt, never reused stale. Mirrors exec_rs_ps.py's _force_exit_leg -
+#     duplicated rather than imported, matching this file's existing fully-self-contained design."""
+#     working_order_id = None
+#     attempt = 0
+#     while True:
+#         attempt += 1
+#         ltp = get_fresh_ltp()
+#         if ltp is None:
+#             log.warning(f'{log_prefix}: no LTP available on attempt {attempt} - retrying in {FORCE_EXIT_POLL_INTERVAL}s', extra={'no_telegram': True})
+#             time_module.sleep(FORCE_EXIT_POLL_INTERVAL)
+#             continue
+#
+#         # Rounded to the nearest integer, not just a tick - the exchange rejects SL trigger
+#         # prices for these contracts with "STOP PRICE IS NOT REASONABLE" unless they're whole
+#         # rupees.
+#         #
+#         # A SELL SL trigger already past LTP (i.e. above it) is what forces an immediate release -
+#         # but the exchange only accepts that on a MODIFY of an order it has already accepted, not
+#         # on a brand new placement (a fresh SL whose trigger is already breached gets rejected
+#         # outright as "STOP PRICE IS NOT REASONABLE" - see _convert_resting_sl_to_market_exit in
+#         # exec_rsv_cont_chop.py, which relies on the same modify-only exception for the BUY side).
+#         # So a brand new order has to go in on the natural, unbreached side of LTP first (it just
+#         # rests there, trigger not yet hit) - only once it exists do we push its trigger past LTP
+#         # via modify to force it through.
+#         trigger_price = round(ltp * (1 + LIMIT_OFFSET_PCT))
+#         # Nearest integer, not a tick - same rejection applies to the SL order's limit price.
+#         limit_price = round(ltp * (1 - LIMIT_OFFSET_PCT))
+#
+#         if working_order_id is not None:
+#             log.info(
+#                 f'{log_prefix}: attempt {attempt} - modifying SL {working_order_id} to '
+#                 f'trigger={trigger_price} limit={limit_price} (ltp {ltp}) to force an immediate fill',
+#                 extra={'no_telegram': True},
+#             )
+#             try:
+#                 _modify_order(working_order_id, quantity, limit_price, trigger_price)
+#             except Exception as exc:
+#                 log.warning(f'{log_prefix}: modify of {working_order_id} failed on attempt {attempt} ({exc}) - will place a fresh SL order instead', extra={'no_telegram': True})
+#                 working_order_id = None
+#
+#         if working_order_id is None:
+#             new_trigger_price = round(ltp * (1 - LIMIT_OFFSET_PCT))
+#             new_limit_price = round(new_trigger_price * (1 - LIMIT_OFFSET_PCT))
+#             log.info(f'{log_prefix}: attempt {attempt} - placing a new SL order, trigger={new_trigger_price} limit={new_limit_price} (ltp {ltp})', extra={'no_telegram': True})
+#             try:
+#                 new_order = _place_order('SELL', instrument, quantity, 'SL', price=str(new_limit_price), trigger_price=new_trigger_price, order_tag=order_tag)
+#                 working_order_id = new_order.get('brokerOrderId')
+#                 if not working_order_id:
+#                     log.warning(f'{log_prefix}: new SL order rejected on attempt {attempt}: {new_order}', extra={'no_telegram': True})
+#             except Exception as exc:
+#                 log.warning(f'{log_prefix}: placing a new SL order failed on attempt {attempt} ({exc})', extra={'no_telegram': True})
+#
+#         time_module.sleep(FORCE_EXIT_POLL_INTERVAL)
+#
+#         book = _order_book_cache.get()
+#         if book is not None and working_order_id is not None:
+#             for o in book:
+#                 if o.get('brokerOrderId') != working_order_id:
+#                     continue
+#                 status = str(o.get('orderStatus', '')).lower()
+#                 if status == 'complete':
+#                     fill_price = float(o.get('averageTradedPrice') or 0)
+#                     log.info(f'{log_prefix}: order {working_order_id} filled @ {fill_price} on attempt {attempt}')
+#                     return fill_price
+#                 if status in ('rejected', 'cancelled'):
+#                     log.warning(f'{log_prefix}: order {working_order_id} is {status} - will place a fresh SL order next attempt', extra={'no_telegram': True})
+#                     working_order_id = None
+#                 break
+#         elif book is None:
+#             log.warning(f'{log_prefix}: order book unavailable on attempt {attempt}', extra={'no_telegram': True})
+#
+#         # Our own order isn't showing 'complete' yet - but the position might already be flat
+#         # anyway, closed outside this process entirely (manually, by a different order/process).
+#         # Nothing left to square off in that case - stop retrying rather than keep firing exit
+#         # orders at a position that no longer exists.
+#         if not _leg_still_open(instrument):
+#             log.info(f'{log_prefix}: broker position is already flat on attempt {attempt} - closed outside this process, stopping the forced exit')
+#             if working_order_id is not None:
+#                 try:
+#                     _cancel_order(working_order_id)
+#                 except Exception as exc:
+#                     log.warning(f'{log_prefix}: cancel of now-stale order {working_order_id} failed ({exc})')
+#             log.warning(
+#                 f'{log_prefix}: position was already flat at the broker (closed outside this process, e.g. manually) - '
+#                 f'stopping the forced exit; pnl is a best-effort estimate off the current LTP, not an actual fill price',
+#             )
+#             return ltp
+#
+#         if attempt % FORCE_EXIT_STUCK_ALERT_EVERY == 0:
+#             log.critical(
+#                 f'{log_prefix}: still NOT squared off after {attempt} attempts '
+#                 f'(~{attempt * FORCE_EXIT_POLL_INTERVAL}s) - no MARKET fallback permitted, continuing to retry with SL orders',
+#             )
+
+
+FORCE_EXIT_POLL_INTERVAL = 2  # seconds between exit re-price attempts while forcing a close
 FORCE_EXIT_STUCK_ALERT_EVERY = 30  # attempts between "still not squared off" escalation alerts (~1min at 2s cadence)
+EXIT_CHASE_OFFSET_STEP = 0.05  # each unfilled round prices the exit this much further below LTP...
+EXIT_CHASE_MAX_OFFSET_PCT = 0.50  # ...up to this far below (effectively marketable, still a LIMIT)
+CANCEL_CONFIRM_SECONDS = 6  # how long to wait for a cancelled order to show as terminal in the order book
+
+
+def _find_book_order(order_id):
+    for o in _order_book_cache.get() or []:
+        if o.get('brokerOrderId') == order_id:
+            return o
+    return None
+
+
+def _cancel_and_confirm(order_id, log_prefix):
+    """Cancel `order_id`, then read the order book until it shows terminal. Returns (status,
+    fill_price): 'complete' -> it filled before the cancel landed, with its averageTradedPrice;
+    'cancelled'/'rejected' -> (status, None); still resting after CANCEL_CONFIRM_SECONDS -> (status,
+    None). A failed cancel call is only logged - the order book, not the cancel response, decides."""
+    try:
+        _cancel_order(order_id)
+    except Exception as exc:
+        log.warning(f'{log_prefix}: cancel of order {order_id} failed ({exc}) - checking the order book', extra={'no_telegram': True})
+    deadline = time_module.time() + CANCEL_CONFIRM_SECONDS
+    while True:
+        o = _find_book_order(order_id)
+        status = _status(o) if o else None
+        if status == 'complete':
+            return status, float(o.get('averageTradedPrice') or 0) or None
+        if status in TERMINAL_ORDER_STATUSES or time_module.time() >= deadline:
+            return status, None
+        time_module.sleep(FILL_POLL_INTERVAL)
 
 
 def _force_exit_leg(instrument, quantity, get_fresh_ltp, order_tag, log_prefix):
-    """Force a bought leg closed using only SL (stop-loss LIMIT) SELL orders - MARKET/SLM orders are
-    never used, they are not permitted for this account/strategy. A brand new SL order is placed
-    with trigger/limit on the natural, unbreached side of LTP (trigger below LTP, limit further
-    below still) - a fresh order whose trigger is already past LTP gets rejected outright by the
-    exchange as "STOP PRICE IS NOT REASONABLE", so the first placement has to be one it will
-    actually accept, even though that means it just rests there rather than filling immediately.
-    Every attempt after that repeatedly MODIFIES it (never cancel+replace) so trigger and limit
-    both bracket the current LTP - trigger = ltp+3% (already breached from below, since a SELL SL
-    fires once price falls TO OR BELOW the trigger - setting it above current price means that's
-    already true), limit = ltp-3% (marketable) - the exchange accepts this on a MODIFY of an
-    order it has already accepted (unlike on a fresh placement), so it should fill immediately. If
-    that order can't be found/modified (rejected, already filled/cancelled by something else) a
-    brand new SL order is placed instead (again on the natural side first) and the same retry loop
-    continues working that one. There is NO attempt cap and NO MARKET
-    fallback: this loops forever, re-pricing every FORCE_EXIT_POLL_INTERVAL, until the position is
-    actually confirmed squared off - escalating to a CRITICAL alert every
-    FORCE_EXIT_STUCK_ALERT_EVERY attempts so a stuck close doesn't go unnoticed, but it keeps
-    retrying regardless. Each attempt also checks the broker's actual position (_leg_still_open) -
-    if it's already flat, the leg was closed some other way (manually, or by anything other than
-    the order this loop is tracking), and this stops immediately rather than continuing to fire
-    exit orders at a position that no longer exists. `get_fresh_ltp` is a zero-arg callable,
-    re-fetched every attempt, never reused stale. Mirrors exec_rs_ps.py's _force_exit_leg -
-    duplicated rather than imported, matching this file's existing fully-self-contained design."""
+    """Force a bought leg closed with a plain SELL LIMIT order priced below LTP (marketable), chased
+    lower each round until it fills - MARKET/SLM orders are never used (not permitted for this
+    account/strategy), and no SL orders either (see the commented-out version above for why).
+
+    Each round: place the exit LIMIT at LTP*(1-offset), or MODIFY the resting one to the new price;
+    wait FORCE_EXIT_POLL_INTERVAL; 'complete' in the order book -> done. The offset widens by
+    EXIT_CHASE_OFFSET_STEP per unfilled round up to EXIT_CHASE_MAX_OFFSET_PCT. A replacement order is
+    only ever placed once the previous one is CONFIRMED dead in the order book (_cancel_and_confirm)
+    - if it turns out to have filled instead, that's the exit, and no second SELL goes in (which
+    would open a short). Each round also checks the broker position (_leg_still_open): already flat
+    means it was closed some other way (e.g. manually) - stop. No attempt cap: a CRITICAL alert every
+    FORCE_EXIT_STUCK_ALERT_EVERY attempts so a stuck close doesn't go unnoticed. `get_fresh_ltp` is a
+    zero-arg callable, re-fetched every attempt, never reused stale."""
     working_order_id = None
+    offset_pct = LIMIT_OFFSET_PCT
     attempt = 0
     while True:
         attempt += 1
@@ -773,87 +928,66 @@ def _force_exit_leg(instrument, quantity, get_fresh_ltp, order_tag, log_prefix):
             log.warning(f'{log_prefix}: no LTP available on attempt {attempt} - retrying in {FORCE_EXIT_POLL_INTERVAL}s', extra={'no_telegram': True})
             time_module.sleep(FORCE_EXIT_POLL_INTERVAL)
             continue
-
-        # Rounded to the nearest integer, not just a tick - the exchange rejects SL trigger
-        # prices for these contracts with "STOP PRICE IS NOT REASONABLE" unless they're whole
-        # rupees.
-        #
-        # A SELL SL trigger already past LTP (i.e. above it) is what forces an immediate release -
-        # but the exchange only accepts that on a MODIFY of an order it has already accepted, not
-        # on a brand new placement (a fresh SL whose trigger is already breached gets rejected
-        # outright as "STOP PRICE IS NOT REASONABLE" - see _convert_resting_sl_to_market_exit in
-        # exec_rsv_cont_chop.py, which relies on the same modify-only exception for the BUY side).
-        # So a brand new order has to go in on the natural, unbreached side of LTP first (it just
-        # rests there, trigger not yet hit) - only once it exists do we push its trigger past LTP
-        # via modify to force it through.
-        trigger_price = round(ltp * (1 + LIMIT_OFFSET_PCT))
-        # Nearest integer, not a tick - same rejection applies to the SL order's limit price.
-        limit_price = round(ltp * (1 - LIMIT_OFFSET_PCT))
+        price = _round_to_tick(ltp * (1 - offset_pct), instrument.tick_size)
 
         if working_order_id is not None:
-            log.info(
-                f'{log_prefix}: attempt {attempt} - modifying SL {working_order_id} to '
-                f'trigger={trigger_price} limit={limit_price} (ltp {ltp}) to force an immediate fill',
-                extra={'no_telegram': True},
-            )
+            log.info(f'{log_prefix}: attempt {attempt} - modifying exit {working_order_id} to LIMIT {price} (ltp {ltp}, offset {offset_pct:.0%})', extra={'no_telegram': True})
             try:
-                _modify_order(working_order_id, quantity, limit_price, trigger_price)
+                _modify_order(working_order_id, quantity, price, order_type='LIMIT')
             except Exception as exc:
-                log.warning(f'{log_prefix}: modify of {working_order_id} failed on attempt {attempt} ({exc}) - will place a fresh SL order instead', extra={'no_telegram': True})
-                working_order_id = None
+                log.warning(f'{log_prefix}: modify of {working_order_id} failed on attempt {attempt} ({exc}) - cancelling it before placing a fresh one', extra={'no_telegram': True})
+                status, fill_price = _cancel_and_confirm(working_order_id, log_prefix)
+                if status == 'complete':
+                    log.info(f'{log_prefix}: order {working_order_id} filled @ {fill_price} on attempt {attempt}')
+                    return fill_price
+                if status in TERMINAL_ORDER_STATUSES:
+                    working_order_id = None
+                # else: still resting - keep working that same order, never a second SELL alongside it
 
         if working_order_id is None:
-            new_trigger_price = round(ltp * (1 - LIMIT_OFFSET_PCT))
-            new_limit_price = round(new_trigger_price * (1 - LIMIT_OFFSET_PCT))
-            log.info(f'{log_prefix}: attempt {attempt} - placing a new SL order, trigger={new_trigger_price} limit={new_limit_price} (ltp {ltp})', extra={'no_telegram': True})
+            log.info(f'{log_prefix}: attempt {attempt} - placing exit SELL LIMIT {price} (ltp {ltp}, offset {offset_pct:.0%})', extra={'no_telegram': True})
             try:
-                new_order = _place_order('SELL', instrument, quantity, 'SL', price=str(new_limit_price), trigger_price=new_trigger_price, order_tag=order_tag)
+                new_order = _place_order('SELL', instrument, quantity, 'LIMIT', price=str(price), order_tag=order_tag)
                 working_order_id = new_order.get('brokerOrderId')
                 if not working_order_id:
-                    log.warning(f'{log_prefix}: new SL order rejected on attempt {attempt}: {new_order}', extra={'no_telegram': True})
+                    log.warning(f'{log_prefix}: exit order rejected on attempt {attempt}: {new_order}', extra={'no_telegram': True})
             except Exception as exc:
-                log.warning(f'{log_prefix}: placing a new SL order failed on attempt {attempt} ({exc})', extra={'no_telegram': True})
+                log.warning(f'{log_prefix}: placing exit order failed on attempt {attempt} ({exc})', extra={'no_telegram': True})
 
         time_module.sleep(FORCE_EXIT_POLL_INTERVAL)
 
-        book = _order_book_cache.get()
-        if book is not None and working_order_id is not None:
-            for o in book:
-                if o.get('brokerOrderId') != working_order_id:
-                    continue
-                status = str(o.get('orderStatus', '')).lower()
-                if status == 'complete':
-                    fill_price = float(o.get('averageTradedPrice') or 0)
-                    log.info(f'{log_prefix}: order {working_order_id} filled @ {fill_price} on attempt {attempt}')
-                    return fill_price
-                if status in ('rejected', 'cancelled'):
-                    log.warning(f'{log_prefix}: order {working_order_id} is {status} - will place a fresh SL order next attempt', extra={'no_telegram': True})
-                    working_order_id = None
-                break
-        elif book is None:
-            log.warning(f'{log_prefix}: order book unavailable on attempt {attempt}', extra={'no_telegram': True})
+        if working_order_id is not None:
+            o = _find_book_order(working_order_id)
+            status = _status(o) if o else None
+            if status == 'complete':
+                fill_price = float(o.get('averageTradedPrice') or 0)
+                log.info(f'{log_prefix}: order {working_order_id} filled @ {fill_price} on attempt {attempt}')
+                return fill_price
+            if status in ('rejected', 'cancelled'):
+                log.warning(f'{log_prefix}: order {working_order_id} is {status} - placing a fresh exit next attempt', extra={'no_telegram': True})
+                working_order_id = None
 
         # Our own order isn't showing 'complete' yet - but the position might already be flat
         # anyway, closed outside this process entirely (manually, by a different order/process).
-        # Nothing left to square off in that case - stop retrying rather than keep firing exit
-        # orders at a position that no longer exists.
         if not _leg_still_open(instrument):
-            log.info(f'{log_prefix}: broker position is already flat on attempt {attempt} - closed outside this process, stopping the forced exit')
+            fill_price = None
             if working_order_id is not None:
-                try:
-                    _cancel_order(working_order_id)
-                except Exception as exc:
-                    log.warning(f'{log_prefix}: cancel of now-stale order {working_order_id} failed ({exc})')
+                # the order book may simply lag OUR exit's fill - confirm before calling it external
+                status, fill_price = _cancel_and_confirm(working_order_id, log_prefix)
+                if status == 'complete':
+                    log.info(f'{log_prefix}: order {working_order_id} filled @ {fill_price} on attempt {attempt}')
+                    return fill_price
             log.warning(
                 f'{log_prefix}: position was already flat at the broker (closed outside this process, e.g. manually) - '
                 f'stopping the forced exit; pnl is a best-effort estimate off the current LTP, not an actual fill price',
             )
             return ltp
 
+        offset_pct = min(offset_pct + EXIT_CHASE_OFFSET_STEP, EXIT_CHASE_MAX_OFFSET_PCT)
         if attempt % FORCE_EXIT_STUCK_ALERT_EVERY == 0:
             log.critical(
                 f'{log_prefix}: still NOT squared off after {attempt} attempts '
-                f'(~{attempt * FORCE_EXIT_POLL_INTERVAL}s) - no MARKET fallback permitted, continuing to retry with SL orders',
+                f'(~{attempt * FORCE_EXIT_POLL_INTERVAL}s) - no MARKET fallback permitted, continuing to chase with LIMIT orders',
             )
 
 
@@ -886,7 +1020,7 @@ def buy_leg(instrument, quantity, ltp):
 
 def sell_leg(instrument, quantity, get_fresh_ltp):
     """Square off a bought leg: cancel any resting order on it (defensive - buy_leg above never
-    leaves one) then force a SELL SL exit via _force_exit_leg - retried/re-priced (via modify, not
+    leaves one) then force a SELL LIMIT exit via _force_exit_leg - retried/re-priced (via modify, not
     cancel+replace) until actually filled, MARKET/SLM never used - once we've decided to close,
     speed matters more than price (see notes.md), but never at the cost of an order type not
     permitted for this account/strategy. `get_fresh_ltp` is a zero-arg callable, re-fetched every
@@ -898,7 +1032,11 @@ def sell_leg(instrument, quantity, get_fresh_ltp):
         return _round_to_tick(initial_ltp * (1 - LIMIT_OFFSET_PCT), instrument.tick_size)
 
     for o in _order_book_cache.get() or []:
-        if str(o.get('instrumentId')) == str(instrument.token) and str(o.get('orderStatus', '')).lower() not in TERMINAL_ORDER_STATUSES:
+        # only THIS strategy's own orders (tag echoed back as 'remarks') - exec_rsv_adjust_sl.py may
+        # hold a short with a resting SL on this very contract, which must never be cancelled here
+        tag = str(o.get('remarks') or o.get('orderTag') or '')
+        if str(o.get('instrumentId')) == str(instrument.token) and tag.startswith('premium_spike_buy') \
+                and _status(o) not in TERMINAL_ORDER_STATUSES:
             _cancel_order(o['brokerOrderId'])
 
     log_prefix = f'{instrument.name} close'

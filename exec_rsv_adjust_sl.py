@@ -282,6 +282,9 @@ WARMUP_POLL_SECONDS = 2  # how often the warm-up loop (WARMUP_TIME -> ENTRY_TIME
 
 FIRST_OTM_STRIKES = 0  # 0 = ATM; n = n strikes OTM (CE up, PE down)
 STOPLOSS_PCT = 0.25  # per-leg resting stoploss, flat across every underlying - matches the backtest exactly
+CHOP_ENABLED = False  # 30 Sep 2026: False = no chop reentry after a STOPLOSS - the leg stays flat until
+# the next checkpoint reopens it. Matches Data/backtests/backtest_rs_v3_corrected_no_chop.py (repin on,
+# no chop), which beat every chop variant on both NIFTY and SENSEX since 2024. True = old behaviour.
 PREMIUM_HIGH_STOPLOSS_ENABLED = False
 PREMIUM_HIGH_LOOKBACK = timedelta(hours=1)
 # DAILY_LOSS_LIMIT is now per-underlying (see CFG's daily_loss_limit below) rather than one flat
@@ -1447,6 +1450,9 @@ def _handle_stoploss_fill(day, opt, leg, exit_price=None):
 
     info = day['checkpoint_info'][opt]
     exit_hint = f"entry ~{leg['entry_price']} exit ~{exit_price} pnl~{pnl:+.2f}"
+    if not CHOP_ENABLED:
+        alert(f'STOPLOSS FILLED: {opt} {leg["instrument"].name} ({exit_hint}) - chop disabled, staying flat until next checkpoint')
+        return
     if info is None:
         # shouldn't happen (an open leg always has checkpoint_info pinned) but be defensive -
         # nothing pinned to chop back to, stay flat.
