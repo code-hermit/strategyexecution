@@ -326,7 +326,7 @@ DAY_CODE_TO_WEEKDAY = {'m': 'Monday', 't': 'Tuesday', 'w': 'Wednesday', 'h': 'Th
 # underlying future (see get_spot_ltp), so there's no zerodha_spot_instrument.
 CFG = {
     'GOLDM': dict(
-        strike_interval=500, lots=2, aliceblue_exchange='MCX',
+        strike_interval=500, lots=1, aliceblue_exchange='MCX',
         zerodha_options_exchange='MCX',
         daily_loss_limit=500,
     ),
