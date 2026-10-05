@@ -1118,9 +1118,66 @@ def _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id):
     if not order_no:
         raise RuntimeError(f'{instrument.name} entry order rejected: {entry}')
 
-    entry_price = _wait_for_fill_price(order_no)
+    try:
+        entry_price = _wait_for_fill_price(order_no)
+    except TimeoutError:
+        entry_price = _settle_timed_out_entry(opt, order_no, instrument)
     sl_order_id = _place_protective_sl(instrument, quantity, entry_price, order_tag=_order_tag(opt, TAG_SL, leg_id))
     return entry_price, sl_order_id
+
+
+class _UnresolvedEntry(RuntimeError):
+    """An entry SELL whose outcome couldn't be confirmed (still resting after a cancel, or
+    part-filled) - its side must not be entered again until it's settled, see _unresolved_entries."""
+
+    def __init__(self, message, order_no):
+        super().__init__(message)
+        self.order_no = order_no
+
+
+# opt -> (order_no, instrument, strike, quantity, leg_id) of an entry SELL that timed out and couldn't be
+# confirmed dead. 1 Oct 2026 13:45 SENSEX: the PE entry timed out, was neither cancelled nor
+# tracked, the checkpoint retry saw PE flat and sold a second 60 - then the first one filled too
+# (120 short, SL on 60). _enter_leg settles anything parked here before placing a fresh entry.
+_unresolved_entries = {}
+
+
+def _settle_entry_order(order_no, label):
+    """Cancel an entry SELL that didn't confirm filled, and read what really became of it. Returns
+    its fill price if it filled anyway, None if it's dead with nothing filled. Raises
+    _UnresolvedEntry if it's still resting, part-filled, or the book can't say."""
+    status, fill_price = _cancel_and_confirm(order_no, label)
+    if status == 'complete':
+        if fill_price is None:
+            raise _UnresolvedEntry(f'{label}: order {order_no} complete but no averageTradedPrice', order_no)
+        return fill_price
+    if status in ('cancelled', 'rejected'):
+        book = _read_order_book_or_none(f'{label} filled-qty check')
+        o = _find_order(book, order_no) if book is not None else None
+        if o is None:
+            raise _UnresolvedEntry(f'{label}: order {order_no} {status} but not readable in the order book', order_no)
+        filled = int(o.get('filledQuantity') or o.get('Fillshares') or 0)
+        if filled:
+            raise _UnresolvedEntry(f'{label}: order {order_no} {status} after part-filling {filled}', order_no)
+        return None
+    raise _UnresolvedEntry(f'{label}: order {order_no} still {status!r} after cancel', order_no)
+
+
+def _settle_timed_out_entry(opt, order_no, instrument):
+    """_wait_for_fill_price timed out on `order_no`: never leave it live and untracked. Filled
+    anyway -> its fill price (the caller protects and tracks it as normal). Dead with nothing
+    filled -> raise, so the checkpoint retry enters afresh. Unresolved -> CRITICAL alert and
+    raise _UnresolvedEntry (_enter_leg parks it, blocking a second SELL on this side)."""
+    label = f'{instrument.name} entry'
+    try:
+        fill_price = _settle_entry_order(order_no, label)
+    except _UnresolvedEntry as exc:
+        alert(f'{opt}: {exc} - NOT re-entering {opt} until it settles. Check manually!', level=logging.CRITICAL)
+        raise
+    if fill_price is None:
+        raise RuntimeError(f'{label} order {order_no} not filled within {FILL_POLL_TIMEOUT}s - cancelled, nothing filled')
+    log.warning(f'{label} order {order_no} filled late @ {fill_price} - tracking it as the leg')
+    return fill_price
 
 
 def _run_legs_in_parallel(tasks):
@@ -1208,9 +1265,33 @@ def _abandon_chop_watches(day):
 
 
 def _enter_leg(state, day, opt, instrument, ltp, strike, cfg):
+    pending = _unresolved_entries.get(opt)
+    if pending is not None:
+        # an earlier entry on this side is still unaccounted for - settle it before any new SELL
+        order_no, p_instrument, p_strike, p_quantity, p_leg_id = pending
+        try:
+            fill_price = _settle_entry_order(order_no, f'{p_instrument.name} entry')
+        except _UnresolvedEntry as exc:
+            log.warning(f'{opt}: {exc} - staying flat on {opt} this checkpoint')
+            return
+        del _unresolved_entries[opt]
+        if fill_price is not None:
+            sl_order_id = _place_protective_sl(p_instrument, p_quantity, fill_price, order_tag=_order_tag(opt, TAG_SL, p_leg_id))
+            alert(f'{opt}: earlier entry {order_no} turned out filled @ {fill_price} - SL placed, tracking it')
+            _install_leg(state, day, opt, p_instrument, p_strike, fill_price, p_quantity, p_leg_id, sl_order_id)
+            return
+
     quantity = instrument.lot_size * cfg['lots']
     leg_id = _new_leg_id()
-    entry_price, sl_order_id = _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id)
+    try:
+        entry_price, sl_order_id = _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id)
+    except _UnresolvedEntry as exc:
+        _unresolved_entries[opt] = (exc.order_no, instrument, strike, quantity, leg_id)
+        raise
+    _install_leg(state, day, opt, instrument, strike, entry_price, quantity, leg_id, sl_order_id)
+
+
+def _install_leg(state, day, opt, instrument, strike, entry_price, quantity, leg_id, sl_order_id):
     leg = dict(
         instrument=instrument, strike=strike, entry_price=entry_price, quantity=quantity, leg_id=leg_id,
         sl_order_id=sl_order_id, sl_ref_price=entry_price,  # sl_ref_price: the price this leg's
