@@ -34,7 +34,8 @@ same API key, within Kite's per-key limit (3).
 Auth reuses zerodha_token.json (zerodha_generate_access_token.py), failing loudly if missing/expired.
 
 Run standalone once per MCX trading day, before the MCX strategy scripts (e.g. ~08:55 or any time
-before exec_rsv_goldm.py's 15:44 warm-up):
+before exec_rsv_goldm.py's 15:14 warm-up; cron starts it at 15:14, exec_rsv_goldm.py at 15:14:30
+- and exec_rsv_goldm.py waits for this to be running before it starts):
     python3 mcx_ticker_service.py
 Logs to mcx_ticker_service.log and stdout; WARNING+ records go to Telegram if
 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are set in .env.

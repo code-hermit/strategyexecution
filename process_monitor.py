@@ -52,6 +52,20 @@ JOBS = [
         "end": dtime(15, 30),
         "weekdays": None,
     },
+    {
+        "name": "mcx_ticker",
+        "match": r"mcx_ticker_service\.py",
+        "start": dtime(15, 14),
+        "end": dtime(23, 30),
+        "weekdays": {0, 1, 2, 3, 4},
+    },
+    {
+        "name": "goldm",
+        "match": r"exec_rsv_goldm\.py",
+        "start": dtime(15, 14, 30),
+        "end": dtime(23, 0),
+        "weekdays": {0, 1, 2, 3, 4},
+    },
 ]
 
 # Give a freshly-cron-started process this long to actually appear in the process list

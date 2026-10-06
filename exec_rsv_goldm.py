@@ -11,10 +11,15 @@ data from Zerodha Kite, orders through AliceBlue. Only the MCX-specific parts di
     the chain's expiry (e.g. 29 Oct options -> 5 Nov future, even while the 5 Oct future still
     trades) - see _load_zerodha_option_chain / get_spot_ltp. Same pairing as the backtest's
     symbols_config.build_roll_table.
-  - Timing (matches the backtest): warm-up 15:44, entry 15:45, checkpoints every 3.5h (19:15,
-    22:45), square-off 23:00 - already 30 min inside MCX's 23:30 close, so no extra buffer.
-  - Size: 1 lot. AliceBlue's MCX order quantity is in LOTS (GOLDM contract lot_size = 1), so
-    quantity = lot_size * lots = lots, as in mcx_short_straddle_premium_stoploss.py.
+  - Timing: warm-up 15:14, entry 15:15, hourly checkpoints (16:15, 17:15 ... 22:15), square-off
+    23:00 - already 30 min inside MCX's 23:30 close, so no extra buffer. Backtested as
+    "--entry-time 15:15 --checkpoint-hours 1" (Oct 2026: best of the 1h/2h/3.5h x 15:15/15:45/16:15
+    variants on drawdown; 28 liquid days only, so provisional).
+  - Size: 2 lots (1 -> 2 on 6 Oct 2026). AliceBlue's MCX order quantity is in LOTS (GOLDM contract
+    lot_size = 1), so quantity = lot_size * lots = lots, as in mcx_short_straddle_premium_stoploss.py.
+  - Requires mcx_ticker_service.py: if it isn't running at startup the process waits for it (polling
+    every TICKER_WAIT_POLL_SECONDS) before doing anything, giving up only at EXIT_TIME (see
+    _wait_for_mcx_ticker). Cron: ticker 15:14:00, this script 15:14:30.
   - daily_loss_limit 500 points per unit (Rs 5,000 per lot - 1 point = Rs 10/lot, price per 10g,
     100g lot): NIFTY/SENSEX-sized limits scaled to GOLDM's ~6,000-point ATM straddle.
   - Order tags use prefix 'rvG', so this process never adopts or touches NIFTY/SENSEX legs.
@@ -166,6 +171,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time as time_module
@@ -287,15 +293,15 @@ for _sig in (signal.SIGTERM, signal.SIGHUP):
 DRY_RUN = os.getenv('DRY_RUN', 'true').lower() != 'false'  # set DRY_RUN=false to place real orders
 
 # ── Strategy config (mirrors backtest_rolling_straddle_variation_continuous.py) ────────────────
-WARMUP_TIME = dtime(15, 44)  # process (and its cron trigger) starts here, a minute ahead of ENTRY_TIME,
+WARMUP_TIME = dtime(15, 14)  # process (and its cron trigger) starts here, a minute ahead of ENTRY_TIME,
 # purely so the once-a-day instrument/contract-dump caches (_zerodha_options_cache,
 # _aliceblue_contracts_cache, ...) and the Redis LTP feed are already hot by ENTRY_TIME - see the
 # warm-up loop in run_day. No orders are placed and no price is recorded as "the entry price" during
 # this minute; it exists only to absorb the first-fetch latency ahead of time.
-ENTRY_TIME = dtime(15, 45)  # spot/ATM premium is snapshotted here (as close to exactly 15:45 as the
+ENTRY_TIME = dtime(15, 15)  # spot/ATM premium is snapshotted here (as close to exactly 15:15 as the
 # warm-up loop can land it) and that same snapshot's legs are what get bought - see run_day.
 EXIT_TIME = dtime(23, 0)  # the backtest's own exit - already 30 min inside MCX's 23:30 close
-CHECKPOINT_INTERVAL = timedelta(hours=3.5)  # 15:45 -> 19:15 -> 22:45, matching the backtest
+CHECKPOINT_INTERVAL = timedelta(hours=1)  # 16:15, 17:15 ... 22:15 (23:15 is past EXIT_TIME, never runs)
 POLL_INTERVAL_SECONDS = 15  # was 30 - halved after the 31 Aug 2026 review found up to ~30s of pure
 # detection lag (a checkpoint/stoploss-fill notice waiting for the next poll) compounding with
 # fill-wait/retry delays into multi-minute-late exits (see notes.md) - 15s roughly halves that
@@ -306,7 +312,9 @@ WARMUP_POLL_SECONDS = 2  # how often the warm-up loop (WARMUP_TIME -> ENTRY_TIME
 # ENTRY_TIME lands within ~2s of it.
 
 FIRST_OTM_STRIKES = 0  # 0 = ATM; n = n strikes OTM (CE up, PE down)
-STOPLOSS_PCT = 0.25  # per-leg resting stoploss, flat across every underlying - matches the backtest exactly
+STOPLOSS_PCT = 0.15  # per-leg resting stoploss - 5 Oct 2026: 0.25 -> 0.15 for GOLDM (backtest uses 0.25). AliceBlue
+# rejects MCX option orders priced more than ~20% from LTP ("RED:RULE:{Check option price on ltp range}"),
+# so a 25% stop could never rest. Trigger 15% + SL_LIMIT_OFFSET_PCT limit = ~17.3% above LTP, inside it.
 CHOP_ENABLED = False  # 30 Sep 2026: False = no chop reentry after a STOPLOSS - the leg stays flat until
 # the next checkpoint reopens it. Matches Data/backtests/backtest_rs_v3_corrected_no_chop.py (repin on,
 # no chop), which beat every chop variant on both NIFTY and SENSEX since 2024. True = old behaviour.
@@ -326,7 +334,7 @@ DAY_CODE_TO_WEEKDAY = {'m': 'Monday', 't': 'Tuesday', 'w': 'Wednesday', 'h': 'Th
 # underlying future (see get_spot_ltp), so there's no zerodha_spot_instrument.
 CFG = {
     'GOLDM': dict(
-        strike_interval=500, lots=1, aliceblue_exchange='MCX',
+        strike_interval=500, lots=2, aliceblue_exchange='MCX',
         zerodha_options_exchange='MCX',
         daily_loss_limit=500,
     ),
@@ -485,11 +493,16 @@ def get_spot_ltp(symbol, cfg):
 ALICEBLUE_TOKEN_FILE = os.path.join(os.path.dirname(__file__), 'aliceblue_token.json')
 ALICEBLUE_BASE_URL = 'https://a3.aliceblueonline.com/open-api/od/v1'
 ALICEBLUE_CONTRACT_MASTER_URL = 'https://v2api.aliceblueonline.com/restpy/static/contract_master/V2/{exchange}'
+SL_LIMIT_OFFSET_PCT = 0.02  # protective SL's limit above its trigger - not LIMIT_OFFSET_PCT's 5%: 1.15 * 1.05 = 1.2075 breaks the ~20% LTP band
 LIMIT_OFFSET_PCT = 0.05  # limit price offset from LTP: below LTP for SELL, above LTP for BUY -
 # matches execution_rolling_straddle_tn.py's rolling-straddle-family value. Entries and the resting
 # SL still use this fixed offset unchanged - only EXITS chase (see EXIT_CHASE_* below), since
 # getting OUT fast is the priority once we've already decided to close, not getting a clean price.
 FILL_POLL_TIMEOUT = 10
+ALICEBLUE_PRODUCT = 'LONGTERM'  # = NRML (carry-forward) for F&O/MCX - AliceBlue blocks MIS/INTRADAY on MCX
+# GOLDM options ("RED:Block Type:ALL Reason:MIS orders are not allowed,Kindly place in NRML"), and this
+# API only accepts INTRADAY/LONGTERM/MTF (EC092 on 'NORMAL', 5 Oct 2026). NRML is never
+# auto-squared-off by the broker, so EXIT_TIME's square-off is the only thing closing these legs.
 TERMINAL_ORDER_STATUSES = {'complete', 'rejected', 'cancelled'}
 
 
@@ -512,7 +525,7 @@ _ALICEBLUE_EMPTY_RESULT_STATUSES = {'EC920'}
 # orders on these NFO options, EC965).
 EXIT_CHASE_WAIT_SECONDS = 2
 EXIT_CHASE_OFFSET_STEP = 0.05
-EXIT_CHASE_MAX_OFFSET_PCT = 0.50
+EXIT_CHASE_MAX_OFFSET_PCT = 0.15  # was 0.50 - capped under AliceBlue's ~20%-from-LTP MCX price band (see STOPLOSS_PCT)
 
 
 def _aliceblue_headers(session_id):
@@ -773,7 +786,7 @@ def _place_order(transaction_type, instrument, quantity, order_type, price='0', 
         'instrumentId': str(instrument.token),
         'transactionType': transaction_type,
         'quantity': quantity,
-        'product': 'INTRADAY',
+        'product': ALICEBLUE_PRODUCT,
         'orderComplexity': 'REGULAR',
         'orderType': order_type,
         'validity': 'DAY',
@@ -1082,7 +1095,7 @@ def _place_protective_sl(instrument, quantity, entry_price, order_tag):
     trigger_price = round(entry_price * (1 + STOPLOSS_PCT))
     # Nearest integer, not a tick - same "STOP PRICE IS NOT REASONABLE" rejection applies to the
     # SL order's limit price as well as its trigger.
-    sl_limit_price = round(trigger_price * (1 + LIMIT_OFFSET_PCT))
+    sl_limit_price = round(trigger_price * (1 + SL_LIMIT_OFFSET_PCT))
     if DRY_RUN:
         log.info(f'{instrument.name} @ {entry_price}, SL trigger {trigger_price} limit {sl_limit_price} [DRY RUN, not placed]')
         return None
@@ -1952,7 +1965,7 @@ def _reprice_leg_stoploss(state, opt, market):
         log.warning(f'{opt} {leg["instrument"].name}: no live quote at checkpoint - leaving existing SL as is')
         return
     trigger_price = round(current_ltp * (1 + STOPLOSS_PCT))
-    sl_limit_price = round(trigger_price * (1 + LIMIT_OFFSET_PCT))
+    sl_limit_price = round(trigger_price * (1 + SL_LIMIT_OFFSET_PCT))
     if leg['sl_order_id'] is None:
         # DRY_RUN, or the resting order id couldn't be recovered (e.g. a startup-adoption
         # reconstruction miss) - nothing live to modify; still move the in-memory reference on so
@@ -2113,10 +2126,38 @@ def _sleep_until(target_time, label):
         time_module.sleep(wait)
 
 
+def _mcx_ticker_running():
+    """True if an mcx_ticker_service.py process is alive on this box (pgrep -f, same check
+    process_monitor.py uses)."""
+    return subprocess.run(
+        ['pgrep', '-f', r'mcx_ticker_service\.py'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+TICKER_WAIT_POLL_SECONDS = 5
+
+
+def _wait_for_mcx_ticker(symbol):
+    """Blocks until mcx_ticker_service.py is running. Log-only (nothing goes to Telegram). Returns
+    False (don't trade today) only if EXIT_TIME arrives first."""
+    if _mcx_ticker_running():
+        return True
+    log.info(f'mcx_ticker_service.py is not running - {symbol} waiting for it before starting')
+    while not _mcx_ticker_running():
+        if datetime.now().time() >= EXIT_TIME:
+            log.info(f'mcx_ticker_service.py never started before {EXIT_TIME} - {symbol} NOT trading today')
+            return False
+        time_module.sleep(TICKER_WAIT_POLL_SECONDS)
+    log.info(f'mcx_ticker_service.py is now running - {symbol} continuing startup')
+    return True
+
+
 def run_day(symbol, trade_weekdays):
     today_name = datetime.now().strftime('%A')
     if today_name not in trade_weekdays:
         log.info(f'{today_name} is not in TRADE_WEEKDAYS ({sorted(trade_weekdays)}) - not trading')
+        return
+    if not _wait_for_mcx_ticker(symbol):
         return
 
     cfg = CFG[symbol]
