@@ -12,6 +12,7 @@ Day timeline (IST):
   every minute   download the new candle for every stock (about 35 s for 99 stocks), feed it to
                  the rules; when a tracked stock makes its first break, rest an SL-limit entry
                  order at the opposite end of the range
+  every 15 s     one batch LTP call for the armed stocks (see below)
   every 5 s      read the order book: an entry that filled gets its 0.5% SL-limit stop at once;
                  a stop that filled closes the trade
   14:30          cancel every entry order that hasn't triggered
@@ -28,22 +29,35 @@ fills, the rest are cancelled (two filling in the same second could overshoot - 
 Entry orders are placed only when price is near them: AliceBlue blocks margin for resting orders as
 well as positions, and on a busy day 15-20 stocks can be waiting for their second break at once -
 far more than the margin can carry as resting orders. So a first break only ARMS the stock; every
-5 s one batch LTP call checks all armed stocks, and the SL-limit entry is placed once price is
+15 s one batch LTP call checks all armed stocks, and the SL-limit entry is placed once price is
 within PLACE_WITHIN_PCT of the trigger (nearest first, while (open positions + resting entries) /
 leverage fits in the equity). A resting entry whose stock drifts more than RECALL_BEYOND_PCT away is
 cancelled and the stock re-armed, freeing its margin. A level that is jumped straight through
 between two checks is still entered with a limit at the SL-limit's own limit price, or skipped if
 price has already run past that.
 
-Sizing (stock_signal_range_reversal.trade_qty): equity from stock_range_reversal_equity.json; the
+Sizing (stock_signal_range_reversal.trade_qty): equity from stock_range_reversal_data/equity.json; the
 day's first 4 fills get the profit above the starting capital spread across them. A resting
 entry is re-sized (modified) when it moves from a "first 4" slot to a normal one.
 
 DRY_RUN (default true, like the other execution scripts): PaperBroker, no orders sent. Set
 DRY_RUN=false in .env to trade.
 
-State: logs/stock_range_reversal_<date>.json is rewritten on every change; on a restart the day's
-trades are reloaded so no stock is entered twice.
+Files - everything this program writes is under execution/stock_range_reversal_data/:
+  equity.json                    account equity + one line per day (compounding) - back this up
+  stock_range_reversal.log       the log
+  state/trades_<date>.json       the day's trades, rewritten on every change; on a restart they are
+                                 reloaded so no stock is entered twice
+  candles/candles_<date>.csv     the day's 1-minute candles for all stocks
+
+Run: python3 stock_range_reversal.py   (one program - the candle download runs in its own thread)
+
+Late start / restart: any time before 15:15 is fine. The first candle download covers 09:15 to now
+and is replayed through the rules, so ranges, tracking and first breaks come out exactly as if the
+program had been running since 10:15. A replayed first break whose opposite level hasn't been
+crossed yet is armed as usual; one whose level was already crossed is logged as missed (that
+entry happened while the program wasn't running). Trades from earlier in the day are reloaded
+from state/, so a restart never enters a stock twice.
 """
 
 import json
@@ -80,11 +94,11 @@ UNIVERSE = [
 ENTRY_LIMIT_BUFFER_PCT = 0.2        # SL-limit entry: limit this far beyond the trigger
 STOP_LIMIT_BUFFER_PCT = 0.5         # protective SL-limit: limit this far beyond its trigger
 EXIT_LIMIT_BUFFER_PCT = 0.5         # fallback marketable LIMIT if a MARKET exit is rejected
-PLACE_WITHIN_PCT = 0.3             # place the resting entry once LTP is this close to its trigger
-RECALL_BEYOND_PCT = 0.6            # cancel a resting entry (free its margin) once LTP is this far away
-POLL_SECONDS = 5
+PLACE_WITHIN_PCT = 0.5             # place the resting entry once LTP is this close to its trigger
+RECALL_BEYOND_PCT = 1.0            # cancel a resting entry (free its margin) once LTP is this far away
+LTP_CHECK_SECONDS = 15             # how often armed stocks' LTPs are checked
+POLL_SECONDS = 5                   # how often the order book is read (fills -> stops)
 REFRESH_DELAY_SECONDS = 3           # fetch a minute's candle this long after the minute closes
-SIGNAL_FRESH_MINUTES = 3            # ignore first breaks older than this (e.g. replayed after a restart)
 HEARTBEAT_EVERY = timedelta(minutes=30)
 EXIT_FILL_TIMEOUT_SECONDS = 60
 
@@ -92,10 +106,13 @@ EXIT_FILL_TIMEOUT_SECONDS = 60
 BROKERAGE_PER_ORDER, BROKERAGE_RATE = 20.0, 0.0005
 STT_SELL, EXCHANGE_TXN, SEBI, STAMP_BUY, GST = 0.00025, 0.0000297, 0.000001, 0.00003, 0.18
 
-LOG_DIR = os.path.join(HERE, 'logs')
-os.makedirs(LOG_DIR, exist_ok=True)
-EQUITY_FILE = os.path.join(HERE, 'stock_range_reversal_equity.json')
-LOG_FILE = os.path.join(HERE, 'stock_range_reversal.log')
+DATA_DIR = os.path.join(HERE, 'stock_range_reversal_data')
+STATE_DIR = os.path.join(DATA_DIR, 'state')
+CANDLE_DIR = os.path.join(DATA_DIR, 'candles')
+for _d in (DATA_DIR, STATE_DIR, CANDLE_DIR):
+    os.makedirs(_d, exist_ok=True)
+EQUITY_FILE = os.path.join(DATA_DIR, 'equity.json')
+LOG_FILE = os.path.join(DATA_DIR, 'stock_range_reversal.log')
 
 log = get_logger('stock_range_reversal', LOG_FILE, 'SRR' + (' PAPER' if DRY_RUN else ''))
 
@@ -151,7 +168,7 @@ def save_equity(eq):
 class Runner:
     def __init__(self):
         self.day = now_ist().date()
-        self.state_file = os.path.join(LOG_DIR, f'stock_range_reversal_{self.day:%Y%m%d}.json')
+        self.state_file = os.path.join(STATE_DIR, f'trades_{self.day:%Y%m%d}.json')
         self.lock = threading.RLock()
         self.signals = queue.Queue()
         self.broker = PaperBroker(log) if DRY_RUN else AliceBlueBroker(log)
@@ -166,6 +183,9 @@ class Runner:
         self.trades = self._load_state()          # symbol -> trade dict (one per stock per day)
         self.armed = {}                           # symbol -> EntrySignal with no order at the broker yet
         self.sigs = {}                            # symbol -> its EntrySignal (to re-arm a recalled entry)
+        self.margin_blocked = set()               # armed stocks already logged as waiting for margin
+        self.last_ltp_check = None
+        self.new_tracked, self.new_breaks = [], []    # filled by the data thread, sent by _report_events
         self.cutoff_done = False
         self.cap_done = False
         self.data_done = threading.Event()
@@ -208,6 +228,7 @@ class Runner:
             bars = self.data.bootstrap()
             for symbol, symbol_bars in bars.items():
                 self._feed(symbol, symbol_bars)
+            self._report_events()
             ranged = sum(1 for m in self.machines.values() if m.high is not None)
             alert(log, f'Ranges set for {ranged}/{len(self.machines)} stocks; equity ₹{self.equity:,.0f}'
                        f'{" (PAPER)" if DRY_RUN else ""}')
@@ -219,6 +240,7 @@ class Runner:
                 new = self.data.refresh()
                 for symbol, symbol_bars in new.items():
                     self._feed(symbol, symbol_bars)
+                self._report_events()
                 if DRY_RUN:
                     self.broker.simulate(new)
                 took = time_module.time() - started
@@ -229,22 +251,46 @@ class Runner:
             log.critical('data thread crashed - no new signals will arrive', exc_info=True)
         finally:
             try:
-                self.data.save(os.path.join(LOG_DIR, f'stock_candles_{self.day:%Y%m%d}.csv'))
+                self.data.save(os.path.join(CANDLE_DIR, f'candles_{self.day:%Y%m%d}.csv'))
             except Exception as exc:
                 log.warning(f'could not save candles: {exc}')
             self.data_done.set()
 
     def _feed(self, symbol, bars):
         machine = self.machines[symbol]
-        for bar in bars:
+        for i, bar in enumerate(bars):
+            before = machine.status
             sig = machine.on_bar(bar)
+            if before == 'tracking' and machine.status == 'armed':
+                mid_lo = machine.low + rules.MID_LO * (machine.high - machine.low)
+                mid_hi = machine.low + rules.MID_HI * (machine.high - machine.low)
+                log.info(f'{symbol}: TRACKING from {bar.ts:%H:%M} - close {bar.close} in the middle band '
+                         f'{mid_lo:.2f}-{mid_hi:.2f} (range {machine.low}-{machine.high})')
+                self.new_tracked.append(f'{symbol} ({machine.low}-{machine.high})')
             if sig is None:
                 continue
-            age = now_ist() - bar.ts
-            if age > timedelta(minutes=SIGNAL_FRESH_MINUTES):
-                log.info(f'{symbol}: first break at {bar.ts:%H:%M} is {age} old - not traded')
+            # replayed candles (late start / restart): the first break is still tradeable only if no
+            # later candle has already crossed the opposite level - otherwise the entry was missed
+            crossed = next((b for b in bars[i + 1:]
+                            if (b.high > sig.level if sig.side == 'BUY' else b.low < sig.level)), None)
+            if crossed is not None:
+                log.info(f'{symbol}: first break at {bar.ts:%H:%M}, but {sig.level} was already crossed at '
+                         f'{crossed.ts:%H:%M} before the program saw it - missed')
                 continue
+            entry = 'BUY above' if sig.side == 'BUY' else 'SELL below'
+            self.new_breaks.append(f'{symbol} broke {sig.first_break} -> {entry} {sig.level}')
             self.signals.put(sig)
+
+    def _report_events(self):
+        """One Telegram message per candle pass: stocks that started tracking, and first breaks."""
+        parts = []
+        if self.new_tracked:
+            parts.append(f'Tracking ({len(self.new_tracked)}): ' + ', '.join(self.new_tracked))
+        if self.new_breaks:
+            parts.append('First break: ' + '; '.join(self.new_breaks))
+        if parts:
+            alert(log, '\n'.join(parts))
+        self.new_tracked, self.new_breaks = [], []
 
     # ── order handling (main thread) ──────────────────────────────────────────────────────────
     @staticmethod
@@ -255,8 +301,12 @@ class Runner:
     def manage_armed(self):
         """Place entries for armed stocks whose price is near the trigger (nearest first) and recall
         resting entries whose price has drifted away."""
-        if now_ist().time() >= rules.LAST_ENTRY:
+        now = now_ist()
+        if now.time() >= rules.LAST_ENTRY:
             return
+        if self.last_ltp_check is not None and (now - self.last_ltp_check).total_seconds() < LTP_CHECK_SECONDS:
+            return
+        self.last_ltp_check = now
         pending_sl = [t for t in self.pending() if t['entry_type'] == 'SL' and not t.get('recall')]
         watch = list(self.armed) + [t['symbol'] for t in pending_sl]
         if not watch:
@@ -302,8 +352,11 @@ class Runner:
             log.info(f'{sig.symbol}: price {trigger} above the per-trade allocation - skipped')
             return True
         if self.margin_in_use() + qty * trigger / rules.LEVERAGE > self.equity + 1:
-            log.info(f'{sig.symbol}: near its trigger but no free margin - stays armed')
+            if sig.symbol not in self.margin_blocked:
+                self.margin_blocked.add(sig.symbol)
+                log.info(f'{sig.symbol}: near its trigger but no free margin - stays armed')
             return False
+        self.margin_blocked.discard(sig.symbol)
         order_type, price, trig = 'SL', limit, trigger
         if ltp is not None and ((ltp >= trigger) if sig.side == 'BUY' else (ltp <= trigger)):
             # already through the level: an SL order would be rejected; a limit at the SL-limit's
