@@ -476,6 +476,8 @@ LIMIT_OFFSET_PCT = 0.05  # limit price offset from LTP: below LTP for SELL, abov
 # SL still use this fixed offset unchanged - only EXITS chase (see EXIT_CHASE_* below), since
 # getting OUT fast is the priority once we've already decided to close, not getting a clean price.
 FILL_POLL_TIMEOUT = 10
+ALICEBLUE_PRODUCT = 'LONGTERM'  # = NRML (carry-forward); this API only accepts INTRADAY/LONGTERM/MTF (EC092 on
+# 'NORMAL'). NRML is never auto-squared-off by the broker, so EXIT_TIME's square-off is the only thing closing these legs.
 TERMINAL_ORDER_STATUSES = {'complete', 'rejected', 'cancelled'}
 
 
@@ -759,7 +761,7 @@ def _place_order(transaction_type, instrument, quantity, order_type, price='0', 
         'instrumentId': str(instrument.token),
         'transactionType': transaction_type,
         'quantity': quantity,
-        'product': 'INTRADAY',
+        'product': ALICEBLUE_PRODUCT,
         'orderComplexity': 'REGULAR',
         'orderType': order_type,
         'validity': 'DAY',

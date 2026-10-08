@@ -11,14 +11,18 @@ per unit, which is 1000 / 4000 Rs at 1 lot):
     future). One straddle at a time.
   - Every poll (POLL_INTERVAL_SECONDS), the open straddle's P&L - both legs, entry fill vs live
     LTP - is checked:  >= +target_rs -> close both legs (TARGET);  <= -stoploss_rs -> close both
-    legs (STOPLOSS). Both are checked here, by this process: there is NO resting stop order at the
-    broker (a per-leg broker stop can't express a straddle-level stop - it would fire on ordinary
-    one-sided moves the backtest never exits on). If this process is down, nothing stops the legs:
-    run it under process_monitor and watch the heartbeats.
+    legs (STOPLOSS). Both are checked here, by this process.
+  - Dead man's switch: every leg also gets a resting broker-side SL BUY order at LEG_SL_PCT (15%)
+    above its own entry fill (limit SL_LIMIT_OFFSET_PCT above the trigger, inside AliceBlue's ~20%
+    MCX price band), placed right after the entry fills and never moved. It protects the legs if
+    this process dies. If one fires while the process is running, the other leg is closed too and
+    it counts as a STOPLOSS (restart waits for the premium to fall back). Every deliberate close
+    cancels the leg's SL first, and if the SL filled before the cancel landed, that fill is the exit.
   - After a straddle closes, the next one starts (checked every poll):
-      * immediately at the new ATM if the ATM strike differs from the ATM at the close;
-      * at the same strike once the ATM straddle premium has reversed by reentry_rs from its value
-        at the close - back UP after a TARGET (premium had fallen), back DOWN after a STOPLOSS.
+      * immediately at the current ATM if it differs from the strike the closed straddle was traded
+        at (even if ATM had already moved away by the time of the close);
+      * at that same strike once its straddle premium has reversed by reentry_rs from its value at
+        the close - back UP after a TARGET (premium had fallen), back DOWN after a STOPLOSS.
   - daily_loss_limit_rs (realized + unrealized) closes everything and stops for the day.
   - EXIT_TIME (23:00): close whatever is open. NRML (LONGTERM) positions are never auto-squared-off
     by the broker, so this square-off is the only thing closing them.
@@ -336,6 +340,8 @@ _ALICEBLUE_EMPTY_RESULT_STATUSES = {'EC920'}
 EXIT_CHASE_WAIT_SECONDS = 2
 EXIT_CHASE_OFFSET_STEP = 0.05
 EXIT_CHASE_MAX_OFFSET_PCT = 0.15  # under AliceBlue's ~20%-from-LTP MCX price band
+LEG_SL_PCT = 0.15  # dead man's switch: resting SL BUY per leg at entry * (1 + LEG_SL_PCT), never moved
+SL_LIMIT_OFFSET_PCT = 0.02  # SL limit above its trigger - 1.15 * 1.02 stays inside the ~20% LTP band
 
 
 def _status(o):
@@ -512,7 +518,7 @@ def _find_order(order_book, order_id):
 # exec_rsv_goldm.py's 'rv...' tags.
 _TAG_UNDERLYING = {'GOLDM': 'G'}
 TAG_PREFIX = 'rt' + _TAG_UNDERLYING.get(_ARGV_SYMBOL, _ARGV_SYMBOL[:1])
-TAG_ENTRY, TAG_EXIT = 'E', 'X'
+TAG_ENTRY, TAG_SL, TAG_EXIT = 'E', 'S', 'X'
 
 
 def _new_leg_id():
@@ -802,8 +808,32 @@ def _short_leg(instrument, quantity, ltp, opt, leg_id):
         return _settle_timed_out_entry(order_no, instrument)
 
 
+def _place_leg_stop(instrument, quantity, entry_price, opt, leg_id):
+    """Dead man's switch: resting SL BUY at entry * (1 + LEG_SL_PCT). Trigger and limit are whole
+    rupees (MCX rejects other SL prices as "STOP PRICE IS NOT REASONABLE" - see exec_rsv_goldm.py).
+    Returns the broker order id, or None (DRY_RUN, or placement failed - CRITICAL alert: the leg is
+    then protected only by this process)."""
+    trigger = round(entry_price * (1 + LEG_SL_PCT))
+    limit = round(trigger * (1 + SL_LIMIT_OFFSET_PCT))
+    log.info(f'{"[DRY RUN] " if DRY_RUN else ""}SL BUY {quantity} x {instrument.name} trigger {trigger} limit {limit} (entry {entry_price})')
+    if DRY_RUN:
+        return None
+    try:
+        order = _place_order('BUY', instrument, quantity, 'SL', price=str(limit), trigger_price=trigger,
+                             order_tag=_order_tag(opt, TAG_SL, leg_id))
+        order_no = order.get('brokerOrderId')
+        if not order_no:
+            raise RuntimeError(f'rejected: {order}')
+        return order_no
+    except Exception as exc:
+        alert(f'{instrument.name}: dead-man SL order FAILED ({exc}) - leg protected only by this process. Place a stop manually!', level=logging.CRITICAL)
+        return None
+
+
 def _buy_back_leg(leg, opt, fallback_ltp):
-    """BUY to close a short leg, chasing until filled. Returns the fill price (LTP in DRY_RUN)."""
+    """BUY to close a short leg: cancel its resting SL first (if the SL already filled, that fill
+    is the exit; if the cancel can't be confirmed, raise and leave the leg open and protected),
+    then chase an exit order until filled. Returns the fill price (LTP in DRY_RUN)."""
     instrument = leg['instrument']
 
     def _fresh_ltp():
@@ -817,6 +847,17 @@ def _buy_back_leg(leg, opt, fallback_ltp):
     log.info(f'{"[DRY RUN] " if DRY_RUN else ""}BUY (close) {leg["quantity"]} x {instrument.name}')
     if DRY_RUN:
         return _fresh_ltp()
+    if _fresh_ltp() is None:
+        raise RuntimeError(f'{instrument.name}: no LTP available to close - leaving the leg and its SL in place')
+    if leg.get('sl_order_id'):
+        status, fill_price = _cancel_and_confirm(leg['sl_order_id'], f'{instrument.name} SL')
+        if status == 'complete':
+            log.info(f"{instrument.name}: SL {leg['sl_order_id']} filled before its cancel landed @ {fill_price} - already closed")
+            leg['sl_order_id'] = None
+            return fill_price
+        if status not in TERMINAL_ORDER_STATUSES:
+            raise RuntimeError(f"{instrument.name}: SL {leg['sl_order_id']} still {status!r} after cancel - leaving leg open and protected")
+        leg['sl_order_id'] = None
     return _exit_chase_fill(instrument, 'BUY', leg['quantity'], _fresh_ltp, order_tag=_order_tag(opt, TAG_EXIT, leg['leg_id']))
 
 
@@ -850,7 +891,10 @@ def _enter_straddle(day, market, cfg, strike, why):
         instrument = _to_instrument(contract)
         quantity = instrument.lot_size * cfg['lots']  # MCX quantity is in lots (GOLDM lot_size = 1)
         leg_id = _new_leg_id()
-        tasks[opt] = (lambda i=instrument, q=quantity, l=ltp, o=opt, lid=leg_id: (i, q, lid, _short_leg(i, q, l, o, lid)))
+        def _task(i=instrument, q=quantity, l=ltp, o=opt, lid=leg_id):
+            fill = _short_leg(i, q, l, o, lid)
+            return i, q, lid, fill, _place_leg_stop(i, q, fill, o, lid)
+        tasks[opt] = _task
     if not tasks:
         return
     results = _in_parallel(tasks)
@@ -858,8 +902,9 @@ def _enter_straddle(day, market, cfg, strike, why):
         if isinstance(res, Exception):
             alert(f'{opt} {strike} entry failed: {res}', level=logging.ERROR)
             continue
-        instrument, quantity, leg_id, fill = res
-        straddle[opt] = dict(instrument=instrument, strike=strike, entry_price=fill, quantity=quantity, leg_id=leg_id)
+        instrument, quantity, leg_id, fill, sl_order_id = res
+        straddle[opt] = dict(instrument=instrument, strike=strike, entry_price=fill, quantity=quantity,
+                             leg_id=leg_id, sl_order_id=sl_order_id)
     if straddle and day['straddle'] is None:
         day['straddle_count'] += 1
     day['straddle'] = straddle or None
@@ -907,6 +952,39 @@ def _close_straddle(day, market, cfg, reason):
     return day['straddle'] is None
 
 
+def _check_leg_stops(day, cfg):
+    """A leg whose resting SL has filled is closed at that fill; returns True if any fired. A SL
+    found rejected/cancelled by someone else is reported (the leg is then unprotected at the broker)."""
+    if DRY_RUN or not day['straddle']:
+        return False
+    if not any(leg.get('sl_order_id') for leg in day['straddle'].values()):
+        return False
+    book = _read_order_book_or_none('leg SL check')
+    if book is None:
+        return False
+    fired = []
+    for opt, leg in list(day['straddle'].items()):
+        o = _find_order(book, leg.get('sl_order_id'))
+        if o is None:
+            continue
+        status = _status(o)
+        if status == 'complete':
+            fill = float(o.get('averageTradedPrice') or 0) or round(leg['entry_price'] * (1 + LEG_SL_PCT))
+            pts = leg['entry_price'] - fill
+            day['realized_pts'] += pts
+            fired.append(f"{opt} {leg['entry_price']} -> {fill} ({_rs(pts, cfg):+,.0f})")
+            del day['straddle'][opt]
+        elif status in ('rejected', 'cancelled'):
+            alert(f"{leg['instrument'].name}: dead-man SL {leg['sl_order_id']} is {status} ({o.get('rejectionReason') or ''}) - leg unprotected at the broker", level=logging.CRITICAL)
+            leg['sl_order_id'] = None
+    if not fired:
+        return False
+    if not day['straddle']:
+        day['straddle'] = None
+    alert(f"LEG STOPLOSS (dead-man SL filled): {'; '.join(fired)} - closing the rest | day {_rs(day['realized_pts'], cfg):+,.0f} Rs", level=logging.WARNING)
+    return True
+
+
 def _finish_close(day, market, cfg, reason):
     """Close the straddle for `reason`; if a leg stays open, remember the reason in day['closing']
     so every following poll retries the close (never re-enters the leg already closed). Once flat:
@@ -918,9 +996,10 @@ def _finish_close(day, market, cfg, reason):
     if reason == 'DAILY_LOSS_LIMIT':
         day['halted'] = True
     elif reason in ('TARGET', 'STOPLOSS'):
-        day['waiting'] = dict(strike=market['atm'], premium=_straddle_premium(market, market['atm']),
+        traded = day['straddle_strike']  # the closed straddle's strike - not wherever ATM is now
+        day['waiting'] = dict(strike=traded, premium=_straddle_premium(market, traded),
                               direction=1 if reason == 'TARGET' else -1)
-        log.info(f"waiting to restart: ATM {market['atm']} change, or ATM premium "
+        log.info(f"waiting to restart: ATM moving off {traded} (now {market['atm']}), or its straddle premium "
                  f"{'+' if reason == 'TARGET' else '-'}{_points(cfg['reentry_rs'], cfg):.0f} pts from {day['waiting']['premium']}")
 
 
@@ -931,6 +1010,10 @@ def _strategy_tick(day, market, cfg):
 
     if day['closing'] is not None:  # a close that left a leg open - finish it before anything else
         _finish_close(day, market, cfg, day['closing'])
+        return
+
+    if _check_leg_stops(day, cfg):  # a dead-man SL filled -> close the rest, treat as a STOPLOSS
+        _finish_close(day, market, cfg, 'STOPLOSS')
         return
 
     if day['straddle']:
@@ -984,13 +1067,32 @@ def _adopt_open_positions(day, market):
         if entry is None:
             entry = market['price'].get((strike, opt)) or 0.0
             log.warning(f"{opt} {strike}: couldn't reconstruct entry price - using live LTP {entry} (approximate)")
-        straddle[opt] = dict(instrument=_to_instrument(contract), strike=strike, entry_price=entry,
-                             quantity=abs(qty), leg_id=_new_leg_id())
+        instrument, leg_id = _to_instrument(contract), _new_leg_id()
+        sl_order_id = _find_resting_leg_stop(token)
+        if sl_order_id is None:
+            sl_order_id = _place_leg_stop(instrument, abs(qty), entry, opt, leg_id)
+        straddle[opt] = dict(instrument=instrument, strike=strike, entry_price=entry,
+                             quantity=abs(qty), leg_id=leg_id, sl_order_id=sl_order_id)
     if straddle:
         day['straddle'], day['straddle_count'] = straddle, 1
         day['straddle_strike'] = next(iter(straddle.values()))['strike']
         alert('Adopted open positions: ' + ', '.join(f"{o} {l['instrument'].name} @ {l['entry_price']:.2f}" for o, l in straddle.items()), level=logging.WARNING)
     return bool(straddle)
+
+
+def _find_resting_leg_stop(token):
+    """Broker id of a still-resting SL BUY of ours on `token` (adoption after a restart), else None."""
+    try:
+        book = _get_order_book()
+    except Exception as exc:
+        log.warning(f'could not read order book to find a resting SL for token {token}: {exc}')
+        return None
+    for o in book:
+        tag = (_tag_of(o) or '').lower()
+        if (str(o.get('instrumentId')) == str(token) and tag.startswith(TAG_PREFIX.lower()) and tag[len(TAG_PREFIX) + 1:len(TAG_PREFIX) + 2] == TAG_SL.lower()
+                and str(o.get('transactionType', '')).upper() == 'BUY' and _status(o) not in TERMINAL_ORDER_STATUSES):
+            return o.get('brokerOrderId')
+    return None
 
 
 def _infer_entry_price(token, quantity):

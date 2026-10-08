@@ -4,7 +4,7 @@ Live runner for the opening-range failed-breakout reversal on 99 NSE stocks.
 Layers (each in its own file, this one only wires them together):
   data      stock_data_zerodha.py         - Zerodha historical API, 1-minute candles
   rules     stock_signal_range_reversal.py - range / arming / first-break logic, prices, sizing
-  execution stock_broker_aliceblue.py      - AliceBlue orders (or PaperBroker when DRY_RUN)
+  execution stock_broker_finvasia.py       - Finvasia (Shoonya) orders (or PaperBroker when DRY_RUN)
 
 Day timeline (IST):
   start ~10:10   auth both brokers, load instruments, load account equity
@@ -26,7 +26,7 @@ filled entry gets its stop within a few seconds.
 Daily cap: at most 10 entries fill per day. Several entry orders can rest at once; when the 10th
 fills, the rest are cancelled (two filling in the same second could overshoot - logged).
 
-Entry orders are placed only when price is near them: AliceBlue blocks margin for resting orders as
+Entry orders are placed only when price is near them: the broker blocks margin for resting orders as
 well as positions, and on a busy day 15-20 stocks can be waiting for their second break at once -
 far more than the margin can carry as resting orders. So a first break only ARMS the stock; every
 15 s one batch LTP call checks all armed stocks, and the SL-limit entry is placed once price is
@@ -73,7 +73,7 @@ from datetime import datetime, timedelta
 from stock_common import HERE, alert, get_logger, now_ist
 import stock_signal_range_reversal as rules
 from stock_data_zerodha import ZerodhaMinuteData
-from stock_broker_aliceblue import AliceBlueBroker, PaperBroker
+from stock_broker_finvasia import FinvasiaBroker, PaperBroker
 
 DRY_RUN = os.getenv('DRY_RUN', 'true').lower() != 'false'
 
@@ -102,7 +102,7 @@ REFRESH_DELAY_SECONDS = 3           # fetch a minute's candle this long after th
 HEARTBEAT_EVERY = timedelta(minutes=30)
 EXIT_FILL_TIMEOUT_SECONDS = 60
 
-# charges used for the P&L / equity bookkeeping (AliceBlue equity intraday)
+# charges used for the P&L / equity bookkeeping (equity intraday)
 BROKERAGE_PER_ORDER, BROKERAGE_RATE = 20.0, 0.0005
 STT_SELL, EXCHANGE_TXN, SEBI, STAMP_BUY, GST = 0.00025, 0.0000297, 0.000001, 0.00003, 0.18
 
@@ -171,11 +171,11 @@ class Runner:
         self.state_file = os.path.join(STATE_DIR, f'trades_{self.day:%Y%m%d}.json')
         self.lock = threading.RLock()
         self.signals = queue.Queue()
-        self.broker = PaperBroker(log) if DRY_RUN else AliceBlueBroker(log)
+        self.broker = PaperBroker(log) if DRY_RUN else FinvasiaBroker(log)
         self.instruments = self.broker.instruments(UNIVERSE)
         missing = sorted(set(UNIVERSE) - set(self.instruments))
         if missing:
-            log.warning(f'AliceBlue: no NSE EQ contract for {missing} - these stocks are skipped')
+            log.warning(f'Finvasia: no NSE EQ contract for {missing} - these stocks are skipped')
         self.data = ZerodhaMinuteData([s for s in UNIVERSE if s in self.instruments], log)
         self.machines = {s: rules.RangeReversal(s) for s in self.data.symbols}
         eq = load_equity()
