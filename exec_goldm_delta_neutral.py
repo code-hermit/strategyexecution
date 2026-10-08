@@ -72,6 +72,7 @@ Every JSONL record has ts, event and dry_run; read them with pandas.read_json(pa
 
 import csv
 import io
+import itertools
 import json
 import logging
 import math
@@ -195,7 +196,8 @@ DRY_RUN = os.getenv('DRY_RUN', 'true').lower() != 'false'  # set DRY_RUN=false t
 EVENT_LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
 TRADES_CSV = os.path.join(EVENT_LOG_DIR, f'exec_goldm_delta_neutral_{_ARGV_SYMBOL}_trades.csv')
 TRADES_CSV_FIELDS = ['date', 'straddle', 'option_type', 'strike', 'symbol', 'entry_time', 'entry_price', 'entry_ref_ltp',
-                     'exit_time', 'exit_price', 'exit_ref_ltp', 'pts', 'lots', 'pnl_rs', 'reason', 'dry_run']
+                     'entry_slip_pts', 'exit_time', 'exit_price', 'exit_ref_ltp', 'exit_slip_pts', 'pts', 'lots', 'pnl_rs',
+                     'reason', 'dry_run']  # slip: points against us vs the reference (decision LTP; a broker stop's trigger)
 
 
 def _fmt(value):
@@ -433,6 +435,7 @@ LIMIT_OFFSET_PCT = 0.05  # first marketable reprice this far through LTP ...
 CHASE_OFFSET_STEP = 0.05  # ... widened by this ...
 CHASE_WAIT_SECONDS = 2  # ... every this many seconds ...
 CHASE_MAX_OFFSET_PCT = 0.15  # ... up to this (under AliceBlue's ~20%-from-LTP MCX price band)
+CHASE_MAX_STEPS = 30  # ~60 s of repricing; then the order is cancelled and the caller retries / reports
 ALICEBLUE_PRODUCT = 'LONGTERM'  # = NRML - AliceBlue blocks MIS/INTRADAY on MCX GOLDM options (see exec_rsv_goldm.py)
 TERMINAL_ORDER_STATUSES = {'complete', 'rejected', 'cancelled'}
 _ALICEBLUE_EMPTY_RESULT_STATUSES = {'EC920'}
@@ -658,7 +661,25 @@ def _counts_toward_position(o):
 
 
 # ── Orders ──────────────────────────────────────────────────────────────────────────────────────
-def _place_order(transaction_type, instrument, quantity, order_type, price='0', trigger_price=None, order_tag=None):
+_REQUEST_SEQ = itertools.count(1)
+
+
+def _logged_post(kind, path, payload, summary, ref_ltp=None):
+    """POST to AliceBlue with the exact payload execution-logged BEFORE it is sent ('<kind>_request',
+    file only - on record even if the call hangs or the process dies), and any error after
+    ('<kind>_failed', then re-raised). The caller logs the response as '<kind>' with the same
+    req_id. ref_ltp: the live LTP the order was priced off, for slippage. Returns (req_id, result, t0)."""
+    req_id = next(_REQUEST_SEQ)
+    EXECUTION(f'{kind}_request', echo=False, req_id=req_id, path=path, ref_ltp=ref_ltp, **summary, payload=payload)
+    t0 = time_module.time()
+    try:
+        return req_id, _aliceblue_post(path, payload), t0
+    except Exception as exc:
+        EXECUTION(f'{kind}_failed', level=logging.WARNING, req_id=req_id, ref_ltp=ref_ltp, **summary, error=str(exc), ms=_ms_since(t0))
+        raise
+
+
+def _place_order(transaction_type, instrument, quantity, order_type, price='0', trigger_price=None, order_tag=None, ref_ltp=None):
     payload = [{
         'exchange': instrument.exchange,
         'instrumentId': str(instrument.token),
@@ -674,30 +695,20 @@ def _place_order(transaction_type, instrument, quantity, order_type, price='0', 
     }]
     request = dict(side=transaction_type, symbol=instrument.name, token=instrument.token, qty=quantity,
                    order_type=order_type, price=price, trigger=trigger_price, tag=order_tag)
-    t0 = time_module.time()
-    try:
-        result = _aliceblue_post('/orders/placeorder', payload)
-    except Exception as exc:
-        EXECUTION('place_failed', level=logging.WARNING, **request, error=str(exc), ms=_ms_since(t0))
-        raise
+    req_id, result, t0 = _logged_post('place', '/orders/placeorder', payload, request, ref_ltp)
     result = result[0] if isinstance(result, list) and len(result) == 1 else result
     order_id = result.get('brokerOrderId') if isinstance(result, dict) else None
-    EXECUTION('place', **request, order_id=order_id, response=result, ms=_ms_since(t0))
+    EXECUTION('place', req_id=req_id, ref_ltp=ref_ltp, **request, order_id=order_id, response=result, ms=_ms_since(t0))
     return result
 
 
 def _cancel_order(broker_order_id):
-    t0 = time_module.time()
-    try:
-        result = _aliceblue_post('/orders/cancel', {'brokerOrderId': broker_order_id})
-    except Exception as exc:
-        EXECUTION('cancel_failed', level=logging.WARNING, order_id=broker_order_id, error=str(exc), ms=_ms_since(t0))
-        raise
-    EXECUTION('cancel', order_id=broker_order_id, response=result, ms=_ms_since(t0))
+    req_id, result, t0 = _logged_post('cancel', '/orders/cancel', {'brokerOrderId': broker_order_id}, dict(order_id=broker_order_id))
+    EXECUTION('cancel', req_id=req_id, order_id=broker_order_id, response=result, ms=_ms_since(t0))
     return result
 
 
-def _modify_order(broker_order_id, quantity, order_type, price, trigger_price=None):
+def _modify_order(broker_order_id, quantity, order_type, price, trigger_price=None, ref_ltp=None):
     payload = {
         'brokerOrderId': broker_order_id,
         'quantity': quantity,
@@ -707,13 +718,8 @@ def _modify_order(broker_order_id, quantity, order_type, price, trigger_price=No
         'validity': 'DAY',
     }
     request = dict(order_id=broker_order_id, qty=quantity, order_type=order_type, price=price, trigger=trigger_price)
-    t0 = time_module.time()
-    try:
-        result = _aliceblue_post('/orders/modify', payload)
-    except Exception as exc:
-        EXECUTION('modify_failed', level=logging.WARNING, **request, error=str(exc), ms=_ms_since(t0))
-        raise
-    EXECUTION('modify', **request, response=result, ms=_ms_since(t0))
+    req_id, result, t0 = _logged_post('modify', '/orders/modify', payload, request, ref_ltp)
+    EXECUTION('modify', req_id=req_id, ref_ltp=ref_ltp, **request, response=result, ms=_ms_since(t0))
     return result
 
 
@@ -767,7 +773,7 @@ def _limit_then_market(instrument, transaction_type, quantity, get_fresh_ltp, or
     if ltp is None:
         raise RuntimeError(f'{instrument.name}: no LTP available to place {transaction_type} order')
     price = _round_to_tick(ltp, instrument.tick_size)
-    order = _place_order(transaction_type, instrument, quantity, 'LIMIT', price=str(price), order_tag=order_tag)
+    order = _place_order(transaction_type, instrument, quantity, 'LIMIT', price=str(price), order_tag=order_tag, ref_ltp=ltp)
     order_no = order.get('brokerOrderId')
     if not order_no:
         raise RuntimeError(f'{instrument.name} {transaction_type} order rejected: {order}')
@@ -789,13 +795,26 @@ def _chase_fill(instrument, transaction_type, quantity, get_fresh_ltp, order_tag
     """Reprice `order_no` (a resting LIMIT) to LTP +/- LIMIT_OFFSET_PCT, widening by CHASE_OFFSET_STEP
     every CHASE_WAIT_SECONDS up to CHASE_MAX_OFFSET_PCT (inside AliceBlue's ~20% MCX price band),
     until it fills - modify in place; cancel + place-new once a modify fails (see exec_rsv_goldm.py).
-    Returns (fill price, the order that filled, reprice steps taken)."""
+    Returns (fill price, the order that filled, reprice steps taken). Gives up after CHASE_MAX_STEPS:
+    the order is cancelled (a fill that beat the cancel is returned) and RuntimeError raised - an exit
+    is then retried next poll, an entry reported failed - so a chase never blocks the main loop or
+    the 23:00 square-off."""
     sign = 1 if transaction_type == 'BUY' else -1
     offset_pct = LIMIT_OFFSET_PCT
     modify_broken = False
     step = 0
     while True:
         step += 1
+        if step > CHASE_MAX_STEPS:
+            status, fill_price = _cancel_and_confirm(order_no, f'{instrument.name} {transaction_type} chase give-up')
+            if status == 'complete':
+                return fill_price, order_no, step - 1
+            EXECUTION('chase_gave_up', level=logging.ERROR, symbol=instrument.name, side=transaction_type, tag=order_tag,
+                      order_id=order_no, steps=CHASE_MAX_STEPS, cancel_status=status)
+            if status not in TERMINAL_ORDER_STATUSES:
+                alert(f'{instrument.name}: {transaction_type} order {order_no} gave up after {CHASE_MAX_STEPS} reprices and its cancel '
+                      f'is unconfirmed ({status!r}) - CHECK MANUALLY', level=logging.CRITICAL)
+            raise RuntimeError(f'{instrument.name}: {transaction_type} not filled after {CHASE_MAX_STEPS} reprices - order cancelled')
         ltp = get_fresh_ltp()
         if ltp is None:
             raise RuntimeError(f'{instrument.name}: no LTP available to reprice {transaction_type} order')
@@ -803,7 +822,7 @@ def _chase_fill(instrument, transaction_type, quantity, get_fresh_ltp, order_tag
         method = 'modify'
         if not modify_broken:
             try:
-                _modify_order(order_no, quantity, 'LIMIT', price)
+                _modify_order(order_no, quantity, 'LIMIT', price, ref_ltp=ltp)
             except Exception as exc:
                 modify_broken = True
                 log.warning(f'{instrument.name}: modify of order {order_no} failed ({exc}) - cancel+place-new from now on')
@@ -818,7 +837,7 @@ def _chase_fill(instrument, transaction_type, quantity, get_fresh_ltp, order_tag
                 if fill_price is not None:
                     return fill_price, order_no, step
                 continue
-            order = _place_order(transaction_type, instrument, quantity, 'LIMIT', price=str(price), order_tag=order_tag)
+            order = _place_order(transaction_type, instrument, quantity, 'LIMIT', price=str(price), order_tag=order_tag, ref_ltp=ltp)
             order_no = order.get('brokerOrderId')
             if not order_no:
                 raise RuntimeError(f'{instrument.name} {transaction_type} order rejected: {order}')
@@ -984,25 +1003,38 @@ def _fetch_market_until_success(symbol, cfg, day):
 
 
 # ── Legs ────────────────────────────────────────────────────────────────────────────────────────
-def _fresh_ltp_fn(instrument, fallback_ltp):
+def _fresh_ltp_fn(instrument, strike, opt, fallback_ltp):
+    """Zero-arg live-LTP getter for a leg, used while working its orders. The price is read through
+    the leg's KITE instrument (looked up by strike/type in today's Kite chain, as _fetch_market does)
+    - AliceBlue's trading symbol (e.g. GOLDM29OCT26C149000) is not a Kite key (GOLDM26OCT149000CE).
+    Redis first (mcx_ticker_service.py), REST fallback; if both fail, `fallback_ltp` (the snapshot
+    the order started from) is returned and the fallback is execution-logged."""
     def _fresh_ltp():
-        key = f'{instrument.exchange}:{instrument.name}'
         try:
-            ltp = _zerodha_quote_ltp([key]).get(key)
-        except Exception:
-            ltp = None
-        return ltp if ltp is not None else fallback_ltp
+            row = _zerodha_option_row(_zerodha_options_cache[instrument.symbol]['options'], strike, opt)
+            key = f"{row['exchange']}:{row['tradingsymbol']}"
+            token = int(row['instrument_token'])
+            zerodha_ltp_client.register_subscription(token)
+            ltp = zerodha_ltp_client.get_ltp(token, rest_fetch=lambda: _zerodha_quote_ltp([key])[key], log=log)
+            if ltp is not None:
+                return ltp
+            error = 'no price returned'
+        except Exception as exc:
+            error = str(exc)
+        EXECUTION('ltp_fallback', level=logging.WARNING, symbol=instrument.name, strike=strike, opt=opt,
+                  fallback_ltp=fallback_ltp, error=error)
+        return fallback_ltp
     return _fresh_ltp
 
 
-def _short_leg(instrument, quantity, ltp, opt, leg_id):
+def _short_leg(instrument, quantity, ltp, strike, opt, leg_id):
     """SELL to open: LIMIT at LTP, made marketable after LIMIT_WAIT_SECONDS. Returns the fill
     price (the LTP in DRY_RUN)."""
     tag = _order_tag(opt, TAG_ENTRY, leg_id)
     if DRY_RUN:
         EXECUTION('dry_fill', side='SELL', symbol=instrument.name, tag=tag, qty=quantity, fill_price=ltp)
         return ltp
-    return _limit_then_market(instrument, 'SELL', quantity, _fresh_ltp_fn(instrument, ltp), tag)
+    return _limit_then_market(instrument, 'SELL', quantity, _fresh_ltp_fn(instrument, strike, opt, ltp), tag)
 
 
 def _leg_stop_trigger(entry_price):
@@ -1042,7 +1074,7 @@ def _buy_back_leg(leg, opt, fallback_ltp):
     the exit; if the cancel can't be confirmed, raise and leave the leg open and protected), then
     LIMIT at LTP made marketable after LIMIT_WAIT_SECONDS. Returns the fill price (LTP in DRY_RUN)."""
     instrument = leg['instrument']
-    fresh_ltp = _fresh_ltp_fn(instrument, fallback_ltp)
+    fresh_ltp = _fresh_ltp_fn(instrument, leg['strike'], opt, fallback_ltp)
     if DRY_RUN:
         fill = fresh_ltp()
         EXECUTION('dry_fill', side='BUY', symbol=instrument.name, tag=_order_tag(opt, TAG_EXIT, leg['leg_id']),
@@ -1103,10 +1135,12 @@ def _record_exit(day, cfg, opt, fill, reason, ref_ltp=None):
     if reason == 'LEG_STOPLOSS' and COST_STOP_AFTER_SL:
         day['cost_pending'] = True
     now = datetime.now()
+    entry_ref = leg.get('entry_ref_ltp')
     row = dict(date=now.date().isoformat(), straddle=leg['straddle'], option_type=opt, strike=leg['strike'],
                symbol=leg['instrument'].name, entry_time=leg['entry_time'], entry_price=leg['entry_price'],
-               entry_ref_ltp=leg.get('entry_ref_ltp'), exit_time=now.isoformat(timespec='seconds'), exit_price=fill,
-               exit_ref_ltp=ref_ltp, pts=round(pts, 2), lots=cfg['lots'], pnl_rs=round(_rs(pts, cfg), 2), reason=reason,
+               entry_ref_ltp=entry_ref, entry_slip_pts=None if entry_ref is None else round(entry_ref - leg['entry_price'], 2),
+               exit_time=now.isoformat(timespec='seconds'), exit_price=fill, exit_ref_ltp=ref_ltp,
+               exit_slip_pts=None if ref_ltp is None else round(fill - ref_ltp, 2), pts=round(pts, 2), lots=cfg['lots'], pnl_rs=round(_rs(pts, cfg), 2), reason=reason,
                dry_run=DRY_RUN)
     DECISION('leg_exit', echo=False, **{k: v for k, v in row.items() if k not in ('date', 'dry_run')},
              held_min=round((now - leg['entry_dt']).total_seconds() / 60, 1), day_realized_rs=round(_rs(day['realized_pts'], cfg)))
@@ -1148,8 +1182,8 @@ def _enter_straddle(day, market, cfg, strike, why):
         quantity = instrument.lot_size * cfg['lots']  # MCX quantity is in lots (GOLDM lot_size = 1)
         leg_id = _new_leg_id()
 
-        def _task(i=instrument, q=quantity, l=ltp, o=opt, lid=leg_id):
-            fill = _short_leg(i, q, l, o, lid)
+        def _task(i=instrument, q=quantity, l=ltp, k=strike, o=opt, lid=leg_id):
+            fill = _short_leg(i, q, l, k, o, lid)
             return i, q, lid, l, fill, _place_leg_stop(i, q, fill, o, lid)
         tasks[opt] = _task
     if not tasks:
@@ -1230,7 +1264,7 @@ def _check_leg_stops(day, market, cfg):
                 DECISION('stop_filled_at_broker', echo=False, opt=opt, strike=leg['strike'], entry=leg['entry_price'],
                          trigger=trigger, fill=fill, ltp=ltp, sl_order_id=leg['sl_order_id'], reason=reason)
                 leg['sl_order_id'] = None
-                alert(f"{reason} (SL filled): {_record_exit(day, cfg, opt, fill, reason, ltp)} | day {_rs(day['realized_pts'], cfg):+,.0f} Rs",
+                alert(f"{reason} (SL filled): {_record_exit(day, cfg, opt, fill, reason, trigger)} | day {_rs(day['realized_pts'], cfg):+,.0f} Rs",
                       level=logging.WARNING)
                 continue
             if status in ('rejected', 'cancelled'):
