@@ -35,7 +35,7 @@ Rules (backtested as --otm-strikes 0 --leg-sl-pct 10 --leg-target-pct 20 --leg-t
     expiry-day data either).
 
 Orders: every entry and exit is a LIMIT at the live LTP; if it hasn't filled within
-LIMIT_WAIT_SECONDS (60 s) it is "converted to market" - AliceBlue refuses MARKET orders on these
+LIMIT_WAIT_SECONDS (15 s) it is "converted to market" - AliceBlue refuses MARKET orders on these
 options, so instead it is repriced to a marketable LIMIT (LTP +/- 5%, i.e. through the book so it
 fills at once), widened 5% every CHASE_WAIT_SECONDS up to 15% (inside AliceBlue's ~20% MCX price
 band) until it fills.
@@ -429,7 +429,7 @@ def get_spot_ltp(symbol, cfg):
 ALICEBLUE_TOKEN_FILE = os.path.join(os.path.dirname(__file__), 'aliceblue_token.json')
 ALICEBLUE_BASE_URL = 'https://a3.aliceblueonline.com/open-api/od/v1'
 ALICEBLUE_CONTRACT_MASTER_URL = 'https://v2api.aliceblueonline.com/restpy/static/contract_master/V2/{exchange}'
-LIMIT_WAIT_SECONDS = 60  # a LIMIT at LTP gets this long to fill before it's repriced to be marketable
+LIMIT_WAIT_SECONDS = 15  # a LIMIT at LTP gets this long to fill before it's repriced to be marketable
 # AliceBlue refuses MARKET orders on these options - "market" is a LIMIT priced through the LTP:
 LIMIT_OFFSET_PCT = 0.05  # first marketable reprice this far through LTP ...
 CHASE_OFFSET_STEP = 0.05  # ... widened by this ...
@@ -440,6 +440,11 @@ ALICEBLUE_PRODUCT = 'LONGTERM'  # = NRML - AliceBlue blocks MIS/INTRADAY on MCX 
 TERMINAL_ORDER_STATUSES = {'complete', 'rejected', 'cancelled'}
 _ALICEBLUE_EMPTY_RESULT_STATUSES = {'EC920'}
 SL_LIMIT_OFFSET_PCT = 0.02  # SL limit above its trigger - stays inside the ~20% LTP band
+# AliceBlue's MCX quantity units are inconsistent: /orders/placeorder takes LOTS (1 = one GOLDM lot), but
+# /orders/modify and /positions (netQuantity) and the order book's quantity are in UNITS - 100 per GOLDM
+# lot (100 g). Seen live 8 Oct 2026: modify with quantity 1 -> EC954 "'quantity' should be a multiple of
+# the lot size"; a 1-lot short showed netQuantity -100. Leg quantities in this file are always LOTS.
+ALICEBLUE_UNITS_PER_LOT = 100
 
 
 def _status(o):
@@ -711,7 +716,7 @@ def _cancel_order(broker_order_id):
 def _modify_order(broker_order_id, quantity, order_type, price, trigger_price=None, ref_ltp=None):
     payload = {
         'brokerOrderId': broker_order_id,
-        'quantity': quantity,
+        'quantity': quantity * ALICEBLUE_UNITS_PER_LOT,  # modify takes units, not lots (see ALICEBLUE_UNITS_PER_LOT)
         'orderType': order_type,
         'price': str(price),
         'slTriggerPrice': str(trigger_price) if trigger_price is not None else '',
@@ -1457,26 +1462,27 @@ def _adopt_open_positions(day, market):
     for token, pos in open_legs.items():
         contract = market['contracts_by_token'][token]
         opt, strike = contract['option_type'], int(float(contract['strike_price']))
-        qty = int(pos['netQuantity'])
-        if qty > 0 or opt in day['legs']:
-            alert(f'Unexpected position {contract["trading_symbol"]} net {qty} - not adopted, handle manually', level=logging.CRITICAL)
+        qty = int(pos['netQuantity'])  # units (see ALICEBLUE_UNITS_PER_LOT)
+        lots, odd_units = divmod(abs(qty), ALICEBLUE_UNITS_PER_LOT)
+        if qty > 0 or opt in day['legs'] or odd_units or not lots:
+            alert(f'Unexpected position {contract["trading_symbol"]} net {qty} units - not adopted, handle manually', level=logging.CRITICAL)
             continue
-        entry = _infer_entry_price(token, abs(qty))
+        entry = _infer_entry_price(token, abs(qty))  # order book quantities are units too
         if entry is None:
             entry = market['price'].get((strike, opt)) or 0.0
             log.warning(f"{opt} {strike}: couldn't reconstruct entry price - using live LTP {entry} (approximate)")
         instrument, leg_id = _to_instrument(contract), _new_leg_id()
         sl_order_id, stop_trigger = _find_resting_leg_stop(token)
         if sl_order_id is None:
-            sl_order_id = _place_leg_stop(instrument, abs(qty), entry, opt, leg_id)
+            sl_order_id = _place_leg_stop(instrument, lots, entry, opt, leg_id)
         if sl_order_id is None or stop_trigger is None:
             stop_trigger = _leg_stop_trigger(entry)
         adopted_at = datetime.now()
-        day['legs'][opt] = dict(instrument=instrument, strike=strike, entry_price=entry, quantity=abs(qty),
+        day['legs'][opt] = dict(instrument=instrument, strike=strike, entry_price=entry, quantity=lots,
                                 leg_id=leg_id, sl_order_id=sl_order_id, delta=None, sl_seen_at=None, straddle=1,
                                 stop_trigger=stop_trigger, at_cost=stop_trigger <= _cost_trigger(entry),
                                 entry_dt=adopted_at, entry_time=adopted_at.isoformat(timespec='seconds'), entry_ref_ltp=None)
-        DECISION('leg_adopted', echo=False, opt=opt, strike=strike, symbol=instrument.name, qty=abs(qty), entry=entry,
+        DECISION('leg_adopted', echo=False, opt=opt, strike=strike, symbol=instrument.name, lots=lots, net_units=qty, entry=entry,
                  entry_source='order book' if entry != market['price'].get((strike, opt)) else 'live LTP (approximate)',
                  sl_order_id=sl_order_id, stop_trigger=stop_trigger, at_cost=day['legs'][opt]['at_cost'])
     if not day['legs']:
@@ -1544,7 +1550,7 @@ def _reconcile(day, market):
     except Exception as exc:
         log.warning(f'reconcile: positions read failed ({exc})', extra={'no_telegram': True})
         return
-    broker = {int(t): abs(int(p['netQuantity'])) for t, p in open_legs.items()}
+    broker = {int(t): abs(int(p['netQuantity'])) / ALICEBLUE_UNITS_PER_LOT for t, p in open_legs.items()}  # lots
     ours = {leg['instrument'].token: leg['quantity'] for leg in day['legs'].values()}
     EXECUTION('reconcile', echo=broker != ours, level=logging.INFO if broker == ours else logging.ERROR,
               broker=broker, ours=ours, match=broker == ours)
