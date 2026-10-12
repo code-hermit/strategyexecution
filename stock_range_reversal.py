@@ -46,6 +46,7 @@ DRY_RUN=false in .env to trade.
 Files - everything this program writes is under execution/stock_range_reversal_data/:
   equity.json                    account equity + one line per day (compounding) - back this up
   stock_range_reversal.log       the log
+  finvasia_api.log               every Finvasia request and raw response (LIVE only)
   state/trades_<date>.json       the day's trades, rewritten on every change; on a restart they are
                                  reloaded so no stock is entered twice
   candles/candles_<date>.csv     the day's 1-minute candles for all stocks
@@ -113,6 +114,7 @@ for _d in (DATA_DIR, STATE_DIR, CANDLE_DIR):
     os.makedirs(_d, exist_ok=True)
 EQUITY_FILE = os.path.join(DATA_DIR, 'equity.json')
 LOG_FILE = os.path.join(DATA_DIR, 'stock_range_reversal.log')
+BROKER_LOG_FILE = os.path.join(DATA_DIR, 'finvasia_api.log')     # every broker request + response
 
 log = get_logger('stock_range_reversal', LOG_FILE, 'SRR' + (' PAPER' if DRY_RUN else ''))
 
@@ -171,7 +173,7 @@ class Runner:
         self.state_file = os.path.join(STATE_DIR, f'trades_{self.day:%Y%m%d}.json')
         self.lock = threading.RLock()
         self.signals = queue.Queue()
-        self.broker = PaperBroker(log) if DRY_RUN else FinvasiaBroker(log)
+        self.broker = PaperBroker(log) if DRY_RUN else FinvasiaBroker(log, BROKER_LOG_FILE)
         self.instruments = self.broker.instruments(UNIVERSE)
         missing = sorted(set(UNIVERSE) - set(self.instruments))
         if missing:

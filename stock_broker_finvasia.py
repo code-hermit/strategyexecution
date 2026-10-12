@@ -20,6 +20,7 @@ Every call is a form POST 'jData=<json>' with the OAuth access token as a Bearer
 """
 
 import json
+import logging
 import os
 import threading
 import time as time_module
@@ -66,17 +67,41 @@ def load_instruments(symbols):
     return out
 
 
+def _api_logger(log_file):
+    """Raw request/response log for every Finvasia call - its own file, never sent to Telegram."""
+    api_log = logging.getLogger('finvasia_api')
+    if not api_log.handlers:
+        api_log.setLevel(logging.INFO)
+        api_log.propagate = False
+        handler = logging.FileHandler(log_file)
+        handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+        api_log.addHandler(handler)
+    return api_log
+
+
 class FinvasiaBroker:
-    def __init__(self, log):
+    def __init__(self, log, api_log_file=None):
         self.log = log
+        self.api_log = _api_logger(api_log_file) if api_log_file else None
         self.access_token, self.uid, self.actid = self._valid_session()
         self._book_lock = threading.Lock()
         self._book, self._book_at = None, 0.0
 
     # ── auth / http ───────────────────────────────────────────────────────────────────────────
     def _raw_post(self, path, values, access_token):
-        resp = requests.post(f'{FINVASIA_BASE_URL}/{path}', data='jData=' + json.dumps(values),
-                             headers={'Authorization': f'Bearer {access_token}'}, timeout=REQUEST_TIMEOUT)
+        body = json.dumps(values)
+        started = time_module.time()
+        if self.api_log:
+            self.api_log.info(f'>> {path} {body}')
+        try:
+            resp = requests.post(f'{FINVASIA_BASE_URL}/{path}', data='jData=' + body,
+                                 headers={'Authorization': f'Bearer {access_token}'}, timeout=REQUEST_TIMEOUT)
+        except Exception as exc:
+            if self.api_log:
+                self.api_log.info(f'<< {path} EXCEPTION after {1000 * (time_module.time() - started):.0f}ms: {exc!r}')
+            raise
+        if self.api_log:
+            self.api_log.info(f'<< {path} {resp.status_code} {1000 * (time_module.time() - started):.0f}ms {resp.text}')
         if not resp.ok:                         # the rejection reason is in the body, keep it
             raise RuntimeError(f'Finvasia {path} failed ({resp.status_code}): {resp.text}')
         return resp.json()

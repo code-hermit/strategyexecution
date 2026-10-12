@@ -1,4 +1,20 @@
 """
+LADDER STOP (12 Oct 2026, ported from Data/backtests/rsv_ladder/rsv_ladder.py): the per-leg stop is no
+longer a flat 25%. It starts tight and widens only while the leg's premium creeps up, so a sudden spike
+is stopped small and a gradual move can still run to the full width:
+
+  stop width = latest minute close's 5% rung above sl_ref_price + 10%, kept between the start width and 30%
+    e.g. start 15%: close below +10% -> 15%, at +10% -> 20%, +15% -> 25%, +20% and above -> 30%
+         start 10%: close below +5% -> 10%, at +5% -> 15%, +10% -> 20%, +15% -> 25%, +20% -> 30%
+  - start width per underlying (LADDER): NIFTY 15% every day; SENSEX 10%, but 20% on expiry day (the
+    day the nearest expiry falls on);
+  - the width only changes on a minute CLOSE - the main loop wakes just after every minute boundary and
+    takes that snapshot's LTP as the minute that just ended's close (see run_ladder); when the rung
+    moves, the leg's resting SL order is MODIFIED in place to the new trigger;
+  - it follows the close both ways: a later close back below a rung narrows it again;
+  - a checkpoint repin of sl_ref_price (_reprice_leg_stoploss) restarts it at the start width.
+Everything below that mentions a flat STOPLOSS_PCT now means "the leg's current ladder width".
+
 Live execution of Data/backtests/backtest_rs_adjust_sl.py - a variant of exec_rsv_cont_chop.py
 (everything below through the CHOP section is carried over from it unchanged) with ONE addition on
 top: at every checkpoint, any leg that is "old" - already open coming into that checkpoint and left
@@ -281,7 +297,15 @@ WARMUP_POLL_SECONDS = 2  # how often the warm-up loop (WARMUP_TIME -> ENTRY_TIME
 # ENTRY_TIME lands within ~2s of it.
 
 FIRST_OTM_STRIKES = 0  # 0 = ATM; n = n strikes OTM (CE up, PE down)
-STOPLOSS_PCT = 0.25  # per-leg resting stoploss, flat across every underlying - matches the backtest exactly
+LADDER = {  # per-leg stop's starting width: (normal day, expiry day) - see module docstring / rsv_ladder.py
+    'NIFTY': (0.15, 0.15),
+    'SENSEX': (0.10, 0.20),
+}
+LADDER_STEP = 0.05  # rung size
+LADDER_GAP = 0.10  # stop sits this far above the latest close's rung
+LADDER_MAX = 0.30  # widest the stop gets
+LADDER_CLOSE_DELAY_SECONDS = 0.5  # main loop wakes this long after each minute boundary so its LTP
+# snapshot is the minute that just ended's close - see run_ladder
 CHOP_ENABLED = False  # 30 Sep 2026: False = no chop reentry after a STOPLOSS - the leg stays flat until
 # the next checkpoint reopens it. Matches Data/backtests/backtest_rs_v3_corrected_no_chop.py (repin on,
 # no chop), which beat every chop variant on both NIFTY and SENSEX since 2024. True = old behaviour.
@@ -1056,18 +1080,27 @@ def _new_state():
     return {opt: None for opt in OPTION_TYPES}  # None, or {'instrument','strike','entry_price','quantity'}
 
 
-def _place_protective_sl(instrument, quantity, entry_price, order_tag):
-    """Resting BUY SL (stop-loss LIMIT) at entry_price * (1 + STOPLOSS_PCT) - flat percentage
-    across every underlying, matching the backtest exactly (see module docstring on why there's no
-    SENSEX points-based override here, unlike execution_rolling_straddle_variation_mn_hs_fn.py).
-    Shared by a leg's very first entry (_short_leg_with_stoploss) and every chop reentry after it
-    (_handle_chop_fill) - each gets its own fresh stoploss off wherever it actually filled, not off
-    the checkpoint's pinned original level. Returns the protective order's broker order id, or None
-    in DRY_RUN (nothing is actually placed)."""
+def _ladder_pct(leg):
+    """This leg's current stop width - see module docstring. leg['sl_start']/leg['rung'] are
+    stamped when the leg is installed."""
+    return min(LADDER_MAX, max(leg['sl_start'], leg['rung'] * LADDER_STEP + LADDER_GAP))
+
+
+def _sl_trigger(ref_price, sl_pct):
     # Rounded to the nearest integer, not just a tick - the exchange rejects SL trigger
     # prices for these contracts with "STOP PRICE IS NOT REASONABLE" unless they're whole
     # rupees.
-    trigger_price = round(entry_price * (1 + STOPLOSS_PCT))
+    return round(ref_price * (1 + sl_pct))
+
+
+def _place_protective_sl(instrument, quantity, entry_price, order_tag, sl_pct):
+    """Resting BUY SL (stop-loss LIMIT) at entry_price * (1 + sl_pct) - sl_pct is the ladder's
+    starting width for the day (day['sl_start'], see LADDER); run_ladder widens/narrows it from
+    there. Shared by a leg's very first entry (_short_leg_with_stoploss) and every chop reentry
+    after it (_handle_chop_fill) - each gets its own fresh stoploss off wherever it actually filled,
+    not off the checkpoint's pinned original level. Returns the protective order's broker order id,
+    or None in DRY_RUN (nothing is actually placed)."""
+    trigger_price = _sl_trigger(entry_price, sl_pct)
     # Nearest integer, not a tick - same "STOP PRICE IS NOT REASONABLE" rejection applies to the
     # SL order's limit price as well as its trigger.
     sl_limit_price = round(trigger_price * (1 + LIMIT_OFFSET_PCT))
@@ -1104,7 +1137,7 @@ def _place_chop_reentry(instrument, quantity, original_entry_price, order_tag):
     return order_no
 
 
-def _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id):
+def _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id, sl_pct):
     """SELL to open, then hand off to _place_protective_sl. Returns (fill_price, sl_order_id) -
     sl_order_id (None in DRY_RUN) is kept by the caller so a later checkpoint can MODIFY this same
     resting order in place (see _reprice_leg_stoploss) rather than track the stoploss by trigger
@@ -1124,7 +1157,7 @@ def _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id):
         entry_price = _wait_for_fill_price(order_no)
     except TimeoutError:
         entry_price = _settle_timed_out_entry(opt, order_no, instrument)
-    sl_order_id = _place_protective_sl(instrument, quantity, entry_price, order_tag=_order_tag(opt, TAG_SL, leg_id))
+    sl_order_id = _place_protective_sl(instrument, quantity, entry_price, order_tag=_order_tag(opt, TAG_SL, leg_id), sl_pct=sl_pct)
     return entry_price, sl_order_id
 
 
@@ -1278,7 +1311,7 @@ def _enter_leg(state, day, opt, instrument, ltp, strike, cfg):
             return
         del _unresolved_entries[opt]
         if fill_price is not None:
-            sl_order_id = _place_protective_sl(p_instrument, p_quantity, fill_price, order_tag=_order_tag(opt, TAG_SL, p_leg_id))
+            sl_order_id = _place_protective_sl(p_instrument, p_quantity, fill_price, order_tag=_order_tag(opt, TAG_SL, p_leg_id), sl_pct=day['sl_start'])
             alert(f'{opt}: earlier entry {order_no} turned out filled @ {fill_price} - SL placed, tracking it')
             _install_leg(state, day, opt, p_instrument, p_strike, fill_price, p_quantity, p_leg_id, sl_order_id)
             return
@@ -1286,7 +1319,7 @@ def _enter_leg(state, day, opt, instrument, ltp, strike, cfg):
     quantity = instrument.lot_size * cfg['lots']
     leg_id = _new_leg_id()
     try:
-        entry_price, sl_order_id = _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id)
+        entry_price, sl_order_id = _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id, day['sl_start'])
     except _UnresolvedEntry as exc:
         _unresolved_entries[opt] = (exc.order_no, instrument, strike, quantity, leg_id)
         raise
@@ -1300,13 +1333,15 @@ def _install_leg(state, day, opt, instrument, strike, entry_price, quantity, leg
         # live SL trigger is currently measured off - starts equal to entry_price, then gets
         # re-pinned to the checkpoint LTP each time _reprice_leg_stoploss moves the live order -
         # see that function and the module docstring.
+        sl_start=day['sl_start'], rung=0, sl_trigger=_sl_trigger(entry_price, day['sl_start']),  # ladder
+        # state - see run_ladder; sl_trigger is the trigger the live SL order currently rests at.
         opened_at=time_module.time(),  # see _sync_stopped_out_and_chopped_legs: a positions
         # snapshot taken before this moment can't see this leg yet and must not count it as stopped.
     )
     with _state_lock:  # see _state_lock's comment - races the watch thread's own clear
         state[opt] = leg
         _pin_checkpoint_info(day, opt, leg)
-    alert(f'ENTER {opt} {instrument.name} x{quantity} @ ~{entry_price} (SL {STOPLOSS_PCT:.0%})')
+    alert(f'ENTER {opt} {instrument.name} x{quantity} @ ~{entry_price} (SL {day["sl_start"]:.0%} ladder, trigger {leg["sl_trigger"]})')
 
 
 def _enter_legs_parallel(state, day, desired, cfg, only_missing=False):
@@ -1514,8 +1549,8 @@ def _handle_stoploss_fill(day, opt, leg, exit_price=None):
     against a realized_pnl that's missing most of the day's actual losses. The fill price is
     `exit_price` when the caller already has it (the SL order's own averageTradedPrice), else
     reconstructed from the order book (_infer_fill_price_from_orderbook); if that comes up empty
-    (DRY_RUN, or the order book hasn't caught up yet), falls back to the nominal STOPLOSS_PCT
-    trigger price rather than skipping the credit entirely.
+    (DRY_RUN, or the order book hasn't caught up yet), falls back to the leg's current ladder
+    trigger (leg['sl_trigger']) rather than skipping the credit entirely.
 
     Then arms this leg's chop watch: places a fresh resting SELL-SL at the ORIGINAL entry price
     pinned for the current checkpoint window (see _pin_checkpoint_info) - NOT this stoploss's own
@@ -1523,10 +1558,9 @@ def _handle_stoploss_fill(day, opt, leg, exit_price=None):
     if exit_price is None:
         exit_price = _infer_fill_price_from_orderbook(leg['instrument'].token, leg['quantity'], 'BUY')
     if exit_price is None:
-        # sl_ref_price, not entry_price - the live trigger may have been re-priced at a checkpoint
-        # since this leg entered (see _reprice_leg_stoploss), so that's the accurate reference for
-        # what the resting order was actually about to fire at.
-        exit_price = round(leg['sl_ref_price'] * (1 + STOPLOSS_PCT))
+        # the trigger the resting order was last placed/modified at - it may have been re-priced at
+        # a checkpoint (_reprice_leg_stoploss) or moved by the ladder (run_ladder) since entry.
+        exit_price = leg.get('sl_trigger') or _sl_trigger(leg['sl_ref_price'], _ladder_pct(leg))
     pnl = leg['entry_price'] - exit_price
     with _state_lock:
         day['realized_pnl'] += pnl
@@ -1568,20 +1602,21 @@ def _handle_chop_fill(state, day, opt, order_id, fill_price):
     leg_id = day['chop_leg_id'][opt]  # the reentry order was this leg's entry - see _order_tag
     sl_order_id = None
     try:
-        sl_order_id = _place_protective_sl(info['instrument'], info['quantity'], fill_price, order_tag=_order_tag(opt, TAG_SL, leg_id))
+        sl_order_id = _place_protective_sl(info['instrument'], info['quantity'], fill_price, order_tag=_order_tag(opt, TAG_SL, leg_id), sl_pct=day['sl_start'])
     except Exception as exc:
         alert(f'{opt}: chop reentry filled @ {fill_price} but protective SL failed to place ({exc}) - naked position, check manually!', level=logging.CRITICAL)
     leg = dict(
         instrument=info['instrument'], strike=info['strike'], entry_price=fill_price, quantity=info['quantity'],
         leg_id=leg_id, sl_order_id=sl_order_id, sl_ref_price=fill_price,  # fresh leg - nothing to adjust yet, see
         # _enter_leg's comment.
+        sl_start=day['sl_start'], rung=0, sl_trigger=_sl_trigger(fill_price, day['sl_start']),
         opened_at=time_module.time(),
     )
     with _state_lock:
         state[opt] = leg
         day['awaiting_chop'][opt] = False
         day['chop_order_id'][opt] = None
-    alert(f'CHOP REENTRY {opt} {info["instrument"].name} x{info["quantity"]} @ ~{fill_price} (SL {STOPLOSS_PCT:.0%})')
+    alert(f'CHOP REENTRY {opt} {info["instrument"].name} x{info["quantity"]} @ ~{fill_price} (SL {day["sl_start"]:.0%} ladder)')
 
 
 def _find_order(order_book, order_id):
@@ -1930,33 +1965,81 @@ def _reprice_leg_stoploss(state, opt, market):
     left alone by it (no roll, no premium-rise close, no fresh reopen) - so its resting protective
     BUY SL order gets MODIFIED in place to trigger off THIS checkpoint's current LTP instead of
     wherever it originally entered. e.g. entry 100 (initial trigger 125); premium has since dropped
-    to 90 -> trigger re-priced to round(90 * 1.25) = 112 (int-rounded, same "STOP PRICE IS NOT
-    REASONABLE" rule _place_protective_sl already follows). leg['entry_price'] (pnl bookkeeping) is
-    untouched - only the live order and leg['sl_ref_price'] (the reference _handle_stoploss_fill
-    falls back to if it can't read the fill price straight off the order book) move."""
+    to 90 -> trigger re-priced to round(90 * (1 + start width)) (int-rounded, same "STOP PRICE IS
+    NOT REASONABLE" rule _place_protective_sl already follows) - the ladder restarts at its start
+    width off the repinned price. leg['entry_price'] (pnl bookkeeping) is untouched - only the live
+    order, leg['sl_ref_price'] and the ladder state move. If the modify fails, sl_ref_price/rung
+    have still moved, so the next run_ladder retries the modify off the new reference."""
     leg = state[opt]
     current_ltp = market['price'].get((leg['strike'], opt))
     if current_ltp is None:
         log.warning(f'{opt} {leg["instrument"].name}: no live quote at checkpoint - leaving existing SL as is')
         return
-    trigger_price = round(current_ltp * (1 + STOPLOSS_PCT))
+    old_ref = leg['sl_ref_price']
+    with _state_lock:
+        leg['sl_ref_price'] = current_ltp
+        leg['rung'] = 0
+    _move_leg_stoploss(opt, leg, _sl_trigger(current_ltp, _ladder_pct(leg)), f'checkpoint repin {old_ref} -> {current_ltp}')
+
+
+def _move_leg_stoploss(opt, leg, trigger_price, why):
+    """Modify `leg`'s resting SL order in place to `trigger_price` (shared by the checkpoint repin
+    and the minute ladder). Never raises - a failed modify leaves the previous SL resting and
+    leg['sl_trigger'] unchanged, so the next run_ladder tries again."""
     sl_limit_price = round(trigger_price * (1 + LIMIT_OFFSET_PCT))
+    name = leg['instrument'].name
     if leg['sl_order_id'] is None:
         # DRY_RUN, or the resting order id couldn't be recovered (e.g. a startup-adoption
-        # reconstruction miss) - nothing live to modify; still move the in-memory reference on so
+        # reconstruction miss) - nothing live to modify; still move the in-memory trigger on so
         # the STOPLOSS fallback estimate in _handle_stoploss_fill stays accurate.
-        log.info(f'{opt} {leg["instrument"].name}: SL would be re-priced to trigger {trigger_price} limit {sl_limit_price} (ltp {current_ltp}) [no live order to modify]')
+        log.info(f'{opt} {name}: SL would move {leg.get("sl_trigger")} -> trigger {trigger_price} limit {sl_limit_price} ({why}) [no live order to modify]')
         with _state_lock:
-            leg['sl_ref_price'] = current_ltp
+            leg['sl_trigger'] = trigger_price
         return
     try:
         _modify_order(leg['sl_order_id'], leg['instrument'], leg['quantity'], 'SL', sl_limit_price, trigger_price=trigger_price)
     except Exception as exc:
-        log.warning(f'{opt} {leg["instrument"].name}: failed to reprice resting SL order {leg["sl_order_id"]} at checkpoint ({exc}) - leaving previous SL in place')
+        log.warning(f'{opt} {name}: failed to move resting SL order {leg["sl_order_id"]} to {trigger_price} ({why}): {exc} - previous SL {leg.get("sl_trigger")} left in place')
         return
-    log.info(f'{opt} {leg["instrument"].name}: SL re-priced at checkpoint {leg["sl_ref_price"]} -> {current_ltp} (trigger {trigger_price}, limit {sl_limit_price})')
+    log.info(f'{opt} {name}: SL moved {leg.get("sl_trigger")} -> trigger {trigger_price} limit {sl_limit_price} ({why})')
     with _state_lock:
-        leg['sl_ref_price'] = current_ltp
+        leg['sl_trigger'] = trigger_price
+
+
+def _ladder_leg_stoploss(opt, leg, close):
+    """Point `leg`'s ladder at the rung `close` (the minute that just ended's close) is on - either
+    direction - and move the resting SL if that changes its trigger."""
+    rung = int((close / leg['sl_ref_price'] - 1 + 1e-9) // LADDER_STEP)
+    with _state_lock:
+        leg['rung'] = rung
+    sl_pct = _ladder_pct(leg)
+    trigger_price = _sl_trigger(leg['sl_ref_price'], sl_pct)
+    if trigger_price == leg.get('sl_trigger'):
+        return
+    if trigger_price <= close:
+        # can't normally happen (the width is always >= 5% above the close's rung) - only via
+        # rounding or a stale adopted trigger; a BUY SL at/below LTP would fire or be rejected.
+        log.warning(f'{opt} {leg["instrument"].name}: ladder trigger {trigger_price} not above close {close} - leaving SL at {leg.get("sl_trigger")}', extra={'no_telegram': True})
+        return
+    _move_leg_stoploss(opt, leg, trigger_price, f'ladder: close {close} = rung {rung} off {leg["sl_ref_price"]} -> width {sl_pct:.0%}')
+
+
+def run_ladder(state, market):
+    """Once per minute, on the first snapshot after the minute boundary - its LTP is taken as the
+    close of the minute that just ended, the only price the ladder steps on (see module
+    docstring). A minute that spikes through the stop and back never moves the ladder: the
+    resting SL fires at the width in force during that minute, as in the backtest."""
+    for opt in OPTION_TYPES:
+        leg = state[opt]
+        if leg is None:
+            continue
+        close = market['price'].get((leg['strike'], opt))
+        if close is None:
+            continue
+        try:
+            _ladder_leg_stoploss(opt, leg, close)
+        except Exception as exc:
+            log.warning(f'{opt}: ladder update failed ({exc}) - will retry next minute', exc_info=True)
 
 
 def run_checkpoint(state, market, cfg, day, symbol):
@@ -2147,6 +2230,13 @@ def run_day(symbol, trade_weekdays):
     entry_time = datetime.now()
     log.info(f'entry snapshot taken at {entry_time:%H:%M:%S.%f} - spot={market["spot"]} atm={market["atm"]}')
 
+    nearest_expiry = _resilient_call(_load_zerodha_current_week_options, symbol, cfg)[0]['expiry']
+    is_expiry_day = nearest_expiry == _today_str()
+    day['sl_start'] = LADDER[symbol][1 if is_expiry_day else 0]
+    day['ladder_minute'] = entry_time.replace(second=0, microsecond=0)  # last minute run_ladder handled
+    alert(f'{symbol}: ladder stop starts at {day["sl_start"]:.0%} (nearest expiry {nearest_expiry}{", expiry day" if is_expiry_day else ""}), '
+          f'+{LADDER_STEP:.0%} per rung, capped at {LADDER_MAX:.0%}')
+
     scheduled_entry = datetime.combine(entry_time.date(), ENTRY_TIME)
     next_checkpoint = scheduled_entry + checkpoint_interval
     while next_checkpoint <= entry_time:
@@ -2186,6 +2276,8 @@ def run_day(symbol, trade_weekdays):
                 leg = dict(
                     instrument=instrument, strike=strike_opt[0], entry_price=entry_price, quantity=quantity,
                     sl_order_id=sl_order_id, sl_ref_price=entry_price,
+                    sl_start=day['sl_start'], rung=0, sl_trigger=None,  # resting trigger unknown -
+                    # the first run_ladder moves the adopted SL onto the ladder off entry_price.
                 )
                 state[opt] = leg
                 _pin_checkpoint_info(day, opt, leg)  # adopted leg's (possibly approximate)
@@ -2223,6 +2315,17 @@ def run_day(symbol, trade_weekdays):
             # failed broker read here used to skip the loss-limit check and checkpoint below)
             run_minute_checks(state, market, cfg, day, now)
 
+            minute = now.replace(second=0, microsecond=0)
+            if minute > day['ladder_minute']:
+                day['ladder_minute'] = minute
+                # skipped on a checkpoint minute: the checkpoint repins (rung 0) or closes/rolls
+                # every leg anyway, as the backtest's repin comes before that minute's stop check
+                if not day['halted'] and now < next_checkpoint:
+                    lag = (now - minute).total_seconds()
+                    if lag > 5:
+                        log.warning(f'ladder snapshot {lag:.0f}s after the minute close - stepping on it anyway', extra={'no_telegram': True})
+                    run_ladder(state, market)
+
             if not day['halted'] and now >= next_checkpoint:
                 run_checkpoint(state, market, cfg, day, symbol)
                 next_checkpoint += checkpoint_interval
@@ -2235,7 +2338,10 @@ def run_day(symbol, trade_weekdays):
             poll_failure_count += 1
             _alert_failure_throttled(f'Poll iteration failed, skipping to next cycle: {exc}', poll_failure_count)
 
-        sleep_for = POLL_INTERVAL_SECONDS
+        # also wake just after the next minute boundary, so run_ladder's snapshot is that minute's close
+        wall = datetime.now()
+        to_next_minute = 60 - wall.second - wall.microsecond / 1e6 + LADDER_CLOSE_DELAY_SECONDS
+        sleep_for = min(POLL_INTERVAL_SECONDS, to_next_minute)
         remaining_to_exit = (datetime.combine(now.date(), EXIT_TIME) - datetime.now()).total_seconds()
         time_module.sleep(max(0, min(sleep_for, remaining_to_exit)))
 

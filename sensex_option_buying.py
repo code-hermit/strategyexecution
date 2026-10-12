@@ -23,6 +23,18 @@ Only one position open at a time — while a position is open, no new signal is 
 Each checkpoint's baseline can fire at most one trade. Once a trade has been taken off a given checkpoint's value, that baseline is "used up" (checkpoint_used = True) and won't trigger again — even after the position closes and the premium is still elevated — until the next checkpoint sets a fresh baseline (which also re-arms the signal).
 No profit target, no daily loss limit. Spike-triggered entry, direction from the last-candle driver, fixed-time/stoploss/EOD exit, one trade per checkpoint window.
 
+Second, independent signal - RUNNING LOW (added 9 Oct 2026, backtested as
+Data/backtests/backtest_atm_spike_v3.py's V3_BASELINE=running_low with V3_SPIKE=70): same pinned
+strike, same last-candle driver, same 1st-OTM buy, same HOLD_MINUTES / combined STOPLOSS_POINTS / EOD
+exits, same one-trade-per-checkpoint rule - the only difference is its baseline: the LOWEST combined
+premium of the pinned strike since the checkpoint (updated every minute while it has no position)
+instead of the value AT the checkpoint, and it needs RUNLOW_SPIKE_POINTS = 70 above that low. It runs
+alongside the checkpoint signal above, NOT blocking it or being blocked by it: each has its own
+position (state['position'] / state['runlow_position']) and its own "used" flag
+(state['checkpoint_used'] / state['runlow_used']), so both can be open at once - often on the same
+contract, i.e. double size. Its orders carry their own tags (premium_spike_rl_*, vs premium_spike_buy_*)
+so neither strategy's exit ever cancels the other's working orders - see STRATEGIES / sell_leg.
+
 Day/weekday handling:
 
 Trades every weekday by default (TRADE_WEEKDAYS); restrict via a second CLI arg using m/t/w/h/f codes, e.g. python backtest_atm_premium_spike_buy.py SENSEX th for Tuesday+Thursday only.
@@ -239,8 +251,18 @@ SPIKE_POINTS = 50  # combined ATM premium rise above the latest checkpoint's bas
 HOLD_MINUTES = 5  # how long a triggered buy is held before being time-exited
 STOPLOSS_POINTS = 60  # combined (CE+PE) premium drop from the position's combined entry fill price
 # that force-closes it early, on top of TIME_EXIT/EOD - see _position_combined_premium/run_day.
+RUNLOW_SPIKE_POINTS = 70  # running-low signal: combined ATM premium rise above the pinned strike's
+# LOWEST combined premium since the checkpoint that triggers its own, independent buy (see docstring)
 INVERT_DIRECTION = False  # False (default): buy whichever leg (CE/PE) actually drove the trigger
 # minute's rise. True: buy the OTHER leg instead (contrarian) - see _direction_for_driver.
+
+# The two independent signals - where each keeps its open position / per-checkpoint "used" flag in
+# state, and the order-tag prefix its orders carry (sell_leg only ever cancels orders with its own
+# prefix, so the two can hold the same contract without touching each other's orders).
+STRATEGIES = {
+    'v3': {'position_key': 'position', 'used_key': 'checkpoint_used', 'order_tag': 'premium_spike_buy', 'name': 'checkpoint'},
+    'runlow': {'position_key': 'runlow_position', 'used_key': 'runlow_used', 'order_tag': 'premium_spike_rl', 'name': 'running-low'},
+}
 STOPLOSS_SCAN_SECONDS = 2  # how often the combined stoploss is checked once a position is open -
 # independent of, and much faster than, the once-a-minute checkpoint/spike-signal cadence, since a
 # fast adverse move shouldn't have to wait for the minute to roll over.
@@ -1000,9 +1022,10 @@ def _instrument_from_dict(d):
 
 
 # ── Orders (no resting stoploss - this strategy has none, by design) ────────
-def buy_leg(instrument, quantity, ltp):
+def buy_leg(instrument, quantity, ltp, tag_prefix='premium_spike_buy'):
     """Plain LIMIT buy entry, no resting stoploss order. Returns the fill price (or `ltp` in
-    DRY_RUN, as a stand-in for pnl bookkeeping)."""
+    DRY_RUN, as a stand-in for pnl bookkeeping). `tag_prefix` is the strategy's order tag (see
+    STRATEGIES)."""
     entry_price = _round_to_tick(ltp * (1 + LIMIT_OFFSET_PCT), instrument.tick_size)
     tag = f'{"[DRY RUN] " if DRY_RUN else ""}BUY {quantity} x {instrument.name} LIMIT @ {entry_price} (ltp {ltp})'
     log.info(tag)
@@ -1010,7 +1033,7 @@ def buy_leg(instrument, quantity, ltp):
         return entry_price
 
     entry = _place_order(
-        'BUY', instrument, quantity, 'LIMIT', price=str(entry_price), order_tag='premium_spike_buy_entry',
+        'BUY', instrument, quantity, 'LIMIT', price=str(entry_price), order_tag=f'{tag_prefix}_entry',
     )
     order_no = entry.get('brokerOrderId')
     if not order_no:
@@ -1018,13 +1041,14 @@ def buy_leg(instrument, quantity, ltp):
     return _wait_for_fill_price(order_no)
 
 
-def sell_leg(instrument, quantity, get_fresh_ltp):
+def sell_leg(instrument, quantity, get_fresh_ltp, tag_prefix='premium_spike_buy'):
     """Square off a bought leg: cancel any resting order on it (defensive - buy_leg above never
     leaves one) then force a SELL LIMIT exit via _force_exit_leg - retried/re-priced (via modify, not
     cancel+replace) until actually filled, MARKET/SLM never used - once we've decided to close,
     speed matters more than price (see notes.md), but never at the cost of an order type not
     permitted for this account/strategy. `get_fresh_ltp` is a zero-arg callable, re-fetched every
-    attempt so a retry never reprices off a stale quote."""
+    attempt so a retry never reprices off a stale quote. `tag_prefix` is the strategy's order tag
+    (see STRATEGIES) - only that strategy's own orders on the contract are cancelled."""
     initial_ltp = get_fresh_ltp()
     tag = f'{"[DRY RUN] " if DRY_RUN else ""}SELL (square off) {quantity} x {instrument.name} (ltp {initial_ltp})'
     log.info(tag)
@@ -1033,14 +1057,15 @@ def sell_leg(instrument, quantity, get_fresh_ltp):
 
     for o in _order_book_cache.get() or []:
         # only THIS strategy's own orders (tag echoed back as 'remarks') - exec_rsv_adjust_sl.py may
-        # hold a short with a resting SL on this very contract, which must never be cancelled here
+        # hold a short with a resting SL on this very contract, and the other spike signal (see
+        # STRATEGIES) may be exiting its own position on it right now - neither may be cancelled here
         tag = str(o.get('remarks') or o.get('orderTag') or '')
-        if str(o.get('instrumentId')) == str(instrument.token) and tag.startswith('premium_spike_buy') \
+        if str(o.get('instrumentId')) == str(instrument.token) and tag.startswith(tag_prefix) \
                 and _status(o) not in TERMINAL_ORDER_STATUSES:
             _cancel_order(o['brokerOrderId'])
 
     log_prefix = f'{instrument.name} close'
-    return _force_exit_leg(instrument, quantity, get_fresh_ltp, 'premium_spike_buy_exit', log_prefix)
+    return _force_exit_leg(instrument, quantity, get_fresh_ltp, f'{tag_prefix}_exit', log_prefix)
 
 
 # ── State persistence ─────────────────────────────────────────────────────
@@ -1054,6 +1079,9 @@ def _fresh_state():
         # 'option_type', 'trigger_driver', 'legs': {<option_type>: {...}} (single leg actually
         # bought), 'atm_legs': {'CE': {...}, 'PE': {...}} (both ATM legs, combined-stoploss tracking
         # only - see _enter_position)}
+        'runlow': None,  # {'low'} - running-low signal's baseline: lowest pinned-strike combined premium since the checkpoint
+        'runlow_used': True,  # running-low signal's own checkpoint_used - armed at each checkpoint
+        'runlow_position': None,  # running-low signal's own open position, same shape as 'position'
     }
 
 
@@ -1089,6 +1117,11 @@ def _load_state():
                     'positions manually, close/reconcile as needed, then either delete the "position" key '
                     f'from {STATE_FILE} (if already flat) or restore the old script version until it is.'
                 )
+            # state saved before the running-low signal existed: leave it disarmed until the next
+            # checkpoint arms it with a fresh low, rather than guess a low for this window
+            state.setdefault('runlow', None)
+            state.setdefault('runlow_used', True)
+            state.setdefault('runlow_position', None)
             log.info(f'Resuming from persisted state: {state}')
             return state
         log.info(f'Persisted state is for {state.get("date")}, not today - starting fresh')
@@ -1206,7 +1239,7 @@ def _run_legs_in_parallel(tasks):
     return results
 
 
-def _enter_position(state, checkpoint, option_type, trigger_driver, ce_ltp, pe_ltp, trigger_time):
+def _enter_position(state, checkpoint, option_type, trigger_driver, ce_ltp, pe_ltp, trigger_time, strategy='v3'):
     """Buy ONE first-OTM leg derived from the checkpoint's pinned ATM strike - the tracking signal
     (checkpoint['strike']/checkpoint['premium']) stays ATM throughout, but the strike actually
     bought is one interval to that leg's OTM side (CE = ATM+interval, PE = ATM-interval), via
@@ -1228,7 +1261,13 @@ def _enter_position(state, checkpoint, option_type, trigger_driver, ce_ltp, pe_l
     datetime.now() after the order fills, so the few seconds of order-placement latency don't push
     the deadline past the once-a-minute TIME_EXIT check grid it's compared against in run_day -
     without this, a deadline landing a few seconds after :00 needs a full extra minute to be
-    detected, turning a 5-minute hold into up to ~6."""
+    detected, turning a 5-minute hold into up to ~6.
+
+    `strategy` ('v3' / 'runlow', see STRATEGIES) decides which baseline the trigger was measured
+    from (the checkpoint's premium / the running low), where the position is stored and which "used"
+    flag is spent, and the order tag - everything else is identical for both."""
+    spec = STRATEGIES[strategy]
+    baseline = checkpoint['premium'] if strategy == 'v3' else state['runlow']['low']
     contracts = _load_aliceblue_contracts()
     contracts_by_strike_type = {(int(float(c['strike_price'])), c['option_type']): c for c in contracts}
     zerodha_options = _load_zerodha_current_week_options()
@@ -1236,22 +1275,23 @@ def _enter_position(state, checkpoint, option_type, trigger_driver, ce_ltp, pe_l
     ce_strike, pe_strike = otm_strikes(checkpoint['strike'], CFG['strike_interval'])
     strikes = {'CE': ce_strike, 'PE': pe_strike}
     strike = strikes[option_type]
-    log.info(f'Spike buy: {SYMBOL} ATM tracking strike={checkpoint["strike"]} combined_premium='
-             f'{atm_premium:.1f} (+{atm_premium - checkpoint["premium"]:.1f} vs checkpoint '
-             f'{checkpoint["premium"]:.1f}) - driver={trigger_driver} - buying 1st-OTM {option_type} strike={strike}'
+    log.info(f'Spike buy ({spec["name"]} signal): {SYMBOL} ATM tracking strike={checkpoint["strike"]} combined_premium='
+             f'{atm_premium:.1f} (+{atm_premium - baseline:.1f} vs {spec["name"]} baseline '
+             f'{baseline:.1f}) - driver={trigger_driver} - buying 1st-OTM {option_type} strike={strike}'
              + (f' (INVERT_DIRECTION: driver was {trigger_driver}, buying {option_type} instead)' if trigger_driver != option_type else ''))
 
     ltp = get_option_ltp(zerodha_options, strike, option_type)
     contract = contracts_by_strike_type[(strike, option_type)]
     instrument = _to_instrument(contract)
     quantity = instrument.lot_size * CFG['lots']
-    entry_price = buy_leg(instrument, quantity, ltp)
+    entry_price = buy_leg(instrument, quantity, ltp, spec['order_tag'])
 
     entry_time = trigger_time.replace(second=0, microsecond=0)
-    state['position'] = {
+    state[spec['position_key']] = {
+        'strategy': strategy,
         'entry_time': entry_time.isoformat(),
         'deadline': (entry_time + timedelta(minutes=HOLD_MINUTES)).isoformat(),
-        'checkpoint_premium': checkpoint['premium'],
+        'checkpoint_premium': baseline,  # the baseline this signal fired off (checkpoint value / running low)
         'entry_atm_premium': atm_premium,
         'option_type': option_type, 'trigger_driver': trigger_driver,
         'legs': {option_type: {
@@ -1265,15 +1305,16 @@ def _enter_position(state, checkpoint, option_type, trigger_driver, ce_ltp, pe_l
             'PE': {'strike': checkpoint['strike'], 'entry': pe_ltp},
         },
     }
-    state['checkpoint_used'] = True
+    state[spec['used_key']] = True
     _save_state(state)
 
 
-def _close_position(state, reason):
+def _close_position(state, reason, strategy='v3'):
     """Square off the held position. Each leg's strike (recorded at entry) is looked up directly
     by strike/type rather than via the ATM tag, since the strike may have drifted off ATM by the
-    time this exit fires."""
-    position = state['position']
+    time this exit fires. `strategy` picks which of the two positions (see STRATEGIES)."""
+    spec = STRATEGIES[strategy]
+    position = state[spec['position_key']]
     if position is None:
         return
     zerodha_options = _load_zerodha_current_week_options()
@@ -1282,13 +1323,14 @@ def _close_position(state, reason):
         opt: (lambda leg=leg, opt=opt: sell_leg(
             _instrument_from_dict(leg['instrument']), leg['quantity'],
             lambda leg=leg, opt=opt: get_option_ltp(zerodha_options, leg['strike'], opt),
+            spec['order_tag'],
         ))
         for opt, leg in position['legs'].items()
     })
     pnl = sum(exit_prices[opt] - leg['entry'] for opt, leg in position['legs'].items())  # long: profit when exit > entry
 
-    log.info(f'Closed {SYMBOL} spike-buy {position["option_type"]} leg ({reason}) - pnl ~{pnl:.1f} pts')
-    state['position'] = None
+    log.info(f'Closed {SYMBOL} {spec["name"]} spike-buy {position["option_type"]} leg ({reason}) - pnl ~{pnl:.1f} pts')
+    state[spec['position_key']] = None
     _save_state(state)
 
 
@@ -1306,7 +1348,8 @@ def run_day():
     prev_pinned_ce, prev_pinned_pe = _load_last_candle(state['checkpoint'])
 
     now_t = datetime.now().time()
-    if now_t >= EXIT_TIME and state['position'] is None and not [c for c in CHECK_TIMES if _label(c) not in state['checkpoints_done']]:
+    no_position = all(state[spec['position_key']] is None for spec in STRATEGIES.values())
+    if now_t >= EXIT_TIME and no_position and not [c for c in CHECK_TIMES if _label(c) not in state['checkpoints_done']]:
         log.info(f'{EXIT_TIME} already passed for today with nothing pending - nothing to do')
         return
 
@@ -1317,13 +1360,15 @@ def run_day():
     # immediately: bootstrap a baseline/pinned-strike right now from the live ATM straddle (the
     # actual premium at that past checkpoint minute is gone, so this is an approximation), then
     # fall back into the normal loop below, which waits for the *next* real checkpoint as usual.
-    if now_t >= ENTRY_TIME and state['checkpoint'] is None and state['position'] is None:
+    if now_t >= ENTRY_TIME and state['checkpoint'] is None and no_position:
         recent = [c for c in CHECK_TIMES if c <= now_t]
         if recent:
             zerodha_options = _load_zerodha_current_week_options()
             strike, ce_ltp, pe_ltp = _current_atm(zerodha_options)
             state['checkpoint'] = {'strike': strike, 'premium': ce_ltp + pe_ltp}
             state['checkpoint_used'] = False
+            state['runlow'] = {'low': ce_ltp + pe_ltp}
+            state['runlow_used'] = False
             state['checkpoints_done'].append(_label(recent[-1]))
             log.info(f'Started after {recent[-1]} with no baseline recorded - bootstrapping pinned '
                      f'ATM strike={strike} baseline={state["checkpoint"]["premium"]:.1f} from the '
@@ -1334,6 +1379,7 @@ def run_day():
     tick_failure_count = 0
     stoploss_failure_count = 0
     warmup_failure_count = 0
+    entry_failure_counts = {strategy: 0 for strategy in STRATEGIES}
     last_evaluated_minute = None  # (hour, minute) of the last minute this loop actually acted on -
     # guards the per-minute body below so it runs exactly once per wall-clock minute, matching the
     # backtest's once-per-bar cadence (see module docstring), even though this loop itself now
@@ -1371,31 +1417,43 @@ def run_day():
             continue
 
         if t >= EXIT_TIME:
-            if state['position'] is not None:
-                _close_position(state, 'EOD')
+            # close every open position; one failing must not stop the other being attempted
+            eod_errors = []
+            for strategy, spec in STRATEGIES.items():
+                if state[spec['position_key']] is not None:
+                    try:
+                        _close_position(state, 'EOD', strategy)
+                    except Exception as exc:
+                        log.exception(f'EOD close of the {spec["name"]} position failed')
+                        eod_errors.append(exc)
+            if eod_errors:
+                raise eod_errors[0]
             break
 
         # Combined (CE+PE) stoploss - scanned every STOPLOSS_SCAN_SECONDS whenever a position is
         # open, on this same 1s-tick loop but on its own timer, so it isn't gated by the
         # once-a-minute cadence the checkpoint/spike-signal/TIME_EXIT logic below runs on (a fast
         # adverse move shouldn't have to wait for the minute to roll over).
-        if state['position'] is not None:
+        open_strategies = [s for s, spec in STRATEGIES.items() if state[spec['position_key']] is not None]
+        if open_strategies:
             now_mono = time_module.monotonic()
             if now_mono - last_stoploss_check >= STOPLOSS_SCAN_SECONDS:
                 last_stoploss_check = now_mono
-                try:
-                    zerodha_options = _load_zerodha_current_week_options()
-                    current_premium = _position_combined_premium(zerodha_options, state['position'])
-                    combined_entry = _position_combined_entry(state['position'])
-                    drop = combined_entry - current_premium
-                    if drop >= STOPLOSS_POINTS:
-                        log.warning(f'{SYMBOL} combined stoploss hit: entry={combined_entry:.1f} '
-                                    f'current={current_premium:.1f} (-{drop:.1f}, stoploss {STOPLOSS_POINTS}) - closing')
-                        _close_position(state, 'STOPLOSS')
-                    stoploss_failure_count = 0
-                except Exception:
-                    stoploss_failure_count += 1
-                    _log_failure_throttled('combined stoploss scan failed - will retry next scan', stoploss_failure_count)
+                for strategy in open_strategies:  # each position's own stoploss, own entry snapshot
+                    spec = STRATEGIES[strategy]
+                    try:
+                        zerodha_options = _load_zerodha_current_week_options()
+                        current_premium = _position_combined_premium(zerodha_options, state[spec['position_key']])
+                        combined_entry = _position_combined_entry(state[spec['position_key']])
+                        drop = combined_entry - current_premium
+                        if drop >= STOPLOSS_POINTS:
+                            log.warning(f'{SYMBOL} {spec["name"]} position combined stoploss hit: entry={combined_entry:.1f} '
+                                        f'current={current_premium:.1f} (-{drop:.1f}, stoploss {STOPLOSS_POINTS}) - closing')
+                            _close_position(state, 'STOPLOSS', strategy)
+                        stoploss_failure_count = 0
+                    except Exception:
+                        stoploss_failure_count += 1
+                        _log_failure_throttled(f'{spec["name"]} combined stoploss scan failed - will retry next scan', stoploss_failure_count)
 
         minute_key = (now.hour, now.minute)
         if minute_key == last_evaluated_minute:
@@ -1410,6 +1468,8 @@ def run_day():
                 strike, ce_ltp, pe_ltp = _current_atm(zerodha_options)
                 state['checkpoint'] = {'strike': strike, 'premium': ce_ltp + pe_ltp}
                 state['checkpoint_used'] = False
+                state['runlow'] = {'low': ce_ltp + pe_ltp}  # running low starts at the checkpoint's own value
+                state['runlow_used'] = False
                 prev_pinned_ce, prev_pinned_pe = None, None  # fresh strike - no "1 minute ago" yet
                 log.info(f'{label} checkpoint: {SYMBOL} pinned ATM strike={strike} '
                          f'baseline={state["checkpoint"]["premium"]:.1f}')
@@ -1424,18 +1484,31 @@ def run_day():
                 _save_state(state)
 
         try:
-            if state['position'] is not None:
-                deadline = datetime.fromisoformat(state['position']['deadline'])
+            for strategy, spec in STRATEGIES.items():
+                position = state[spec['position_key']]
+                if position is None:
+                    continue
+                deadline = datetime.fromisoformat(position['deadline'])
                 remaining = (deadline - now).total_seconds() / 60
-                log.info(f'Position open since {state["position"]["entry_time"]} - '
+                log.info(f'{spec["name"]} position open since {position["entry_time"]} - '
                          f'TIME_EXIT in {remaining:.1f} min (or EOD {_label(EXIT_TIME)})',
                          extra={'no_telegram': True})
                 if now >= deadline:
-                    _close_position(state, 'TIME_EXIT')
-            elif state['checkpoint'] is not None and not state['checkpoint_used']:
+                    _close_position(state, 'TIME_EXIT', strategy)
+
+            checkpoint = state['checkpoint']
+            v3_armed = checkpoint is not None and not state['checkpoint_used']
+            runlow_armed = checkpoint is not None and not state['runlow_used'] and state['runlow'] is not None
+            if v3_armed or runlow_armed:
                 zerodha_options = _load_zerodha_current_week_options()
-                current_premium, ce_ltp, pe_ltp = _pinned_premium(zerodha_options, state['checkpoint'])
-                gap = current_premium - state['checkpoint']['premium']
+                current_premium, ce_ltp, pe_ltp = _pinned_premium(zerodha_options, checkpoint)
+                gap = current_premium - checkpoint['premium']
+                # running low: only moves while that signal is flat, as in the backtest (an open
+                # running-low position means this window's running-low trade is already taken)
+                if runlow_armed and state['runlow_position'] is None and current_premium < state['runlow']['low']:
+                    state['runlow']['low'] = current_premium
+                    _save_state(state)
+                runlow_gap = current_premium - state['runlow']['low'] if runlow_armed else None
 
                 # each leg's own move over just the last minute - pure arithmetic, no I/O, computed
                 # unconditionally (NOT inside the logging try/except below) so a logging hiccup can
@@ -1453,53 +1526,70 @@ def run_day():
                     prev_pe_str = 'n/a' if prev_pinned_pe is None else f'{prev_pinned_pe:.1f}'
                     ce_delta_str = 'n/a' if ce_last_candle is None else f'{ce_last_candle:+.1f}'
                     pe_delta_str = 'n/a' if pe_last_candle is None else f'{pe_last_candle:+.1f}'
+                    v3_str = (f'baseline={checkpoint["premium"]:.1f} (+{gap:.1f}, need +{SPIKE_POINTS})'
+                              if v3_armed else 'checkpoint signal used')
+                    runlow_str = (f'running low={state["runlow"]["low"]:.1f} (+{runlow_gap:.1f}, need +{RUNLOW_SPIKE_POINTS})'
+                                  if runlow_armed else 'running-low signal used')
                     log.info(
-                        f'{SYMBOL} pinned ATM strike={state["checkpoint"]["strike"]} '
+                        f'{SYMBOL} pinned ATM strike={checkpoint["strike"]} '
                         f'CE={ce_ltp:.1f} (prev {prev_ce_str}, {ce_delta_str} last candle) '
                         f'PE={pe_ltp:.1f} (prev {prev_pe_str}, {pe_delta_str} last candle) '
-                        f'combined={current_premium:.1f} baseline={state["checkpoint"]["premium"]:.1f} '
-                        f'(+{gap:.1f}, need +{SPIKE_POINTS} to trigger)', extra={'no_telegram': True},
+                        f'combined={current_premium:.1f} | {v3_str} | {runlow_str}', extra={'no_telegram': True},
                     )
                 except Exception as exc:
                     print(f'CE/PE split logging failed ({exc}) - continuing regardless', file=sys.stderr)
 
-                if gap >= SPIKE_POINTS and t > LAST_ENTRY_TIME:
-                    try:
-                        log.info(f'{SYMBOL} spike condition met (+{gap:.1f}) but at/after last entry time '
-                                  f'({_label(LAST_ENTRY_TIME)}) - no new trade, checkpoint stays live', extra={'no_telegram': True})
-                    except Exception as exc:
-                        print(f'last-entry-time logging failed ({exc}) - continuing regardless', file=sys.stderr)
-                elif gap >= SPIKE_POINTS:
-                    # which leg drove THIS minute's rise, not the whole checkpoint window's - only
-                    # a leg actually bought, see module docstring / _enter_position.
-                    trigger_driver = None
-                    if ce_last_candle is not None and pe_last_candle is not None:
-                        if ce_last_candle > pe_last_candle:
-                            trigger_driver = 'CE'
-                        elif pe_last_candle > ce_last_candle:
-                            trigger_driver = 'PE'
-                        # else: tie - no clear driver, no trade (checkpoint stays live, retried next minute)
+                # which leg drove THIS minute's rise, not the whole checkpoint window's - only a leg
+                # actually bought, see module docstring / _enter_position. Shared by both signals.
+                trigger_driver = None
+                if ce_last_candle is not None and pe_last_candle is not None:
+                    if ce_last_candle > pe_last_candle:
+                        trigger_driver = 'CE'
+                    elif pe_last_candle > ce_last_candle:
+                        trigger_driver = 'PE'
+                    # else: tie - no clear driver, no trade (signal stays live, retried next minute)
+
+                # the two signals are independent: each is checked against its own baseline, its
+                # own "used" flag and its own position - one being in a trade never blocks the other
+                for strategy, armed, rise, need in (('v3', v3_armed, gap, SPIKE_POINTS),
+                                                    ('runlow', runlow_armed, runlow_gap, RUNLOW_SPIKE_POINTS)):
+                    spec = STRATEGIES[strategy]
+                    if not armed or state[spec['position_key']] is not None or rise < need:
+                        continue
+                    if t > LAST_ENTRY_TIME:
+                        try:
+                            log.info(f'{SYMBOL} {spec["name"]} spike condition met (+{rise:.1f}) but at/after last entry '
+                                     f'time ({_label(LAST_ENTRY_TIME)}) - no new trade, signal stays live', extra={'no_telegram': True})
+                        except Exception as exc:
+                            print(f'last-entry-time logging failed ({exc}) - continuing regardless', file=sys.stderr)
+                        continue
                     if trigger_driver is None:
                         try:
-                            log.info(f'{SYMBOL} spike condition met (+{gap:.1f}) but no clear last-candle '
-                                      f'driver (CE {ce_last_candle}, PE {pe_last_candle}) - '
-                                      f'skipping this minute, checkpoint stays live', extra={'no_telegram': True})
+                            log.info(f'{SYMBOL} {spec["name"]} spike condition met (+{rise:.1f}) but no clear last-candle '
+                                     f'driver (CE {ce_last_candle}, PE {pe_last_candle}) - '
+                                     f'skipping this minute, signal stays live', extra={'no_telegram': True})
                         except Exception as exc:
                             print(f'no-driver logging failed ({exc}) - continuing regardless', file=sys.stderr)
+                        continue
+                    option_type = _direction_for_driver(trigger_driver)
+                    try:
+                        log.info(f'{SYMBOL} {spec["name"]} signal: last-candle split CE {ce_last_candle:+.1f}, '
+                                 f'PE {pe_last_candle:+.1f} -> driver={trigger_driver}')
+                    except Exception as exc:
+                        print(f'driver-decision logging failed ({exc}) - continuing regardless', file=sys.stderr)
+                    try:
+                        _enter_position(state, checkpoint, option_type, trigger_driver, ce_ltp, pe_ltp, now, strategy)
+                    except Exception:
+                        # one signal's failed entry must not stop the other's; not marked used, so it's retried next minute
+                        entry_failure_counts[strategy] += 1
+                        _log_failure_throttled(f'{spec["name"]} entry failed - will retry next minute', entry_failure_counts[strategy])
                     else:
-                        option_type = _direction_for_driver(trigger_driver)
-                        try:
-                            log.info(f'{SYMBOL} last-candle split: CE {ce_last_candle:+.1f}, PE {pe_last_candle:+.1f} '
-                                     f'-> driver={trigger_driver}')
-                        except Exception as exc:
-                            print(f'driver-decision logging failed ({exc}) - continuing regardless', file=sys.stderr)
-                        _enter_position(state, state['checkpoint'], option_type, trigger_driver, ce_ltp, pe_ltp, now)
+                        entry_failure_counts[strategy] = 0
                 prev_pinned_ce, prev_pinned_pe = ce_ltp, pe_ltp
-                _save_last_candle(state['checkpoint'], ce_ltp, pe_ltp)  # already fails safe internally - see its own docstring
-            elif state['checkpoint'] is not None and state['checkpoint_used']:
-                log.info(f'{SYMBOL} pinned ATM strike={state["checkpoint"]["strike"]} baseline='
-                         f'{state["checkpoint"]["premium"]:.1f} already used - waiting for next '
-                         f'checkpoint ({_label(EXIT_TIME)} EOD if none left today)',
+                _save_last_candle(checkpoint, ce_ltp, pe_ltp)  # already fails safe internally - see its own docstring
+            elif checkpoint is not None:
+                log.info(f'{SYMBOL} pinned ATM strike={checkpoint["strike"]} - both signals already used for this '
+                         f'checkpoint - waiting for next checkpoint ({_label(EXIT_TIME)} EOD if none left today)',
                          extra={'no_telegram': True})
             else:
                 log.info(f'{SYMBOL} no checkpoint baseline recorded yet', extra={'no_telegram': True})
