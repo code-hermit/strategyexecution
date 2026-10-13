@@ -26,7 +26,7 @@ RANGE_START = dtime(9, 15)
 RANGE_END = dtime(10, 15)           # range = candles before this
 MID_LO, MID_HI = 0.4, 0.6
 LAST_ENTRY = dtime(14, 30)          # no entries at/after this; pending entry orders are cancelled
-EXIT_TIME = dtime(15, 15)           # square off whatever is open
+EXIT_TIME = dtime(15, 3)            # square off whatever is open (Finvasia MIS cut-off is 15:05)
 STOP_PCT = 0.5                      # fixed stop, % from the entry fill
 MAX_TRADES_PER_DAY = 10
 MIN_RANGE_BARS = 48                 # 80% of the 60 range minutes, else the range is unreliable

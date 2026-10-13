@@ -1,0 +1,3 @@
+variation,pick,hedge_expiry,CE_strike,CE_px,CE_dist,PE_strike,PE_px,PE_dist,strangle_pts,hedge_cost_Rs,naked_margin,hedged_margin,margin_saved,saved_%,x_best_margin
+benefit,REF wk OTM #1,2026-10-15,72000.0,369.9,100.0,71800.0,411.0,100.0,780.9,15618,188972,57830,131142,69.4,1.0
+benefit,mo OTM #1,2026-11-26,72000.0,1975.45,100.0,71800.0,884.2,100.0,2859.65,57193,188972,119067,69905,37.0,2.06

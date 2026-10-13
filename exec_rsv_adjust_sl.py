@@ -15,6 +15,18 @@ is stopped small and a gradual move can still run to the full width:
   - a checkpoint repin of sl_ref_price (_reprice_leg_stoploss) restarts it at the start width.
 Everything below that mentions a flat STOPLOSS_PCT now means "the leg's current ladder width".
 
+EXPIRY-DAY PREMIUM-RISE RULE (13 Oct 2026, Data/backtests/backtest_rs_v5.py rule 2): on expiry days the
+ATM_PREMIUM_RISE rule (close legs / no trade when the ATM premium rose vs the previous checkpoint) only
+applies at checkpoints up to EXPIRY_RISE_LAST_CHECKPOINT (10:45); from 11:45 a premium rise is ignored and
+the checkpoint rolls/reopens as normal. Non-expiry days are unchanged. Expiry day = Zerodha's nearest
+expiry is today (cross-checked against AliceBlue's contract master) - see run_day.
+
+IV EXIT (13 Oct 2026, backtest_rs_v5.py rule 3, SENSEX only via IV_EXIT_PTS, non-expiry days): the straddle
+strike's IV (mean CE/PE, solved exactly like the backtest's iv_calc) is pinned at entry and after every
+checkpoint; if it rises IV_EXIT_PTS (0.75 vol points) above that on a minute snapshot, every open leg is
+closed and stays flat until the next checkpoint. IV_EXIT_SHADOW = True (current): nothing is placed - the
+IV is logged every minute ('IV watch:') and a would-be exit once per window ('IV EXIT [SHADOW').
+
 Live execution of Data/backtests/backtest_rs_adjust_sl.py - a variant of exec_rsv_cont_chop.py
 (everything below through the CHOP section is carried over from it unchanged) with ONE addition on
 top: at every checkpoint, any leg that is "old" - already open coming into that checkpoint and left
@@ -118,7 +130,7 @@ does NOT import execution_rolling_straddle_tn.py (which authenticates with Dhan 
 its market-data source); Dhan is never touched, imported, or authenticated by this file at all.
 
 Trades a single underlying (command-line arg, default NIFTY) on TRADE_WEEKDAYS (command-line
-weekday codes, default every weekday - matching the backtest's own default). Lots default to 3 for
+weekday codes, default every weekday - matching the backtest's own default). Lots default to 4 for
 both NIFTY and SENSEX (informational CFG below); pass a different symbol/weekday-codes pair on the
 command line to override.
 
@@ -152,9 +164,11 @@ strategy makes leg ownership ambiguous - detect it and alert instead of acting a
 """
 
 import csv
+import functools
 import io
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -306,6 +320,14 @@ LADDER_GAP = 0.10  # stop sits this far above the latest close's rung
 LADDER_MAX = 0.30  # widest the stop gets
 LADDER_CLOSE_DELAY_SECONDS = 0.5  # main loop wakes this long after each minute boundary so its LTP
 # snapshot is the minute that just ended's close - see run_ladder
+EXPIRY_RISE_LAST_CHECKPOINT = dtime(10, 45)  # 13 Oct 2026 (backtest_rs_v5.py rule 2): on EXPIRY days the
+# ATM-premium-rise rule only applies at checkpoints up to this one; from 11:45 a premium rise is ignored.
+# Non-expiry days keep the rule at every checkpoint. See run_checkpoint.
+IV_EXIT_PTS = {'NIFTY': None, 'SENSEX': 0.75}  # backtest_rs_v5.py rule 3 (non-expiry days): straddle-strike IV
+# this many vol points above its checkpoint reference -> close the open legs, flat until the next
+# checkpoint. None = off for that index. See run_iv_watch.
+IV_EXIT_SHADOW = True  # 13 Oct 2026: True = calculate and LOG what the IV exit would do, place nothing.
+IV_RISK_FREE_RATE = 0.065  # same as V2/Data/_split_by_dates.py, which produced the backtest's iv_calc
 CHOP_ENABLED = False  # 30 Sep 2026: False = no chop reentry after a STOPLOSS - the leg stays flat until
 # the next checkpoint reopens it. Matches Data/backtests/backtest_rs_v3_corrected_no_chop.py (repin on,
 # no chop), which beat every chop variant on both NIFTY and SENSEX since 2024. True = old behaviour.
@@ -323,12 +345,12 @@ DAY_CODE_TO_WEEKDAY = {'m': 'Monday', 't': 'Tuesday', 'w': 'Wednesday', 'h': 'Th
 # underlying (matching the backtest's convention); now set per-underlying instead.
 CFG = {
     'NIFTY': dict(
-        strike_interval=50, lots=3, aliceblue_exchange='NFO',
+        strike_interval=50, lots=4, aliceblue_exchange='NFO',
         zerodha_options_exchange='NFO', zerodha_spot_instrument='NSE:NIFTY 50',
         daily_loss_limit=40,
     ),
     'SENSEX': dict(
-        strike_interval=100, lots=3, aliceblue_exchange='BFO',
+        strike_interval=100, lots=4, aliceblue_exchange='BFO',
         zerodha_options_exchange='BFO', zerodha_spot_instrument='BSE:SENSEX',
         daily_loss_limit=120,
     ),
@@ -945,6 +967,20 @@ def get_open_legs(contracts_by_token, fresh_after=None):
     }
 
 
+def _long_position_qty(token):
+    """Net LONG quantity open on `token` - a hedge (this strategy only ever holds shorts), 0 if none. A
+    failed read returns 0 (logged): a transient positions error shouldn't block a normal entry."""
+    try:
+        positions = _positions_fetch.get()
+    except Exception as exc:
+        log.warning(f'token {token}: positions read failed ({exc}) - hedge check skipped for this entry', extra={'no_telegram': True})
+        return 0
+    for p in positions:
+        if int(p['instrumentId']) == int(token):
+            return max(int(p.get('netQuantity', 0)), 0)
+    return 0
+
+
 # ── Retry/backoff for read-only calls (Zerodha quotes/instruments, AliceBlue positions/orders) ──
 RETRY_MAX_ATTEMPTS = 5
 RETRY_BASE_DELAY = 5
@@ -1006,7 +1042,9 @@ def _fetch_market(symbol, cfg, state):
         strike_types_needed.add((desired_strike[opt], opt))
         leg = state[opt]
         if leg is not None:
-            strike_types_needed.add((leg['strike'], opt))
+            # both sides at an open leg's strike - the IV watch needs the straddle strike's CE AND PE
+            # even after one leg has stopped out (see run_iv_watch)
+            strike_types_needed.update({(leg['strike'], 'CE'), (leg['strike'], 'PE')})
 
     key_to_strike_type = {}
     token_to_key = {}
@@ -1315,6 +1353,14 @@ def _enter_leg(state, day, opt, instrument, ltp, strike, cfg):
             alert(f'{opt}: earlier entry {order_no} turned out filled @ {fill_price} - SL placed, tracking it')
             _install_leg(state, day, opt, p_instrument, p_strike, fill_price, p_quantity, p_leg_id, sl_order_id)
             return
+
+    hedge_qty = _long_position_qty(instrument.token)
+    if hedge_qty:
+        # spot has reached a hedge strike: a short here would net against the hedge, and the order book /
+        # positions checks in _reconcile_leg would then misread this leg - stay flat on this side instead
+        alert(f'{opt}: {instrument.name} has a LONG position of {hedge_qty} (hedge) - NOT shorting this leg here. '
+              f'Roll the hedge or trade it manually!', level=logging.CRITICAL)
+        return
 
     quantity = instrument.lot_size * cfg['lots']
     leg_id = _new_leg_id()
@@ -2042,7 +2088,127 @@ def run_ladder(state, market):
             log.warning(f'{opt}: ladder update failed ({exc}) - will retry next minute', exc_info=True)
 
 
-def run_checkpoint(state, market, cfg, day, symbol):
+# ── IV exit (backtest_rs_v5.py rule 3) ───────────────────────────────────────────────────────────
+# IV is solved exactly as V2/Data/_split_by_dates.py produced the backtest's iv_calc: Black-Scholes on
+# spot, r = IV_RISK_FREE_RATE, no dividend, t = calendar time to 15:30 on expiry / 365, same Newton
+# iteration (start 0.3, clip [1e-4, 5], stop once |price error| < 1e-6). Pure Python (no numpy/scipy here).
+def _isolated(fn):
+    """The IV exit is an add-on: an error anywhere in it must never reach the trading flow (a raise after
+    run_checkpoint would re-run that checkpoint; one after the initial entry would end run_day with legs
+    open). Any exception is logged (no Telegram) and swallowed - the watch just skips that call."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            try:
+                log.warning(f'{fn.__name__} failed ({exc}) - IV watch skipped, trading unaffected', exc_info=True, extra={'no_telegram': True})
+            except Exception:
+                pass
+            return None
+    return wrapper
+
+
+def _norm_cdf(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def _bs_price(is_call, S, K, t, r, sigma):
+    sqrt_t = math.sqrt(t)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * t) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+    if is_call:
+        return S * _norm_cdf(d1) - K * math.exp(-r * t) * _norm_cdf(d2)
+    return K * math.exp(-r * t) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
+
+def _implied_vol(price, is_call, S, K, t, r=IV_RISK_FREE_RATE, tol=1e-6, max_iter=100):
+    """IV in vol points (iv_calc's scale), or None if an input is missing/invalid."""
+    if price is None or S is None or not (S > 0 and K > 0 and price > 0 and t > 0):
+        return None
+    sigma = 0.3
+    for _ in range(max_iter):
+        sqrt_t = math.sqrt(t)
+        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * t) / (sigma * sqrt_t)
+        vega = S * math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi) * sqrt_t
+        diff = _bs_price(is_call, S, K, t, r, sigma) - price
+        sigma = min(max(sigma - diff / (vega if abs(vega) >= 1e-8 else 1e-8), 1e-4), 5.0)
+        if abs(diff) < tol:
+            break
+    return sigma * 100
+
+
+def _straddle_iv(market, day, strike):
+    """(mean of CE and PE IV at `strike`, {'CE': iv, 'PE': iv}) off this snapshot - mean is None if
+    either side can't be solved (missing quote)."""
+    t = (day['expiry_at'] - datetime.now()).total_seconds() / 86400 / 365
+    ivs = {opt: _implied_vol(market['price'].get((strike, opt)), opt == 'CE', market['spot'], strike, t) for opt in OPTION_TYPES}
+    if any(v is None for v in ivs.values()):
+        return None, ivs
+    return sum(ivs.values()) / len(ivs), ivs
+
+
+def _fmt_iv(v):
+    return f'{v:.2f}' if v is not None else 'n/a'
+
+
+@_isolated
+def _pin_iv_reference(state, market, day, why):
+    """The IV exit's reference for this window: the straddle strike's IV off `market` (the entry /
+    checkpoint / adoption snapshot) - re-pinned at every checkpoint, as in the backtest."""
+    if day['iv_exit_pts'] is None:
+        return
+    day['iv_ref'], day['iv_strike'], day['iv_fired'] = None, None, False
+    leg = state['CE'] or state['PE']
+    if leg is None:
+        log.info(f'IV watch: no legs open after {why} - nothing to watch this window')
+        return
+    iv, ivs = _straddle_iv(market, day, leg['strike'])
+    day['iv_strike'], day['iv_ref'] = leg['strike'], iv
+    log.info(f'IV watch: reference {_fmt_iv(iv)} at strike {leg["strike"]} (CE {_fmt_iv(ivs["CE"])}, PE {_fmt_iv(ivs["PE"])}) - {why}')
+
+
+@_isolated
+def run_iv_watch(state, market, cfg, day):
+    """Once per minute (same post-boundary snapshot as run_ladder): straddle-strike IV vs this window's
+    reference; at >= iv_exit_pts above it, close every open leg (flat until the next checkpoint). With
+    IV_EXIT_SHADOW nothing is placed - the would-be exit is logged once per window, and the IV keeps
+    being logged every minute so it can be checked against the next day's iv_calc."""
+    if day['iv_exit_pts'] is None or day['iv_ref'] is None or (state['CE'] is None and state['PE'] is None):
+        return
+    iv, ivs = _straddle_iv(market, day, day['iv_strike'])
+    if iv is None:
+        log.info(f'IV watch: strike {day["iv_strike"]} quote missing this minute (CE {_fmt_iv(ivs["CE"])}, PE {_fmt_iv(ivs["PE"])}) - skipped')
+        return
+    rise = iv - day['iv_ref']
+    log.info(f'IV watch: strike {day["iv_strike"]} CE {ivs["CE"]:.2f} PE {ivs["PE"]:.2f} avg {iv:.2f} '
+             f'ref {day["iv_ref"]:.2f} rise {rise:+.2f} spot {market["spot"]}')
+    if rise < day['iv_exit_pts'] or day['iv_fired']:
+        return
+    day['iv_fired'] = True
+    legs, open_pnl = [], 0.0
+    for opt in OPTION_TYPES:
+        leg = state[opt]
+        if leg is None:
+            continue
+        ltp = market['price'].get((leg['strike'], opt))
+        legs.append(f'{leg["instrument"].name} (entry {leg["entry_price"]}, ltp {ltp})')
+        if ltp is not None:
+            open_pnl += leg['entry_price'] - ltp
+    what = (f'straddle IV {iv:.2f} is {rise:+.2f} over the checkpoint reference {day["iv_ref"]:.2f} '
+            f'(>= {day["iv_exit_pts"]}) - {", ".join(legs)}, open pnl ~{open_pnl:+.2f} pts')
+    if IV_EXIT_SHADOW:
+        log.info(f'IV EXIT [SHADOW - nothing placed]: {what} - would close these and stay flat until the next checkpoint')
+        return
+    alert(f'IV EXIT: {what} - closing, flat until the next checkpoint')
+    day['realized_pnl'] += _close_open_legs(state, day, market, cfg, 'IV_RISE_EXIT')
+    _abandon_chop_watches(day)
+    day['iv_ref'] = None
+
+
+def run_checkpoint(state, market, cfg, day, symbol, checkpoint_at):
+    """checkpoint_at: this checkpoint's SCHEDULED time (10:45, 11:45, ...) - not the clock, so a 10:45
+    checkpoint retried at 10:46 after a failure is still treated as the 10:45 one."""
     # Every checkpoint boundary tears down ANY pending chop order outright, unconditionally, before
     # this checkpoint's own decision even runs - a chop watch's life is at most one checkpoint
     # window, full stop: a resting chop order is NEVER carried across a checkpoint boundary, and
@@ -2057,8 +2223,12 @@ def run_checkpoint(state, market, cfg, day, symbol):
         prev_premium is not None and current_premium is not None
         and current_premium > prev_premium
     )
+    if premium_increased and day['is_expiry_day'] and checkpoint_at.time() > EXPIRY_RISE_LAST_CHECKPOINT:
+        log.info(f'ATM premium rose ({prev_premium} -> {current_premium}) but it is expiry day after '
+                 f'{EXPIRY_RISE_LAST_CHECKPOINT:%H:%M} - ignoring the premium-rise rule this checkpoint')
+        premium_increased = False
 
-    log.info(f'checkpoint: spot={market["spot"]} atm={market["atm"]} atm_premium={current_premium} (prev={prev_premium}) day_pnl={day["realized_pnl"]:.2f}')
+    log.info(f'checkpoint {checkpoint_at:%H:%M}: spot={market["spot"]} atm={market["atm"]} atm_premium={current_premium} (prev={prev_premium}) day_pnl={day["realized_pnl"]:.2f}')
     _checkpoint_act(state, market, cfg, day, premium_increased)
     # Only now that this checkpoint's action went through does its premium become the next baseline.
     # 28 Sep 2026: this used to be saved BEFORE acting - when the 10:45 SENSEX roll's close failed,
@@ -2230,12 +2400,35 @@ def run_day(symbol, trade_weekdays):
     entry_time = datetime.now()
     log.info(f'entry snapshot taken at {entry_time:%H:%M:%S.%f} - spot={market["spot"]} atm={market["atm"]}')
 
+    # Expiry day = the nearest expiry in Zerodha's instrument dump (the exchange's own contract list, so a
+    # holiday-shifted expiry is already reflected) is today. Cross-checked against AliceBlue's contract
+    # master (expiry_date = UTC midnight of the expiry date); a mismatch is alerted, Zerodha's is used.
     nearest_expiry = _resilient_call(_load_zerodha_current_week_options, symbol, cfg)[0]['expiry']
     is_expiry_day = nearest_expiry == _today_str()
+    aliceblue_expiry = min(
+        datetime.fromtimestamp(c['expiry_date'] / 1000, tz=timezone.utc).date() for c in market['contracts_by_token'].values()
+    ).isoformat()
+    if aliceblue_expiry != nearest_expiry:
+        alert(f'{symbol}: nearest expiry differs - Zerodha {nearest_expiry}, AliceBlue {aliceblue_expiry}. '
+              f'Using Zerodha\'s (expiry day: {is_expiry_day}). Check manually!', level=logging.WARNING)
+    day['is_expiry_day'] = is_expiry_day  # ladder start width (LADDER) and the expiry premium-rise rule
+    day.update(iv_exit_pts=None, iv_ref=None, iv_strike=None, iv_fired=False, expiry_at=None)  # IV exit off unless set up below
+    try:  # IV exit setup - a failure here just leaves the IV watch off for the day
+        day['expiry_at'] = datetime.combine(datetime.strptime(nearest_expiry, '%Y-%m-%d').date(), dtime(15, 30))  # IV's time to expiry
+        day['iv_exit_pts'] = None if is_expiry_day else IV_EXIT_PTS.get(symbol)  # IV exit: non-expiry days only
+        if is_expiry_day and IV_EXIT_PTS.get(symbol) is not None:
+            log.info('IV watch: OFF today (expiry day)')
+        elif day['iv_exit_pts'] is not None:
+            mode = 'SHADOW mode - logged only, nothing placed' if IV_EXIT_SHADOW else 'LIVE - will close legs'
+            log.info(f'IV watch: on, exit at +{day["iv_exit_pts"]} vol pts over each checkpoint reference ({mode})')
+    except Exception as exc:
+        day['iv_exit_pts'] = None
+        log.warning(f'IV watch setup failed ({exc}) - IV watch off today, trading unaffected', exc_info=True, extra={'no_telegram': True})
     day['sl_start'] = LADDER[symbol][1 if is_expiry_day else 0]
     day['ladder_minute'] = entry_time.replace(second=0, microsecond=0)  # last minute run_ladder handled
     alert(f'{symbol}: ladder stop starts at {day["sl_start"]:.0%} (nearest expiry {nearest_expiry}{", expiry day" if is_expiry_day else ""}), '
-          f'+{LADDER_STEP:.0%} per rung, capped at {LADDER_MAX:.0%}')
+          f'+{LADDER_STEP:.0%} per rung, capped at {LADDER_MAX:.0%}'
+          + (f'; premium-rise rule only up to {EXPIRY_RISE_LAST_CHECKPOINT:%H:%M} today' if is_expiry_day else ''))
 
     scheduled_entry = datetime.combine(entry_time.date(), ENTRY_TIME)
     next_checkpoint = scheduled_entry + checkpoint_interval
@@ -2252,10 +2445,26 @@ def run_day(symbol, trade_weekdays):
     )
     watch_thread.start()
 
-    open_tokens = set(_resilient_call(get_open_legs, market['contracts_by_token']))
+    # 13 Oct 2026: only SHORT positions can be this strategy's legs. LONG positions on the same expiry are
+    # hedges (far-OTM buys, placed separately) - never adopted, never touched. Before this, a hedge bought
+    # before 09:44 was adopted as a "leg" and the 09:45 entry skipped.
+    open_legs_by_token = _resilient_call(get_open_legs, market['contracts_by_token'])
+    longs = {t: p for t, p in open_legs_by_token.items() if int(p['netQuantity']) > 0}
+    if longs:
+        names = ', '.join(f"{market['contracts_by_token'][t]['trading_symbol']} +{int(p['netQuantity'])}" for t, p in longs.items())
+        alert(f'{symbol}: long positions on this expiry ignored (hedges, not this strategy\'s legs): {names}')
+    shorts = {t: p for t, p in open_legs_by_token.items() if int(p['netQuantity']) < 0}
+    adopt_tokens = set()
+    for opt in OPTION_TYPES:  # at most one short leg per side - the one nearest ATM
+        side = [t for t in shorts if market['contracts_by_token'][t]['option_type'] == opt]
+        side.sort(key=lambda t: abs(float(market['contracts_by_token'][t]['strike_price']) - market['atm']))
+        adopt_tokens.update(side[:1])
+        if len(side) > 1:
+            others = ', '.join(market['contracts_by_token'][t]['trading_symbol'] for t in side[1:])
+            alert(f'{symbol}: more than one short {opt} open - adopting the one nearest ATM, NOT tracking: {others}. Check manually!', level=logging.WARNING)
+    open_tokens = adopt_tokens
     if open_tokens:
-        alert('Found open positions at startup (mid-day restart?) - reconstructing entry prices from the order book where possible', level=logging.WARNING)
-        open_legs_by_token = _resilient_call(get_open_legs, market['contracts_by_token'])
+        alert('Found open short positions at startup (mid-day restart?) - reconstructing entry prices from the order book where possible', level=logging.WARNING)
         for strike_opt, contract in market['contracts_by_strike_type'].items():
             token = int(contract['token'])
             if token in open_tokens:
@@ -2288,13 +2497,15 @@ def run_day(symbol, trade_weekdays):
         if adopted_premium is not None:
             day['premium_history'] = [(datetime.now(), adopted_premium)]
             alert(f'Adopted legs - reconstructed combined entry ~{adopted_premium:.2f}, used as the previous-checkpoint premium')
+        _pin_iv_reference(state, market, day, 'adopted at startup')
     else:
-        log.info('No open positions - entering initial legs')
+        log.info('No open short positions - entering initial legs')
         entry_premium = _atm_premium(market)
         day['prev_checkpoint_premium'] = entry_premium
         if entry_premium is not None:
             day['premium_history'] = [(datetime.now(), entry_premium)]
         _enter_legs_parallel(state, day, _desired_legs(market, cfg), cfg)
+        _pin_iv_reference(state, market, day, 'initial entry')
 
     reuse_entry_market = True
     poll_failure_count = 0
@@ -2325,9 +2536,11 @@ def run_day(symbol, trade_weekdays):
                     if lag > 5:
                         log.warning(f'ladder snapshot {lag:.0f}s after the minute close - stepping on it anyway', extra={'no_telegram': True})
                     run_ladder(state, market)
+                    run_iv_watch(state, market, cfg, day)  # @_isolated - can't raise
 
             if not day['halted'] and now >= next_checkpoint:
-                run_checkpoint(state, market, cfg, day, symbol)
+                run_checkpoint(state, market, cfg, day, symbol, next_checkpoint)
+                _pin_iv_reference(state, market, day, f'checkpoint {next_checkpoint:%H:%M}')
                 next_checkpoint += checkpoint_interval
 
             if now >= next_heartbeat:

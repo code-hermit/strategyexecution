@@ -142,7 +142,8 @@ def _run(ip_address):
                 "/home/ec2-user/trading/zerodha_ticker_service.sh "
                 "/home/ec2-user/trading/process_monitor.sh "
                 "/home/ec2-user/trading/mcx_ticker_service.sh "
-                "/home/ec2-user/trading/exec_rsv_goldm.sh",
+                "/home/ec2-user/trading/exec_rsv_goldm.sh "
+                "/home/ec2-user/trading/stock_range_reversal.sh",
                 # One cron line per strategy, restricted to weekdays (1-5) at the day-of-week
                 # field too so the wrong tmux session never even spins up on a weekend:
                 #   Mon-Fri (1,2,3,4,5)   9:42 -> zerodha_ticker_service.sh (started first, so its
@@ -157,6 +158,9 @@ def _run(ip_address):
                 #                                 warm its own instrument caches; sensex_option_
                 #                                 buying.py's own ENTRY_TIME (10:15) still gates the
                 #                                 actual checkpoint/entry)
+                #   Mon-Fri (1,2,3,4,5)  10:15 -> stock_range_reversal.sh (opening-range reversal on
+                #                                 NSE stocks; the program itself waits for 10:15:05 to
+                #                                 build each stock's 09:15-10:14 range)
                 #   Mon-Fri (1,2,3,4,5)   9:46 -> process_monitor.sh (watches the above jobs and
                 #                                 alarms if one dies; started last, after the jobs
                 #                                 it watches are already up)
@@ -202,6 +206,11 @@ def _run(ip_address):
                     "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s mcx_ticker ' || "
                     "(crontab -u ec2-user -l 2>/dev/null; "
                     "echo \"14 15 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s mcx_ticker '/home/ec2-user/trading/mcx_ticker_service.sh'\") | crontab -u ec2-user -"
+                ),
+                (
+                    "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s stock_range_reversal ' || "
+                    "(crontab -u ec2-user -l 2>/dev/null; "
+                    "echo \"15 10 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s stock_range_reversal '/home/ec2-user/trading/stock_range_reversal.sh'\") | crontab -u ec2-user -"
                 ),
                 (
                     "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s goldm ' || "

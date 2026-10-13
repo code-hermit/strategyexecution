@@ -16,7 +16,7 @@ Day timeline (IST):
   every 5 s      read the order book: an entry that filled gets its 0.5% SL-limit stop at once;
                  a stop that filled closes the trade
   14:30          cancel every entry order that hasn't triggered
-  15:15          cancel stops, square off open positions at market, write the day's summary,
+  15:03          cancel stops, square off open positions at market, write the day's summary,
                  update the equity file (compounding)
 
 Two threads: the data thread (minute candles -> signals, onto a queue) and the main thread (order
@@ -53,7 +53,7 @@ Files - everything this program writes is under execution/stock_range_reversal_d
 
 Run: python3 stock_range_reversal.py   (one program - the candle download runs in its own thread)
 
-Late start / restart: any time before 15:15 is fine. The first candle download covers 09:15 to now
+Late start / restart: any time before 15:03 is fine. The first candle download covers 09:15 to now
 and is replayed through the rules, so ranges, tracking and first breaks come out exactly as if the
 program had been running since 10:15. A replayed first break whose opposite level hasn't been
 crossed yet is armed as usual; one whose level was already crossed is logged as missed (that

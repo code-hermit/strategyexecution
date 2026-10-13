@@ -7,6 +7,13 @@ Two ways of choosing the monthly hedge strangle (--mode):
              strike on each side of the ATM), out to the farthest priced strikes
     price:   for each target premium (Rs 1, 2, ... 50), the OTM call and the OTM
              put each priced nearest to that target
+    benefit: reference = straddle hedged with the 1st OTM strangle of the SAME
+             (weekly) expiry, the lowest hedged margin available. Then walk the
+             monthly OTM strangles from the 1st OTM outward and keep the widest one
+             whose hedged margin stays below --margin-cap (default 2x) of that best margin
+    shift:   a hedge bought earlier and carried after spot moved: CE at OTM #(N-k) with PE at
+             OTM #(N+k) (N = --hedge-otm), k = -S..S (S = --shift-range); k > 0 is spot having
+             risen k strikes since the hedge was bought
 For every pair it asks Kite for the margin of:
     1. naked short straddle (weekly, MIS by default)
     2. short straddle (weekly, MIS) + long strangle (monthly, NRML)
@@ -19,6 +26,8 @@ Usage:
     python straddle_hedge_margin.py --index NIFTY --lots 1
     python straddle_hedge_margin.py --index SENSEX --max-otm 30 --csv out.csv
     python straddle_hedge_margin.py --mode price --price-targets 1 2 5 10 20 50
+    python straddle_hedge_margin.py --mode benefit --hedge-product MIS --margin-cap 2
+    python straddle_hedge_margin.py --mode shift --hedge-month -1 --hedge-product MIS --hedge-otm 20
 """
 
 import argparse
@@ -93,13 +102,16 @@ def load_chain(kite, index, exchange):
     return df[df["expiry"] >= date.today()]
 
 
-def pick_expiries(chain):
-    """Weekly = nearest expiry. Monthly = last expiry of a calendar month, strictly after the weekly."""
+def pick_expiries(chain, month_offset=0):
+    """Weekly = nearest expiry. Monthly = last expiry of a calendar month, strictly after the weekly;
+    month_offset=1 skips to the following month's expiry, and so on; -1 hedges in the weekly itself."""
     expiries = sorted(chain["expiry"].unique())
     weekly = expiries[0]
     monthlies = sorted({max(e for e in expiries if (e.year, e.month) == (y, m))
                         for y, m in {(e.year, e.month) for e in expiries}})
-    monthly = next(e for e in monthlies if e > weekly)
+    if month_offset < 0:
+        return weekly, weekly
+    monthly = [e for e in monthlies if e > weekly][month_offset]
     return weekly, monthly
 
 
@@ -137,13 +149,79 @@ def basket_margin(kite, orders):
     return resp["final"]["total"]
 
 
+def run_benefit_walk(kite, args, exch, wk, otm_ce, otm_pe, n_pairs, straddle_orders, naked, qty, rows):
+    """Best margin = weekly 1st OTM strangle hedge. Walk monthly strangles outward while
+    their hedged margin stays below args.margin_cap x that best margin; stop at the first above."""
+    if args.straddle_product != args.hedge_product:
+        print(f"WARNING: straddle {args.straddle_product} + hedge {args.hedge_product} mixes products; "
+              f"the broker may give no hedge benefit. Use the same product for both.\n")
+
+    def hedged_margin(ce, pe):
+        return basket_margin(kite, straddle_orders(args.straddle_product) + [
+            order(exch, ce["tradingsymbol"], "BUY", qty, args.hedge_product),
+            order(exch, pe["tradingsymbol"], "BUY", qty, args.hedge_product)])
+
+    def add_row(pick, expiry, ce, pe, hedged, best_margin):
+        benefit = naked - hedged
+        x_best = hedged / best_margin
+        hedge_pts = ce["price"] + pe["price"]
+        rows.append({
+            "variation": "benefit", "pick": pick, "hedge_expiry": expiry,
+            "CE_strike": ce["strike"], "CE_px": ce["price"], "CE_dist": ce["dist"],
+            "PE_strike": pe["strike"], "PE_px": pe["price"], "PE_dist": pe["dist"],
+            "strangle_pts": round(hedge_pts, 2), "hedge_cost_Rs": round(hedge_pts * qty),
+            "naked_margin": round(naked), "hedged_margin": round(hedged),
+            "margin_saved": round(benefit), "saved_%": round(100 * benefit / naked, 1),
+            "x_best_margin": round(x_best, 2),
+        })
+        print(f"  {pick:<14} {ce['strike']:g}CE @ {ce['price']:.2f} + {pe['strike']:g}PE @ {pe['price']:.2f}"
+              f" = {hedge_pts:.2f} pts (Rs {hedge_pts * qty:,.0f}) | hedged Rs {hedged:,.0f}"
+              f" | saved Rs {benefit:,.0f} ({100 * benefit / naked:.1f}%) | {x_best:.2f}x best margin", flush=True)
+
+    # Reference: 1st OTM strangle on the straddle's own expiry
+    w_ce = wk[wk["instrument_type"] == "CE"]
+    w_pe = wk[wk["instrument_type"] == "PE"]
+    straddle_syms = [o["tradingsymbol"] for o in straddle_orders(args.straddle_product)]
+    atm = wk[wk["tradingsymbol"] == straddle_syms[0]].iloc[0]["strike"]
+    ref_ce = w_ce[w_ce["strike"] > atm].nsmallest(1, "strike").iloc[0].copy()
+    ref_pe = w_pe[w_pe["strike"] < atm].nlargest(1, "strike").iloc[0].copy()
+    px = fetch_prices(kite, exch, [ref_ce["tradingsymbol"], ref_pe["tradingsymbol"]], args.price_field)
+    for leg in (ref_ce, ref_pe):
+        leg["price"] = px.get(leg["tradingsymbol"], 0.0)
+        leg["dist"] = abs(leg["strike"] - atm)
+
+    ref_hedged = hedged_margin(ref_ce, ref_pe)
+    print(f"Reference (best margin): weekly 1st OTM strangle")
+    add_row("REF wk OTM #1", ref_ce["expiry"], ref_ce, ref_pe, ref_hedged, ref_hedged)
+    cap = args.margin_cap * ref_hedged
+    print(f"\nHedge walk ({otm_ce.iloc[0]['expiry']}): keep while hedged margin < {args.margin_cap:g}x best (Rs {cap:,.0f})")
+
+    best = None
+    for k in range(n_pairs):
+        ce, pe = otm_ce.iloc[k], otm_pe.iloc[k]
+        hedged = hedged_margin(ce, pe)
+        add_row(f"hdg OTM #{k + 1}", ce["expiry"], ce, pe, hedged, ref_hedged)
+        if hedged >= cap:
+            break
+        best = k
+    print()
+    if best is None:
+        print(f"No hedge strangle keeps the margin under Rs {cap:,.0f}, not even the 1st OTM.")
+    else:
+        ce, pe = otm_ce.iloc[best], otm_pe.iloc[best]
+        print(f"Widest hedge under {args.margin_cap:g}x best margin: OTM #{best + 1}  "
+              f"{ce['tradingsymbol']} @ {ce['price']:.2f} + {pe['tradingsymbol']} @ {pe['price']:.2f}"
+              f" = {ce['price'] + pe['price']:.2f} pts (Rs {(ce['price'] + pe['price']) * qty:,.0f})")
+    print()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--index", default="NIFTY", choices=INDEX_CONFIG)
     ap.add_argument("--lots", type=int, default=1)
     ap.add_argument("--max-otm", type=int, default=None,
                     help="only test hedge pairs up to this many strikes OTM (default: all priced strikes)")
-    ap.add_argument("--mode", default="both", choices=["strikes", "price", "both"],
+    ap.add_argument("--mode", default="both", choices=["strikes", "price", "both", "benefit", "shift"],
                     help="how to pick hedge pairs (see above)")
     ap.add_argument("--price-targets", type=float, nargs="+", default=list(range(1, 51)),
                     help="per-leg premium targets for --mode price (default: 1..50)")
@@ -151,6 +229,12 @@ def main():
                     help="price used to choose hedge strikes")
     ap.add_argument("--straddle-product", default="MIS", choices=["MIS", "NRML"])
     ap.add_argument("--hedge-product", default="NRML", choices=["MIS", "NRML"])
+    ap.add_argument("--margin-cap", type=float, default=2.0,
+                    help="--mode benefit: keep monthly hedges whose margin is below this multiple of the best margin")
+    ap.add_argument("--hedge-otm", type=int, default=20, help="--mode shift: N, the hedge's OTM number when bought")
+    ap.add_argument("--shift-range", type=int, default=10, help="--mode shift: test k = -S..S strikes of spot move")
+    ap.add_argument("--hedge-month", type=int, default=0,
+                    help="0 = first monthly expiry after the weekly, 1 = the one after that, ...; -1 = the weekly itself")
     ap.add_argument("--csv", help="path to save the table (default: <INDEX>_margin.csv)")
     args = ap.parse_args()
     if args.csv is None:
@@ -161,7 +245,7 @@ def main():
     kite = get_kite()
 
     chain = load_chain(kite, args.index, exch)
-    weekly, monthly = pick_expiries(chain)
+    weekly, monthly = pick_expiries(chain, args.hedge_month)
     wk = chain[chain["expiry"] == weekly]
     mo = chain[chain["expiry"] == monthly].copy()
 
@@ -236,6 +320,30 @@ def main():
               f" | net credit Rs {(straddle_prem - hedge_pts) * qty:,.0f}", flush=True)
 
     rows = []
+    if args.mode == "benefit":
+        run_benefit_walk(kite, args, exch, wk, otm_ce, otm_pe, n_pairs, straddle_orders, naked, qty, rows)
+
+    if args.mode == "shift":
+        best = basket_margin(kite, straddle_orders(args.straddle_product) + [
+            order(exch, otm_ce.iloc[0]["tradingsymbol"], "BUY", qty, args.hedge_product),
+            order(exch, otm_pe.iloc[0]["tradingsymbol"], "BUY", qty, args.hedge_product)])
+        print(f"Best margin (1st OTM strangle, {monthly}): Rs {best:,.0f}\n")
+        for k in range(-args.shift_range, args.shift_range + 1):
+            ci, pi = args.hedge_otm - k - 1, args.hedge_otm + k - 1
+            if min(ci, pi) < 0 or max(ci, pi) >= n_pairs:
+                continue
+            ce, pe = otm_ce.iloc[ci], otm_pe.iloc[pi]
+            hedged = basket_margin(kite, straddle_orders(args.straddle_product) + [
+                order(exch, ce["tradingsymbol"], "BUY", qty, args.hedge_product),
+                order(exch, pe["tradingsymbol"], "BUY", qty, args.hedge_product)])
+            rows.append({"spot_move_strikes": k, "CE_otm": ci + 1, "CE_strike": ce["strike"], "CE_px": ce["price"],
+                         "PE_otm": pi + 1, "PE_strike": pe["strike"], "PE_px": pe["price"],
+                         "naked_margin": round(naked), "hedged_margin": round(hedged),
+                         "x_best_margin": round(hedged / best, 2)})
+            print(f"  spot {k:+d} strikes: CE #{ci + 1} {ce['strike']:g} + PE #{pi + 1} {pe['strike']:g}"
+                  f" | hedged Rs {hedged:,.0f} | {hedged / best:.2f}x best", flush=True)
+        print()
+
     if args.mode in ("strikes", "both"):
         print(f"Strike walk: {n_pairs} hedge pairs, 1st OTM outward")
         for k in range(n_pairs):
