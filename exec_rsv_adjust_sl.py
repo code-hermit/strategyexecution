@@ -21,6 +21,11 @@ applies at checkpoints up to EXPIRY_RISE_LAST_CHECKPOINT (10:45); from 11:45 a p
 the checkpoint rolls/reopens as normal. Non-expiry days are unchanged. Expiry day = Zerodha's nearest
 expiry is today (cross-checked against AliceBlue's contract master) - see run_day.
 
+EXPIRY-DAY MINIMUM STOP (13 Oct 2026, rs_v5_expiry_sl backtest): on NIFTY expiry days (EXPIRY_MIN_SL_PTS),
+from EXPIRY_MIN_SL_FROM (12:45) every stop is at least 10 points above sl_ref_price - trigger = the larger
+of the ladder trigger and sl_ref + 10. Before 12:45 the plain ladder applies. Late-day expiry premiums are
+too small for a 15% stop to be more than noise. One function sets every trigger: _stop_trigger.
+
 IV EXIT (13 Oct 2026, backtest_rs_v5.py rule 3, SENSEX only via IV_EXIT_PTS, non-expiry days): the straddle
 strike's IV (mean CE/PE, solved exactly like the backtest's iv_calc) is pinned at entry and after every
 checkpoint; if it rises IV_EXIT_PTS (0.75 vol points) above that on a minute snapshot, every open leg is
@@ -323,6 +328,12 @@ LADDER_CLOSE_DELAY_SECONDS = 0.5  # main loop wakes this long after each minute 
 EXPIRY_RISE_LAST_CHECKPOINT = dtime(10, 45)  # 13 Oct 2026 (backtest_rs_v5.py rule 2): on EXPIRY days the
 # ATM-premium-rise rule only applies at checkpoints up to this one; from 11:45 a premium rise is ignored.
 # Non-expiry days keep the rule at every checkpoint. See run_checkpoint.
+EXPIRY_MIN_SL_PTS = {'NIFTY': 10, 'SENSEX': None}  # 13 Oct 2026: on that index's EXPIRY days, from
+# EXPIRY_MIN_SL_FROM the stop is never closer than this many points above sl_ref_price (trigger = the larger
+# of the ladder trigger and sl_ref + pts) - late-day expiry premiums (median ~17-35) make a 15% stop a
+# 1-3 point noise stop. Backtest: rs_v5_expiry_sl (NIFTY_EXPIRY_MIN_SL_PTS=10, FLOOR_FROM=12:45) beat
+# the plain ladder on expiry days in 2024/25/26. None = off. See _stop_trigger.
+EXPIRY_MIN_SL_FROM = dtime(12, 45)
 IV_EXIT_PTS = {'NIFTY': None, 'SENSEX': 0.75}  # backtest_rs_v5.py rule 3 (non-expiry days): straddle-strike IV
 # this many vol points above its checkpoint reference -> close the open legs, flat until the next
 # checkpoint. None = off for that index. See run_iv_watch.
@@ -1131,14 +1142,24 @@ def _sl_trigger(ref_price, sl_pct):
     return round(ref_price * (1 + sl_pct))
 
 
-def _place_protective_sl(instrument, quantity, entry_price, order_tag, sl_pct):
+def _stop_trigger(ref_price, sl_pct, min_sl_pts=None):
+    """The stop trigger for a leg: the ladder trigger, raised to at least ref + min_sl_pts once
+    EXPIRY_MIN_SL_FROM has passed (min_sl_pts is stamped on a leg only on its index's expiry days -
+    see EXPIRY_MIN_SL_PTS). Every place a trigger is set goes through here, so they all agree."""
+    trigger = _sl_trigger(ref_price, sl_pct)
+    if min_sl_pts and datetime.now().time() >= EXPIRY_MIN_SL_FROM:
+        trigger = max(trigger, round(ref_price + min_sl_pts))
+    return trigger
+
+
+def _place_protective_sl(instrument, quantity, entry_price, order_tag, sl_pct, min_sl_pts=None):
     """Resting BUY SL (stop-loss LIMIT) at entry_price * (1 + sl_pct) - sl_pct is the ladder's
     starting width for the day (day['sl_start'], see LADDER); run_ladder widens/narrows it from
     there. Shared by a leg's very first entry (_short_leg_with_stoploss) and every chop reentry
     after it (_handle_chop_fill) - each gets its own fresh stoploss off wherever it actually filled,
     not off the checkpoint's pinned original level. Returns the protective order's broker order id,
     or None in DRY_RUN (nothing is actually placed)."""
-    trigger_price = _sl_trigger(entry_price, sl_pct)
+    trigger_price = _stop_trigger(entry_price, sl_pct, min_sl_pts)
     # Nearest integer, not a tick - same "STOP PRICE IS NOT REASONABLE" rejection applies to the
     # SL order's limit price as well as its trigger.
     sl_limit_price = round(trigger_price * (1 + LIMIT_OFFSET_PCT))
@@ -1175,7 +1196,7 @@ def _place_chop_reentry(instrument, quantity, original_entry_price, order_tag):
     return order_no
 
 
-def _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id, sl_pct):
+def _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id, sl_pct, min_sl_pts=None):
     """SELL to open, then hand off to _place_protective_sl. Returns (fill_price, sl_order_id) -
     sl_order_id (None in DRY_RUN) is kept by the caller so a later checkpoint can MODIFY this same
     resting order in place (see _reprice_leg_stoploss) rather than track the stoploss by trigger
@@ -1195,7 +1216,7 @@ def _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id, sl_pct):
         entry_price = _wait_for_fill_price(order_no)
     except TimeoutError:
         entry_price = _settle_timed_out_entry(opt, order_no, instrument)
-    sl_order_id = _place_protective_sl(instrument, quantity, entry_price, order_tag=_order_tag(opt, TAG_SL, leg_id), sl_pct=sl_pct)
+    sl_order_id = _place_protective_sl(instrument, quantity, entry_price, order_tag=_order_tag(opt, TAG_SL, leg_id), sl_pct=sl_pct, min_sl_pts=min_sl_pts)
     return entry_price, sl_order_id
 
 
@@ -1349,7 +1370,7 @@ def _enter_leg(state, day, opt, instrument, ltp, strike, cfg):
             return
         del _unresolved_entries[opt]
         if fill_price is not None:
-            sl_order_id = _place_protective_sl(p_instrument, p_quantity, fill_price, order_tag=_order_tag(opt, TAG_SL, p_leg_id), sl_pct=day['sl_start'])
+            sl_order_id = _place_protective_sl(p_instrument, p_quantity, fill_price, order_tag=_order_tag(opt, TAG_SL, p_leg_id), sl_pct=day['sl_start'], min_sl_pts=day['expiry_min_sl_pts'])
             alert(f'{opt}: earlier entry {order_no} turned out filled @ {fill_price} - SL placed, tracking it')
             _install_leg(state, day, opt, p_instrument, p_strike, fill_price, p_quantity, p_leg_id, sl_order_id)
             return
@@ -1365,7 +1386,7 @@ def _enter_leg(state, day, opt, instrument, ltp, strike, cfg):
     quantity = instrument.lot_size * cfg['lots']
     leg_id = _new_leg_id()
     try:
-        entry_price, sl_order_id = _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id, day['sl_start'])
+        entry_price, sl_order_id = _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id, day['sl_start'], day['expiry_min_sl_pts'])
     except _UnresolvedEntry as exc:
         _unresolved_entries[opt] = (exc.order_no, instrument, strike, quantity, leg_id)
         raise
@@ -1379,7 +1400,8 @@ def _install_leg(state, day, opt, instrument, strike, entry_price, quantity, leg
         # live SL trigger is currently measured off - starts equal to entry_price, then gets
         # re-pinned to the checkpoint LTP each time _reprice_leg_stoploss moves the live order -
         # see that function and the module docstring.
-        sl_start=day['sl_start'], rung=0, sl_trigger=_sl_trigger(entry_price, day['sl_start']),  # ladder
+        sl_start=day['sl_start'], rung=0, sl_trigger=_stop_trigger(entry_price, day['sl_start'], day['expiry_min_sl_pts']),  # ladder
+        min_sl_pts=day['expiry_min_sl_pts'],  # expiry-day points floor (None = off) - see _stop_trigger
         # state - see run_ladder; sl_trigger is the trigger the live SL order currently rests at.
         opened_at=time_module.time(),  # see _sync_stopped_out_and_chopped_legs: a positions
         # snapshot taken before this moment can't see this leg yet and must not count it as stopped.
@@ -1606,7 +1628,7 @@ def _handle_stoploss_fill(day, opt, leg, exit_price=None):
     if exit_price is None:
         # the trigger the resting order was last placed/modified at - it may have been re-priced at
         # a checkpoint (_reprice_leg_stoploss) or moved by the ladder (run_ladder) since entry.
-        exit_price = leg.get('sl_trigger') or _sl_trigger(leg['sl_ref_price'], _ladder_pct(leg))
+        exit_price = leg.get('sl_trigger') or _stop_trigger(leg['sl_ref_price'], _ladder_pct(leg), leg.get('min_sl_pts'))
     pnl = leg['entry_price'] - exit_price
     with _state_lock:
         day['realized_pnl'] += pnl
@@ -1648,14 +1670,15 @@ def _handle_chop_fill(state, day, opt, order_id, fill_price):
     leg_id = day['chop_leg_id'][opt]  # the reentry order was this leg's entry - see _order_tag
     sl_order_id = None
     try:
-        sl_order_id = _place_protective_sl(info['instrument'], info['quantity'], fill_price, order_tag=_order_tag(opt, TAG_SL, leg_id), sl_pct=day['sl_start'])
+        sl_order_id = _place_protective_sl(info['instrument'], info['quantity'], fill_price, order_tag=_order_tag(opt, TAG_SL, leg_id), sl_pct=day['sl_start'], min_sl_pts=day['expiry_min_sl_pts'])
     except Exception as exc:
         alert(f'{opt}: chop reentry filled @ {fill_price} but protective SL failed to place ({exc}) - naked position, check manually!', level=logging.CRITICAL)
     leg = dict(
         instrument=info['instrument'], strike=info['strike'], entry_price=fill_price, quantity=info['quantity'],
         leg_id=leg_id, sl_order_id=sl_order_id, sl_ref_price=fill_price,  # fresh leg - nothing to adjust yet, see
         # _enter_leg's comment.
-        sl_start=day['sl_start'], rung=0, sl_trigger=_sl_trigger(fill_price, day['sl_start']),
+        sl_start=day['sl_start'], rung=0, sl_trigger=_stop_trigger(fill_price, day['sl_start'], day['expiry_min_sl_pts']),
+        min_sl_pts=day['expiry_min_sl_pts'],
         opened_at=time_module.time(),
     )
     with _state_lock:
@@ -2025,7 +2048,7 @@ def _reprice_leg_stoploss(state, opt, market):
     with _state_lock:
         leg['sl_ref_price'] = current_ltp
         leg['rung'] = 0
-    _move_leg_stoploss(opt, leg, _sl_trigger(current_ltp, _ladder_pct(leg)), f'checkpoint repin {old_ref} -> {current_ltp}')
+    _move_leg_stoploss(opt, leg, _stop_trigger(current_ltp, _ladder_pct(leg), leg.get('min_sl_pts')), f'checkpoint repin {old_ref} -> {current_ltp}')
 
 
 def _move_leg_stoploss(opt, leg, trigger_price, why):
@@ -2059,7 +2082,7 @@ def _ladder_leg_stoploss(opt, leg, close):
     with _state_lock:
         leg['rung'] = rung
     sl_pct = _ladder_pct(leg)
-    trigger_price = _sl_trigger(leg['sl_ref_price'], sl_pct)
+    trigger_price = _stop_trigger(leg['sl_ref_price'], sl_pct, leg.get('min_sl_pts'))
     if trigger_price == leg.get('sl_trigger'):
         return
     if trigger_price <= close:
@@ -2412,6 +2435,7 @@ def run_day(symbol, trade_weekdays):
         alert(f'{symbol}: nearest expiry differs - Zerodha {nearest_expiry}, AliceBlue {aliceblue_expiry}. '
               f'Using Zerodha\'s (expiry day: {is_expiry_day}). Check manually!', level=logging.WARNING)
     day['is_expiry_day'] = is_expiry_day  # ladder start width (LADDER) and the expiry premium-rise rule
+    day['expiry_min_sl_pts'] = EXPIRY_MIN_SL_PTS.get(symbol) if is_expiry_day else None  # see _stop_trigger
     day.update(iv_exit_pts=None, iv_ref=None, iv_strike=None, iv_fired=False, expiry_at=None)  # IV exit off unless set up below
     try:  # IV exit setup - a failure here just leaves the IV watch off for the day
         day['expiry_at'] = datetime.combine(datetime.strptime(nearest_expiry, '%Y-%m-%d').date(), dtime(15, 30))  # IV's time to expiry
@@ -2428,7 +2452,8 @@ def run_day(symbol, trade_weekdays):
     day['ladder_minute'] = entry_time.replace(second=0, microsecond=0)  # last minute run_ladder handled
     alert(f'{symbol}: ladder stop starts at {day["sl_start"]:.0%} (nearest expiry {nearest_expiry}{", expiry day" if is_expiry_day else ""}), '
           f'+{LADDER_STEP:.0%} per rung, capped at {LADDER_MAX:.0%}'
-          + (f'; premium-rise rule only up to {EXPIRY_RISE_LAST_CHECKPOINT:%H:%M} today' if is_expiry_day else ''))
+          + (f'; premium-rise rule only up to {EXPIRY_RISE_LAST_CHECKPOINT:%H:%M} today' if is_expiry_day else '')
+          + (f'; stop at least {day["expiry_min_sl_pts"]} pts from {EXPIRY_MIN_SL_FROM:%H:%M}' if day['expiry_min_sl_pts'] else ''))
 
     scheduled_entry = datetime.combine(entry_time.date(), ENTRY_TIME)
     next_checkpoint = scheduled_entry + checkpoint_interval
@@ -2485,7 +2510,7 @@ def run_day(symbol, trade_weekdays):
                 leg = dict(
                     instrument=instrument, strike=strike_opt[0], entry_price=entry_price, quantity=quantity,
                     sl_order_id=sl_order_id, sl_ref_price=entry_price,
-                    sl_start=day['sl_start'], rung=0, sl_trigger=None,  # resting trigger unknown -
+                    sl_start=day['sl_start'], rung=0, sl_trigger=None, min_sl_pts=day['expiry_min_sl_pts'],  # resting trigger unknown -
                     # the first run_ladder moves the adopted SL onto the ladder off entry_price.
                 )
                 state[opt] = leg
