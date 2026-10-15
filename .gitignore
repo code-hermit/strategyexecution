@@ -3,6 +3,7 @@
 /__pycache__
 /archive
 *.log
+*.csv
 /logs
 /stock_range_reversal_data
 
