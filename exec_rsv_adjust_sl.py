@@ -26,6 +26,11 @@ from EXPIRY_MIN_SL_FROM (12:45) every stop is at least 10 points above sl_ref_pr
 of the ladder trigger and sl_ref + 10. Before 12:45 the plain ladder applies. Late-day expiry premiums are
 too small for a 15% stop to be more than noise. One function sets every trigger: _stop_trigger.
 
+PREMIUM-RISE RULE v7 (15 Oct 2026, backtest_rs_v7.py; LIVE from 16 Oct - RISE_V7_SHADOW = False): after an ATM premium
+rise, v7 trades the hour only if the move has STALLED (spot's 15-minute change is zero or opposite to its 1-hour
+change) AND IV is CALM (ATM IV up <= 0.75 vol points over the hour). Inputs: spot recorded every minute and ATM IV
+(own Black-Scholes solver, logged as 'ATM IV') at entry and every checkpoint. Decisions logged as 'RISE RULE v7'.
+
 IV EXIT (13 Oct 2026, backtest_rs_v5.py rule 3, SENSEX only via IV_EXIT_PTS, non-expiry days): the straddle
 strike's IV (mean CE/PE, solved exactly like the backtest's iv_calc) is pinned at entry and after every
 checkpoint; if it rises IV_EXIT_PTS (0.75 vol points) above that on a minute snapshot, every open leg is
@@ -339,6 +344,10 @@ IV_EXIT_PTS = {'NIFTY': None, 'SENSEX': 0.75}  # backtest_rs_v5.py rule 3 (non-e
 # checkpoint. None = off for that index. See run_iv_watch.
 IV_EXIT_SHADOW = True  # 13 Oct 2026: True = calculate and LOG what the IV exit would do, place nothing.
 IV_RISK_FREE_RATE = 0.065  # same as V2/Data/_split_by_dates.py, which produced the backtest's iv_calc
+RISE_V7_SHADOW = False  # 15 Oct 2026: LIVE from 16 Oct (user decision, no shadow week). backtest_rs_v7.py: True = log what the v7 premium-rise rule would do, keep the v5
+# rule (any ATM premium rise skips the hour). False = v7 live: a rise is traded when the move has stalled AND IV is calm.
+RISE_V7_IV_PTS = 0.75  # v7: IV 'calm' = ATM IV rose by this many vol points or less over the past hour
+RISE_V7_STALL_LOOKBACK = timedelta(minutes=15)  # v7: 'stalled' = spot's move over this window isn't in the past hour's direction
 CHOP_ENABLED = False  # 30 Sep 2026: False = no chop reentry after a STOPLOSS - the leg stays flat until
 # the next checkpoint reopens it. Matches Data/backtests/backtest_rs_v3_corrected_no_chop.py (repin on,
 # no chop), which beat every chop variant on both NIFTY and SENSEX since 2024. True = old behaviour.
@@ -2176,6 +2185,48 @@ def _fmt_iv(v):
 
 
 @_isolated
+@_isolated
+def _record_spot(market, day, now):
+    """v7 rule input: spot at each minute (first snapshot seen in that minute, ~the boundary)."""
+    day['spot_by_min'].setdefault(now.replace(second=0, microsecond=0), market['spot'])
+
+
+def _spot_at(day, ts):
+    for k in (ts, ts - timedelta(minutes=1), ts + timedelta(minutes=1)):
+        if k in day['spot_by_min']:
+            return day['spot_by_min'][k]
+    return None
+
+
+@_isolated
+def _record_atm_iv(market, day, at, why):
+    """v7 rule input: ATM straddle IV (mean CE/PE, same solver as the backtest's iv_calc) at entry and every
+    checkpoint - logged every time, so it can be checked against the next day's iv_calc."""
+    iv, ivs = _straddle_iv(market, day, market['atm'])
+    day['atm_iv_by_cp'][at] = iv
+    log.info(f'ATM IV {at:%H:%M} ({why}): strike {market["atm"]} CE {_fmt_iv(ivs["CE"])} PE {_fmt_iv(ivs["PE"])} '
+             f'avg {_fmt_iv(iv)} | spot {market["spot"]}')
+
+
+@_isolated
+def _rise_v7_decision(market, day, at):
+    """backtest_rs_v7.py premium-rise rule: after an ATM premium rise, trade the hour only if the move has STALLED
+    (spot's change over the last RISE_V7_STALL_LOOKBACK is zero or opposite to its change over the past hour) AND IV
+    is CALM (ATM IV rose <= RISE_V7_IV_PTS over the past hour). Returns (trade?, detail); any missing input ->
+    (False, ...) i.e. keep skipping (the v5 rule). None only if this raised (then v5 applies too)."""
+    s_now, s15, s60 = market['spot'], _spot_at(day, at - RISE_V7_STALL_LOOKBACK), _spot_at(day, at - timedelta(hours=1))
+    iv_now, iv_prev = day['atm_iv_by_cp'].get(at), day['atm_iv_by_cp'].get(at - timedelta(hours=1))
+    missing = [n for n, v in (('spot 15m ago', s15), ('spot 1h ago', s60), ('ATM IV now', iv_now), ('ATM IV 1h ago', iv_prev)) if v is None]
+    if missing:
+        return False, f'missing {", ".join(missing)} -> keep skipping'
+    d15, d60, div = s_now - s15, s_now - s60, iv_now - iv_prev
+    stalled = d15 == 0 or (d15 > 0) != (d60 > 0)
+    calm = div <= RISE_V7_IV_PTS
+    return stalled and calm, (f'spot {s_now} | 15m ago {s15} ({d15:+.1f}) | 1h ago {s60} ({d60:+.1f}) -> '
+                              f'{"STALLED" if stalled else "still moving"} | ATM IV {iv_prev:.2f} -> {iv_now:.2f} ({div:+.2f}) -> '
+                              f'{"calm" if calm else "SPIKED"}')
+
+
 def _pin_iv_reference(state, market, day, why):
     """The IV exit's reference for this window: the straddle strike's IV off `market` (the entry /
     checkpoint / adoption snapshot) - re-pinned at every checkpoint, as in the backtest."""
@@ -2250,6 +2301,19 @@ def run_checkpoint(state, market, cfg, day, symbol, checkpoint_at):
         log.info(f'ATM premium rose ({prev_premium} -> {current_premium}) but it is expiry day after '
                  f'{EXPIRY_RISE_LAST_CHECKPOINT:%H:%M} - ignoring the premium-rise rule this checkpoint')
         premium_increased = False
+
+    _record_atm_iv(market, day, checkpoint_at, 'checkpoint')  # @_isolated - v7 rule input, logged
+    if premium_increased:
+        decision = _rise_v7_decision(market, day, checkpoint_at)  # @_isolated - None if it raised
+        if decision is not None:
+            trade, detail = decision
+            if trade and not RISE_V7_SHADOW:
+                log.info(f'RISE RULE v7: ATM premium rose ({prev_premium} -> {current_premium}) but the move is over - '
+                         f'TRADING this hour (v5 would skip) | {detail}')
+                premium_increased = False
+            else:
+                log.info(f'RISE RULE v7{" [SHADOW - v5 rule applied, hour skipped]" if RISE_V7_SHADOW else ""}: ATM premium rose '
+                         f'({prev_premium} -> {current_premium}) - v7 would {"TRADE" if trade else "keep skipping"} | {detail}')
 
     log.info(f'checkpoint {checkpoint_at:%H:%M}: spot={market["spot"]} atm={market["atm"]} atm_premium={current_premium} (prev={prev_premium}) day_pnl={day["realized_pnl"]:.2f}')
     _checkpoint_act(state, market, cfg, day, premium_increased)
@@ -2449,6 +2513,7 @@ def run_day(symbol, trade_weekdays):
         day['iv_exit_pts'] = None
         log.warning(f'IV watch setup failed ({exc}) - IV watch off today, trading unaffected', exc_info=True, extra={'no_telegram': True})
     day['sl_start'] = LADDER[symbol][1 if is_expiry_day else 0]
+    day.update(atm_iv_by_cp={}, spot_by_min={})  # v7 premium-rise rule inputs - see _rise_v7_decision
     day['ladder_minute'] = entry_time.replace(second=0, microsecond=0)  # last minute run_ladder handled
     alert(f'{symbol}: ladder stop starts at {day["sl_start"]:.0%} (nearest expiry {nearest_expiry}{", expiry day" if is_expiry_day else ""}), '
           f'+{LADDER_STEP:.0%} per rung, capped at {LADDER_MAX:.0%}'
@@ -2456,6 +2521,10 @@ def run_day(symbol, trade_weekdays):
           + (f'; stop at least {day["expiry_min_sl_pts"]} pts from {EXPIRY_MIN_SL_FROM:%H:%M}' if day['expiry_min_sl_pts'] else ''))
 
     scheduled_entry = datetime.combine(entry_time.date(), ENTRY_TIME)
+    _record_spot(market, day, entry_time)  # @_isolated - v7 inputs: spot and ATM IV at the entry snapshot
+    _record_atm_iv(market, day, scheduled_entry if entry_time - scheduled_entry < timedelta(minutes=2)
+                   else entry_time.replace(second=0, microsecond=0), 'entry')
+    log.info(f'RISE RULE v7: {"SHADOW - logged only, v5 rule (any ATM premium rise skips) applied" if RISE_V7_SHADOW else "LIVE"}')
     next_checkpoint = scheduled_entry + checkpoint_interval
     while next_checkpoint <= entry_time:
         next_checkpoint += checkpoint_interval
@@ -2546,6 +2615,7 @@ def run_day(symbol, trade_weekdays):
             else:
                 market = _fetch_market(symbol, cfg, state)
                 contracts_box[0] = market['contracts_by_token']
+            _record_spot(market, day, now)  # @_isolated - v7 rule input
             # no _sync_stopped_out_and_chopped_legs here any more - the watch thread is the only
             # place legs are reconciled (running it on both threads let them race each other, and a
             # failed broker read here used to skip the loss-limit check and checkpoint below)
