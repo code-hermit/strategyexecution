@@ -140,7 +140,7 @@ does NOT import execution_rolling_straddle_tn.py (which authenticates with Dhan 
 its market-data source); Dhan is never touched, imported, or authenticated by this file at all.
 
 Trades a single underlying (command-line arg, default NIFTY) on TRADE_WEEKDAYS (command-line
-weekday codes, default every weekday - matching the backtest's own default). Lots default to 4 for
+weekday codes, default every weekday - matching the backtest's own default). Lots default to 5 for
 both NIFTY and SENSEX (informational CFG below); pass a different symbol/weekday-codes pair on the
 command line to override.
 
@@ -365,12 +365,12 @@ DAY_CODE_TO_WEEKDAY = {'m': 'Monday', 't': 'Tuesday', 'w': 'Wednesday', 'h': 'Th
 # underlying (matching the backtest's convention); now set per-underlying instead.
 CFG = {
     'NIFTY': dict(
-        strike_interval=50, lots=4, aliceblue_exchange='NFO',
+        strike_interval=50, lots=5, aliceblue_exchange='NFO',
         zerodha_options_exchange='NFO', zerodha_spot_instrument='NSE:NIFTY 50',
         daily_loss_limit=40,
     ),
     'SENSEX': dict(
-        strike_interval=100, lots=4, aliceblue_exchange='BFO',
+        strike_interval=100, lots=5, aliceblue_exchange='BFO',
         zerodha_options_exchange='BFO', zerodha_spot_instrument='BSE:SENSEX',
         daily_loss_limit=120,
     ),
@@ -1205,44 +1205,36 @@ def _place_chop_reentry(instrument, quantity, original_entry_price, order_tag):
     return order_no
 
 
-def _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id, sl_pct, min_sl_pts=None):
-    """SELL to open, then hand off to _place_protective_sl. Returns (fill_price, sl_order_id) -
-    sl_order_id (None in DRY_RUN) is kept by the caller so a later checkpoint can MODIFY this same
-    resting order in place (see _reprice_leg_stoploss) rather than track the stoploss by trigger
-    price alone."""
-    entry_price = _round_to_tick(ltp * (1 - LIMIT_OFFSET_PCT), instrument.tick_size)
-    tag = f'{"[DRY RUN] " if DRY_RUN else ""}SELL {quantity} x {instrument.name} LIMIT @ {entry_price} (ltp {ltp})'
-    log.info(tag)
-    if DRY_RUN:
-        return entry_price, None
+# ── Leg lifecycle ─────────────────────────────────────────────────────────────────────────────
+# 16 Oct 2026: a leg is recorded in state[opt] from the moment its entry order is SENT, and moves through:
+#   pre_entry - entry SELL sent (tag recorded); fill not yet confirmed. The side counts as occupied (never
+#               re-entered) but there is no position yet - nothing monitors or closes it except the
+#               resolver (_resolve_pre_entry), which reads the order by id, or by tag if the request errored.
+#   entry     - filled (fill price recorded), protective SL not (yet) resting. A real position: rolls, loss
+#               limit and EOD manage it; the SL is retried every poll (_maintain_legs).
+#   stoploss  - SL resting: fully installed, the normal state.
+# Closes duplicate-order holes: a timed-out/errored entry request used to leave the slot empty (the retry
+# sold again), and a failed SL after a fill used to lose the filled leg (retry sold again, first one naked).
+LEG_PRE_ENTRY, LEG_ENTRY, LEG_STOPLOSS = 'pre_entry', 'entry', 'stoploss'
+PRE_ENTRY_GIVE_UP_SECONDS = 60  # an errored entry request with no matching order in the book after this long never reached the broker
 
-    entry = _place_order('SELL', instrument, quantity, 'LIMIT', price=str(entry_price), order_tag=_order_tag(opt, TAG_ENTRY, leg_id))
-    order_no = entry.get('brokerOrderId')
-    if not order_no:
-        raise RuntimeError(f'{instrument.name} entry order rejected: {entry}')
 
-    try:
-        entry_price = _wait_for_fill_price(order_no)
-    except TimeoutError:
-        entry_price = _settle_timed_out_entry(opt, order_no, instrument)
-    sl_order_id = _place_protective_sl(instrument, quantity, entry_price, order_tag=_order_tag(opt, TAG_SL, leg_id), sl_pct=sl_pct, min_sl_pts=min_sl_pts)
-    return entry_price, sl_order_id
+def _leg_state(leg):
+    return None if leg is None else leg.get('leg_state', LEG_STOPLOSS)  # legs built elsewhere (adoption, chop) default to installed
+
+
+def _has_position(leg):
+    """True for a leg that is a real short position (entry or stoploss) - pre_entry is a slot reservation only."""
+    return _leg_state(leg) in (LEG_ENTRY, LEG_STOPLOSS)
 
 
 class _UnresolvedEntry(RuntimeError):
     """An entry SELL whose outcome couldn't be confirmed (still resting after a cancel, or
-    part-filled) - its side must not be entered again until it's settled, see _unresolved_entries."""
+    part-filled) - its side must not be entered again until it's settled (the leg stays pre_entry)."""
 
     def __init__(self, message, order_no):
         super().__init__(message)
         self.order_no = order_no
-
-
-# opt -> (order_no, instrument, strike, quantity, leg_id) of an entry SELL that timed out and couldn't be
-# confirmed dead. 1 Oct 2026 13:45 SENSEX: the PE entry timed out, was neither cancelled nor
-# tracked, the checkpoint retry saw PE flat and sold a second 60 - then the first one filled too
-# (120 short, SL on 60). _enter_leg settles anything parked here before placing a fresh entry.
-_unresolved_entries = {}
 
 
 def _settle_entry_order(order_no, label):
@@ -1264,23 +1256,6 @@ def _settle_entry_order(order_no, label):
             raise _UnresolvedEntry(f'{label}: order {order_no} {status} after part-filling {filled}', order_no)
         return None
     raise _UnresolvedEntry(f'{label}: order {order_no} still {status!r} after cancel', order_no)
-
-
-def _settle_timed_out_entry(opt, order_no, instrument):
-    """_wait_for_fill_price timed out on `order_no`: never leave it live and untracked. Filled
-    anyway -> its fill price (the caller protects and tracks it as normal). Dead with nothing
-    filled -> raise, so the checkpoint retry enters afresh. Unresolved -> CRITICAL alert and
-    raise _UnresolvedEntry (_enter_leg parks it, blocking a second SELL on this side)."""
-    label = f'{instrument.name} entry'
-    try:
-        fill_price = _settle_entry_order(order_no, label)
-    except _UnresolvedEntry as exc:
-        alert(f'{opt}: {exc} - NOT re-entering {opt} until it settles. Check manually!', level=logging.CRITICAL)
-        raise
-    if fill_price is None:
-        raise RuntimeError(f'{label} order {order_no} not filled within {FILL_POLL_TIMEOUT}s - cancelled, nothing filled')
-    log.warning(f'{label} order {order_no} filled late @ {fill_price} - tracking it as the leg')
-    return fill_price
 
 
 def _run_legs_in_parallel(tasks):
@@ -1368,22 +1343,12 @@ def _abandon_chop_watches(day):
 
 
 def _enter_leg(state, day, opt, instrument, ltp, strike, cfg):
-    pending = _unresolved_entries.get(opt)
-    if pending is not None:
-        # an earlier entry on this side is still unaccounted for - settle it before any new SELL
-        order_no, p_instrument, p_strike, p_quantity, p_leg_id = pending
-        try:
-            fill_price = _settle_entry_order(order_no, f'{p_instrument.name} entry')
-        except _UnresolvedEntry as exc:
-            log.warning(f'{opt}: {exc} - staying flat on {opt} this checkpoint')
+    """Short one leg: reserve the slot as pre_entry BEFORE the SELL goes out, record the order id, then on
+    the fill move it to entry and place the SL (stoploss). Never sells while the slot is occupied."""
+    with _state_lock:
+        if state[opt] is not None:
+            log.info(f'{opt}: slot occupied ({_leg_state(state[opt])}) - not placing another entry')
             return
-        del _unresolved_entries[opt]
-        if fill_price is not None:
-            sl_order_id = _place_protective_sl(p_instrument, p_quantity, fill_price, order_tag=_order_tag(opt, TAG_SL, p_leg_id), sl_pct=day['sl_start'], min_sl_pts=day['expiry_min_sl_pts'])
-            alert(f'{opt}: earlier entry {order_no} turned out filled @ {fill_price} - SL placed, tracking it')
-            _install_leg(state, day, opt, p_instrument, p_strike, fill_price, p_quantity, p_leg_id, sl_order_id)
-            return
-
     hedge_qty = _long_position_qty(instrument.token)
     if hedge_qty:
         # spot has reached a hedge strike: a short here would net against the hedge, and the order book /
@@ -1394,31 +1359,164 @@ def _enter_leg(state, day, opt, instrument, ltp, strike, cfg):
 
     quantity = instrument.lot_size * cfg['lots']
     leg_id = _new_leg_id()
-    try:
-        entry_price, sl_order_id = _short_leg_with_stoploss(instrument, quantity, ltp, opt, leg_id, day['sl_start'], day['expiry_min_sl_pts'])
-    except _UnresolvedEntry as exc:
-        _unresolved_entries[opt] = (exc.order_no, instrument, strike, quantity, leg_id)
-        raise
-    _install_leg(state, day, opt, instrument, strike, entry_price, quantity, leg_id, sl_order_id)
-
-
-def _install_leg(state, day, opt, instrument, strike, entry_price, quantity, leg_id, sl_order_id):
-    leg = dict(
-        instrument=instrument, strike=strike, entry_price=entry_price, quantity=quantity, leg_id=leg_id,
-        sl_order_id=sl_order_id, sl_ref_price=entry_price,  # sl_ref_price: the price this leg's
-        # live SL trigger is currently measured off - starts equal to entry_price, then gets
-        # re-pinned to the checkpoint LTP each time _reprice_leg_stoploss moves the live order -
-        # see that function and the module docstring.
-        sl_start=day['sl_start'], rung=0, sl_trigger=_stop_trigger(entry_price, day['sl_start'], day['expiry_min_sl_pts']),  # ladder
-        min_sl_pts=day['expiry_min_sl_pts'],  # expiry-day points floor (None = off) - see _stop_trigger
-        # state - see run_ladder; sl_trigger is the trigger the live SL order currently rests at.
-        opened_at=time_module.time(),  # see _sync_stopped_out_and_chopped_legs: a positions
-        # snapshot taken before this moment can't see this leg yet and must not count it as stopped.
-    )
-    with _state_lock:  # see _state_lock's comment - races the watch thread's own clear
+    limit_price = _round_to_tick(ltp * (1 - LIMIT_OFFSET_PCT), instrument.tick_size)
+    leg = dict(instrument=instrument, strike=strike, quantity=quantity, leg_id=leg_id, leg_state=LEG_PRE_ENTRY,
+               entry_tag=_order_tag(opt, TAG_ENTRY, leg_id), entry_order_id=None, entry_limit=limit_price,
+               placed_at=time_module.time(), entry_price=None, sl_order_id=None)
+    with _state_lock:
         state[opt] = leg
+    log.info(f'{"[DRY RUN] " if DRY_RUN else ""}{opt} PRE-ENTRY: SELL {quantity} x {instrument.name} LIMIT @ {limit_price} '
+             f'(ltp {ltp}) tag {leg["entry_tag"]}')
+    if DRY_RUN:
+        _fill_leg(state, day, opt, limit_price)
+        _protect_leg(state, day, opt)
+        return
+
+    try:
+        entry = _place_order('SELL', instrument, quantity, 'LIMIT', price=str(limit_price), order_tag=leg['entry_tag'])
+    except Exception as exc:
+        # the request errored - it may still have reached the broker. Keep the slot as pre_entry: the
+        # resolver finds the order by its tag (or gives up after PRE_ENTRY_GIVE_UP_SECONDS) - never re-sell blind.
+        log.warning(f'{opt}: entry request for {instrument.name} failed ({exc}) - kept as pre_entry, resolving by tag {leg["entry_tag"]}')
+        return
+    order_no = entry.get('brokerOrderId')
+    if not order_no:  # an explicit rejection: nothing was placed, free the slot
+        with _state_lock:
+            if state[opt] is leg:
+                state[opt] = None
+        raise RuntimeError(f'{instrument.name} entry order rejected: {entry}')
+    with _state_lock:
+        leg['entry_order_id'] = order_no
+    try:
+        fill_price = _wait_for_fill_price(order_no)
+    except TimeoutError:
+        _resolve_pre_entry(state, day, opt)  # cancel + read: filled late -> entry/stoploss, dead -> freed, unknown -> kept
+        if state[opt] is None:
+            raise RuntimeError(f'{instrument.name} entry order {order_no} not filled within {FILL_POLL_TIMEOUT}s - cancelled, nothing filled')
+        return
+    except RuntimeError:  # the order book says rejected: nothing filled, free the slot
+        with _state_lock:
+            if state[opt] is leg:
+                state[opt] = None
+        raise
+    _fill_leg(state, day, opt, fill_price)
+    _protect_leg(state, day, opt)
+
+
+def _fill_leg(state, day, opt, fill_price):
+    """pre_entry -> entry: record the fill and everything a live position needs (ladder state, pinned level)."""
+    leg = state[opt]
+    with _state_lock:
+        leg.update(
+            entry_price=fill_price, sl_ref_price=fill_price,  # sl_ref_price: what the SL trigger is measured off -
+            # starts at the fill, re-pinned to the checkpoint LTP by _reprice_leg_stoploss
+            sl_start=day['sl_start'], rung=0, sl_trigger=_stop_trigger(fill_price, day['sl_start'], day['expiry_min_sl_pts']),
+            min_sl_pts=day['expiry_min_sl_pts'],  # expiry-day points floor (None = off) - see _stop_trigger
+            opened_at=time_module.time(),  # see _sync_stopped_out_and_chopped_legs: an older positions snapshot can't see it yet
+            leg_state=LEG_ENTRY, sl_fail_alerts=0,
+        )
         _pin_checkpoint_info(day, opt, leg)
-    alert(f'ENTER {opt} {instrument.name} x{quantity} @ ~{entry_price} (SL {day["sl_start"]:.0%} ladder, trigger {leg["sl_trigger"]})')
+    log.info(f'{opt} FILLED: {leg["instrument"].name} x{leg["quantity"]} @ {fill_price} (order {leg.get("entry_order_id")}) - placing SL')
+
+
+def _protect_leg(state, day, opt, retry=False):
+    """entry -> stoploss: place the protective SL at the leg's current ladder trigger. On failure the leg stays
+    'entry' (a tracked position, never re-entered), a CRITICAL alert goes out and _maintain_legs retries. On a
+    retry, an SL that already rests with our tag is adopted first - an earlier request may have reached the
+    broker despite erroring, and a second SL could flip the leg long."""
+    leg = state[opt]
+    if _leg_state(leg) != LEG_ENTRY:
+        return
+    name = leg['instrument'].name
+    try:
+        sl_order_id = _find_resting_sl_order_id(leg['instrument'].token) if (retry and not DRY_RUN) else None
+        adopted = sl_order_id is not None
+        if not adopted:
+            sl_order_id = _place_protective_sl(leg['instrument'], leg['quantity'], leg['sl_ref_price'],
+                                               order_tag=_order_tag(opt, TAG_SL, leg['leg_id']), sl_pct=_ladder_pct(leg),
+                                               min_sl_pts=leg.get('min_sl_pts'))
+    except Exception as exc:
+        leg['sl_fail_alerts'] = leg.get('sl_fail_alerts', 0) + 1
+        msg = (f'{opt} {name}: FILLED @ {leg["entry_price"]} but SL NOT placed ({exc}) - position UNPROTECTED, '
+               f'retrying every poll (attempt {leg["sl_fail_alerts"]})')
+        if leg['sl_fail_alerts'] == 1 or leg['sl_fail_alerts'] % 10 == 0:
+            alert(msg + '. Check manually!', level=logging.CRITICAL)
+        else:
+            log.error(msg, extra={'no_telegram': True})
+        return
+    with _state_lock:
+        leg.update(sl_order_id=sl_order_id, sl_trigger=_stop_trigger(leg['sl_ref_price'], _ladder_pct(leg), leg.get('min_sl_pts')),
+                   leg_state=LEG_STOPLOSS)
+    how = 'adopted resting SL' if adopted else ('SL placed on retry' if retry else 'SL')
+    alert(f'ENTER {opt} {name} x{leg["quantity"]} @ ~{leg["entry_price"]} ({how} {sl_order_id}, '
+          f'{leg["sl_start"]:.0%} ladder, trigger {leg["sl_trigger"]})')
+
+
+def _resolve_pre_entry(state, day, opt):
+    """Settle a pre_entry leg against the order book: find its order (by id, else by tag), cancel whatever is
+    still resting, and read the outcome - filled -> entry (+ SL), dead with nothing filled -> slot freed, still
+    unknown -> kept (retried next poll). Main-thread only (entries/closes run there too)."""
+    leg = state[opt]
+    if _leg_state(leg) != LEG_PRE_ENTRY or DRY_RUN:
+        return
+    name = leg['instrument'].name
+    if leg['entry_order_id'] is None:
+        book = _read_order_book_or_none(f'{opt} pre_entry tag lookup')
+        if book is None:
+            return
+        tag = leg['entry_tag'].lower()
+        hits = [o for o in book if str(_tag_of(o) or '').lower() == tag and str(o.get('instrumentId')) == str(leg['instrument'].token)
+                and str(o.get('transactionType', '')).upper() == 'SELL']
+        if hits:
+            with _state_lock:
+                leg['entry_order_id'] = hits[-1].get('brokerOrderId')
+            log.warning(f'{opt}: errored entry request DID reach the broker - order {leg["entry_order_id"]} (tag {leg["entry_tag"]})')
+        elif time_module.time() - leg['placed_at'] > PRE_ENTRY_GIVE_UP_SECONDS:
+            with _state_lock:
+                if state[opt] is leg:
+                    state[opt] = None
+            log.warning(f'{opt}: no order with tag {leg["entry_tag"]} after {PRE_ENTRY_GIVE_UP_SECONDS}s - entry never reached the broker, slot freed')
+            return
+        else:
+            return
+    try:
+        fill_price = _settle_entry_order(leg['entry_order_id'], f'{name} entry')
+    except _UnresolvedEntry as exc:
+        leg['unresolved_alerts'] = leg.get('unresolved_alerts', 0) + 1
+        if leg['unresolved_alerts'] == 1:
+            alert(f'{opt}: {exc} - kept as pre_entry, NOT re-entering {opt} until it settles. Check manually!', level=logging.CRITICAL)
+        return
+    if fill_price is None:
+        with _state_lock:
+            if state[opt] is leg:
+                state[opt] = None
+        log.info(f'{opt}: entry order {leg["entry_order_id"]} cancelled with nothing filled - slot freed')
+        return
+    log.warning(f'{opt}: entry order {leg["entry_order_id"]} filled @ {fill_price} - tracking it as the leg')
+    _fill_leg(state, day, opt, fill_price)
+    _protect_leg(state, day, opt)
+
+
+def _maintain_legs(state, day, market, cfg):
+    """Every poll: settle pre_entry legs, and give 'entry' legs (filled, no SL) their SL - or, if price has
+    already run past where the stop would sit, close them as the stop would have. Errors are logged, never raised."""
+    for opt in OPTION_TYPES:
+        try:
+            st = _leg_state(state[opt])
+            if st == LEG_PRE_ENTRY:
+                _resolve_pre_entry(state, day, opt)
+            elif st == LEG_ENTRY and not day['closing'][opt]:
+                leg = state[opt]
+                ltp = market['price'].get((leg['strike'], opt))
+                stop = leg.get('sl_trigger') or _stop_trigger(leg['sl_ref_price'], _ladder_pct(leg), leg.get('min_sl_pts'))  # adopted legs carry none yet
+                if ltp is not None and ltp >= stop:
+                    alert(f'{opt} {leg["instrument"].name}: still UNPROTECTED and ltp {ltp} >= stop {stop} - closing as a stop',
+                          level=logging.CRITICAL)
+                    day['realized_pnl'] += _close_leg(state, day, opt, market, cfg, 'STOPLOSS_UNPROTECTED') or 0.0
+                else:
+                    _protect_leg(state, day, opt, retry=True)
+        except Exception as exc:
+            log.warning(f'{opt}: leg maintenance failed ({exc}) - retrying next poll', exc_info=True)
 
 
 def _enter_legs_parallel(state, day, desired, cfg, only_missing=False):
@@ -1433,6 +1531,10 @@ def _enter_legs_parallel(state, day, desired, cfg, only_missing=False):
 
 
 def _close_leg(state, day, opt, market, cfg, reason):
+    if _leg_state(state[opt]) == LEG_PRE_ENTRY:  # settle it first: filled -> a position to close, dead -> nothing to do
+        _resolve_pre_entry(state, day, opt)
+        if _leg_state(state[opt]) == LEG_PRE_ENTRY:
+            raise RuntimeError(f'{opt}: entry still unresolved (pre_entry) - not closing yet, will retry')
     leg = state[opt]
     if leg is None:
         return None
@@ -1687,7 +1789,7 @@ def _handle_chop_fill(state, day, opt, order_id, fill_price):
         leg_id=leg_id, sl_order_id=sl_order_id, sl_ref_price=fill_price,  # fresh leg - nothing to adjust yet, see
         # _enter_leg's comment.
         sl_start=day['sl_start'], rung=0, sl_trigger=_stop_trigger(fill_price, day['sl_start'], day['expiry_min_sl_pts']),
-        min_sl_pts=day['expiry_min_sl_pts'],
+        min_sl_pts=day['expiry_min_sl_pts'], leg_state=LEG_STOPLOSS if sl_order_id else LEG_ENTRY,
         opened_at=time_module.time(),
     )
     with _state_lock:
@@ -1867,7 +1969,7 @@ def _sync_stopped_out_and_chopped_legs(state, day, market):
             # opened_at: _enter_leg/_handle_chop_fill install a leg only after its entry filled and
             # its SL was placed - a snapshot taken before that moment may not show that SL order yet,
             # so the leg is skipped until the next check. Adopted legs have no opened_at -> 0.
-            check = leg is not None and not day['closing'][opt] and leg.get('opened_at', 0) < snapshot_at
+            check = _has_position(leg) and not day['closing'][opt] and leg.get('opened_at', 0) < snapshot_at  # pre_entry: no position to reconcile
         if leg is not None:
             if check:
                 _reconcile_leg(state, day, opt, leg, order_book, positions, snapshot_at)
@@ -2109,7 +2211,7 @@ def run_ladder(state, market):
     resting SL fires at the width in force during that minute, as in the backtest."""
     for opt in OPTION_TYPES:
         leg = state[opt]
-        if leg is None:
+        if not _has_position(leg):  # flat, or pre_entry (no fill / ladder state yet)
             continue
         close = market['price'].get((leg['strike'], opt))
         if close is None:
@@ -2227,6 +2329,34 @@ def _rise_v7_decision(market, day, at):
                               f'{"calm" if calm else "SPIKED"}')
 
 
+def _apply_rise_v7(market, day, checkpoint_at, prev_premium, current_premium, v5_premium_increased):
+    """The v7 premium-rise step of a checkpoint. Returns the premium_increased to act on: the v5 value unchanged,
+    except False ('trade this hour') when v5 says skip AND _rise_v7_decision returned a valid (True, detail) AND v7
+    is live. Strict fallback: an invalid decision, missing inputs, or ANY exception -> v5_premium_increased."""
+    try:
+        _record_atm_iv(market, day, checkpoint_at, 'checkpoint')  # @_isolated - v7 input, logged
+        if v5_premium_increased is not True:
+            return v5_premium_increased  # no rise (or expiry after 10:45): nothing for v7 to decide
+        decision = _rise_v7_decision(market, day, checkpoint_at)  # @_isolated - None if it raised
+        if not (isinstance(decision, tuple) and len(decision) == 2 and isinstance(decision[0], bool)):
+            log.warning(f'RISE RULE v7: no valid decision ({decision!r}) - falling back to v5, hour skipped', extra={'no_telegram': True})
+            return v5_premium_increased
+        trade, detail = decision
+        if trade and not RISE_V7_SHADOW:
+            log.info(f'RISE RULE v7: ATM premium rose ({prev_premium} -> {current_premium}) but the move is over - '
+                     f'TRADING this hour (v5 would skip) | {detail}')
+            return False
+        log.info(f'RISE RULE v7{" [SHADOW - v5 rule applied, hour skipped]" if RISE_V7_SHADOW else ""}: ATM premium rose '
+                 f'({prev_premium} -> {current_premium}) - v7 would {"TRADE" if trade else "keep skipping"} | {detail}')
+        return v5_premium_increased
+    except Exception as exc:
+        try:
+            log.warning(f'RISE RULE v7 failed ({exc}) - falling back to v5 (premium rise -> hour skipped)', exc_info=True, extra={'no_telegram': True})
+        except Exception:
+            pass
+        return v5_premium_increased
+
+
 def _pin_iv_reference(state, market, day, why):
     """The IV exit's reference for this window: the straddle strike's IV off `market` (the entry /
     checkpoint / adoption snapshot) - re-pinned at every checkpoint, as in the backtest."""
@@ -2248,7 +2378,7 @@ def run_iv_watch(state, market, cfg, day):
     reference; at >= iv_exit_pts above it, close every open leg (flat until the next checkpoint). With
     IV_EXIT_SHADOW nothing is placed - the would-be exit is logged once per window, and the IV keeps
     being logged every minute so it can be checked against the next day's iv_calc."""
-    if day['iv_exit_pts'] is None or day['iv_ref'] is None or (state['CE'] is None and state['PE'] is None):
+    if day['iv_exit_pts'] is None or day['iv_ref'] is None or not (_has_position(state['CE']) or _has_position(state['PE'])):
         return
     iv, ivs = _straddle_iv(market, day, day['iv_strike'])
     if iv is None:
@@ -2263,7 +2393,7 @@ def run_iv_watch(state, market, cfg, day):
     legs, open_pnl = [], 0.0
     for opt in OPTION_TYPES:
         leg = state[opt]
-        if leg is None:
+        if not _has_position(leg):
             continue
         ltp = market['price'].get((leg['strike'], opt))
         legs.append(f'{leg["instrument"].name} (entry {leg["entry_price"]}, ltp {ltp})')
@@ -2302,18 +2432,13 @@ def run_checkpoint(state, market, cfg, day, symbol, checkpoint_at):
                  f'{EXPIRY_RISE_LAST_CHECKPOINT:%H:%M} - ignoring the premium-rise rule this checkpoint')
         premium_increased = False
 
-    _record_atm_iv(market, day, checkpoint_at, 'checkpoint')  # @_isolated - v7 rule input, logged
-    if premium_increased:
-        decision = _rise_v7_decision(market, day, checkpoint_at)  # @_isolated - None if it raised
-        if decision is not None:
-            trade, detail = decision
-            if trade and not RISE_V7_SHADOW:
-                log.info(f'RISE RULE v7: ATM premium rose ({prev_premium} -> {current_premium}) but the move is over - '
-                         f'TRADING this hour (v5 would skip) | {detail}')
-                premium_increased = False
-            else:
-                log.info(f'RISE RULE v7{" [SHADOW - v5 rule applied, hour skipped]" if RISE_V7_SHADOW else ""}: ATM premium rose '
-                         f'({prev_premium} -> {current_premium}) - v7 would {"TRADE" if trade else "keep skipping"} | {detail}')
+    v5_premium_increased = premium_increased
+    try:  # v7 can only turn a v5 'skip' into 'trade'; any error here -> the v5 decision, unchanged
+        premium_increased = _apply_rise_v7(market, day, checkpoint_at, prev_premium, current_premium, v5_premium_increased)
+        if premium_increased is not True and premium_increased is not False:
+            premium_increased = v5_premium_increased
+    except Exception:
+        premium_increased = v5_premium_increased
 
     log.info(f'checkpoint {checkpoint_at:%H:%M}: spot={market["spot"]} atm={market["atm"]} atm_premium={current_premium} (prev={prev_premium}) day_pnl={day["realized_pnl"]:.2f}')
     _checkpoint_act(state, market, cfg, day, premium_increased)
@@ -2364,16 +2489,18 @@ def _checkpoint_act(state, market, cfg, day, premium_increased):
     # chop watch, or had one that never got touched before this checkpoint tore it down above -
     # gets a normal fresh reopen at this checkpoint's current market price (only_missing below).
     for opt in OPTION_TYPES:
-        if state[opt] is not None:
-            log.info(f'{opt} still open at {state[opt]["strike"]}, leaving as is')
+        if _has_position(state[opt]):
+            log.info(f'{opt} still open at {state[opt]["strike"]} ({_leg_state(state[opt])}), leaving as is')
             _reprice_leg_stoploss(state, opt, market)
+        elif state[opt] is not None:
+            log.info(f'{opt}: slot reserved ({_leg_state(state[opt])}) - resolver settles it, no new entry')
     _enter_legs_parallel(state, day, desired, cfg, only_missing=True)
 
 
 # ── Minute-level checks (every poll) ─────────────────────────────────────────────────────────
 def run_minute_checks(state, market, cfg, day, now):
     current_premium = _atm_premium(market)
-    any_open = state['CE'] is not None or state['PE'] is not None
+    any_open = _has_position(state['CE']) or _has_position(state['PE'])
 
     if PREMIUM_HIGH_STOPLOSS_ENABLED and current_premium is not None:
         window_start = now - PREMIUM_HIGH_LOOKBACK
@@ -2389,7 +2516,7 @@ def run_minute_checks(state, market, cfg, day, now):
     unrealized = 0.0
     for opt in OPTION_TYPES:
         leg = state[opt]
-        if leg is None:
+        if not _has_position(leg):
             continue
         current_ltp = market['price'].get((leg['strike'], opt))
         if current_ltp is None:
@@ -2411,7 +2538,8 @@ def run_minute_checks(state, market, cfg, day, now):
 # ── Heartbeat ─────────────────────────────────────────────────────────────────────────────────
 def _send_heartbeat(state, day, symbol, now):
     legs = ', '.join(
-        f"{opt} {state[opt]['instrument'].name} @ ~{state[opt]['entry_price']}" if state[opt] else f'{opt} flat'
+        (f"{opt} {state[opt]['instrument'].name} @ ~{state[opt]['entry_price']} [{_leg_state(state[opt])}]" if _has_position(state[opt])
+         else f"{opt} {_leg_state(state[opt])} {state[opt]['instrument'].name}" if state[opt] else f'{opt} flat')
         for opt in OPTION_TYPES
     )
     if _last_event['at'] is not None:
@@ -2521,10 +2649,13 @@ def run_day(symbol, trade_weekdays):
           + (f'; stop at least {day["expiry_min_sl_pts"]} pts from {EXPIRY_MIN_SL_FROM:%H:%M}' if day['expiry_min_sl_pts'] else ''))
 
     scheduled_entry = datetime.combine(entry_time.date(), ENTRY_TIME)
-    _record_spot(market, day, entry_time)  # @_isolated - v7 inputs: spot and ATM IV at the entry snapshot
-    _record_atm_iv(market, day, scheduled_entry if entry_time - scheduled_entry < timedelta(minutes=2)
-                   else entry_time.replace(second=0, microsecond=0), 'entry')
-    log.info(f'RISE RULE v7: {"SHADOW - logged only, v5 rule (any ATM premium rise skips) applied" if RISE_V7_SHADOW else "LIVE"}')
+    try:  # v7 inputs at the entry snapshot - a failure only means v7 lacks data and falls back to v5 later
+        _record_spot(market, day, entry_time)  # @_isolated
+        _record_atm_iv(market, day, scheduled_entry if entry_time - scheduled_entry < timedelta(minutes=2)
+                       else entry_time.replace(second=0, microsecond=0), 'entry')  # @_isolated
+        log.info(f'RISE RULE v7: {"SHADOW - logged only, v5 rule (any ATM premium rise skips) applied" if RISE_V7_SHADOW else "LIVE"}')
+    except Exception as exc:
+        log.warning(f'RISE RULE v7 entry setup failed ({exc}) - v7 falls back to v5 where its inputs are missing', extra={'no_telegram': True})
     next_checkpoint = scheduled_entry + checkpoint_interval
     while next_checkpoint <= entry_time:
         next_checkpoint += checkpoint_interval
@@ -2579,6 +2710,7 @@ def run_day(symbol, trade_weekdays):
                 leg = dict(
                     instrument=instrument, strike=strike_opt[0], entry_price=entry_price, quantity=quantity,
                     sl_order_id=sl_order_id, sl_ref_price=entry_price,
+                    leg_state=LEG_STOPLOSS if sl_order_id else LEG_ENTRY, leg_id=None,  # no SL found -> 'entry': _maintain_legs places one
                     sl_start=day['sl_start'], rung=0, sl_trigger=None, min_sl_pts=day['expiry_min_sl_pts'],  # resting trigger unknown -
                     # the first run_ladder moves the adopted SL onto the ladder off entry_price.
                 )
@@ -2620,6 +2752,7 @@ def run_day(symbol, trade_weekdays):
             # place legs are reconciled (running it on both threads let them race each other, and a
             # failed broker read here used to skip the loss-limit check and checkpoint below)
             run_minute_checks(state, market, cfg, day, now)
+            _maintain_legs(state, day, market, cfg)  # settle pre_entry legs, protect 'entry' legs (never raises)
 
             minute = now.replace(second=0, microsecond=0)
             if minute > day['ladder_minute']:
