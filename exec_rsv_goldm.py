@@ -816,6 +816,12 @@ def _cancel_order(broker_order_id):
     return _aliceblue_post('/orders/cancel', {'brokerOrderId': broker_order_id})
 
 
+# AliceBlue's MCX quantity units are inconsistent: /orders/placeorder takes LOTS (1 = one GOLDM lot),
+# but /orders/modify takes UNITS - 100 per GOLDM lot (100 g). Same finding as
+# exec_goldm_delta_neutral.py's ALICEBLUE_UNITS_PER_LOT (seen there live 8 Oct 2026).
+ALICEBLUE_UNITS_PER_LOT = 100
+
+
 def _modify_order(broker_order_id, instrument, quantity, order_type, price, trigger_price=None):
     """Reprices a resting order in place. Payload matches AliceBlue's documented POST /orders/modify
     exactly - see https://v2api.aliceblueonline.com/orders%20Management/ ('brokerOrderId' required;
@@ -826,11 +832,15 @@ def _modify_order(broker_order_id, instrument, quantity, order_type, price, trig
     document AliceBlue 400ing on, and which sensex_option_buying.py's own _modify_order already
     fixed the same way. `instrument` is accepted but unused - kept so callers don't need to change -
     AliceBlue's modify endpoint identifies the order purely by brokerOrderId.
+    `quantity` is in LOTS everywhere in this file, but /orders/modify takes UNITS on MCX
+    (ALICEBLUE_UNITS_PER_LOT per GOLDM lot), so it's converted here. Seen live 21 Oct 2026: modify
+    with the lot count (2) -> EC954 "'quantity' should be a multiple of the lot size"; with
+    quantity left out -> EC914 "'Request parameter' cannot be empty or null" - it's required.
     _exit_chase_fill below still falls back to cancel+place-new if a modify call ever fails, so a
     broker-side rejection can never leave a live exit stuck."""
     payload = {
         'brokerOrderId': broker_order_id,
-        'quantity': quantity,
+        'quantity': quantity * ALICEBLUE_UNITS_PER_LOT,
         'orderType': order_type,
         'price': str(price),
         'slTriggerPrice': str(trigger_price) if trigger_price is not None else '',

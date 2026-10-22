@@ -140,7 +140,7 @@ does NOT import execution_rolling_straddle_tn.py (which authenticates with Dhan 
 its market-data source); Dhan is never touched, imported, or authenticated by this file at all.
 
 Trades a single underlying (command-line arg, default NIFTY) on TRADE_WEEKDAYS (command-line
-weekday codes, default every weekday - matching the backtest's own default). Lots default to 5 for
+weekday codes, default every weekday - matching the backtest's own default). Lots default to 6 for
 both NIFTY and SENSEX (informational CFG below); pass a different symbol/weekday-codes pair on the
 command line to override.
 
@@ -365,12 +365,12 @@ DAY_CODE_TO_WEEKDAY = {'m': 'Monday', 't': 'Tuesday', 'w': 'Wednesday', 'h': 'Th
 # underlying (matching the backtest's convention); now set per-underlying instead.
 CFG = {
     'NIFTY': dict(
-        strike_interval=50, lots=5, aliceblue_exchange='NFO',
+        strike_interval=50, lots=6, aliceblue_exchange='NFO',
         zerodha_options_exchange='NFO', zerodha_spot_instrument='NSE:NIFTY 50',
         daily_loss_limit=40,
     ),
     'SENSEX': dict(
-        strike_interval=100, lots=5, aliceblue_exchange='BFO',
+        strike_interval=100, lots=6, aliceblue_exchange='BFO',
         zerodha_options_exchange='BFO', zerodha_spot_instrument='BSE:SENSEX',
         daily_loss_limit=120,
     ),
