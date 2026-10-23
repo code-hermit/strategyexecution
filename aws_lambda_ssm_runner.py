@@ -141,8 +141,6 @@ def _run(ip_address):
                 "/home/ec2-user/trading/sensex_buying.sh "
                 "/home/ec2-user/trading/zerodha_ticker_service.sh "
                 "/home/ec2-user/trading/process_monitor.sh "
-                "/home/ec2-user/trading/mcx_ticker_service.sh "
-                "/home/ec2-user/trading/exec_rsv_goldm.sh "
                 "/home/ec2-user/trading/stock_range_reversal.sh",
                 # One cron line per strategy, restricted to weekdays (1-5) at the day-of-week
                 # field too so the wrong tmux session never even spins up on a weekend:
@@ -164,11 +162,8 @@ def _run(ip_address):
                 #   Mon-Fri (1,2,3,4,5)   9:46 -> process_monitor.sh (watches the above jobs and
                 #                                 alarms if one dies; started last, after the jobs
                 #                                 it watches are already up)
-                #   Mon-Fri (1,2,3,4,5)  15:14 -> mcx_ticker_service.sh (MCX Redis feed, runs to 23:58)
-                #   Mon-Fri (1,2,3,4,5)  15:14:30 -> exec_rsv_goldm.sh (GOLDM, 2 lots - cron is
-                #                                 minute-granular, hence "sleep 30"; warm-up until
-                #                                 ENTRY_TIME 15:15, hourly checkpoints, exit 23:00;
-                #                                 waits for the MCX ticker if it isn't up yet)
+                #   23 Oct 2026: MCX trading (mcx_ticker_service.sh 15:14, exec_rsv_goldm.sh 15:14:30) REMOVED -
+                #                                 the clean-up command at the end deletes their cron lines too
                 # Each job is added independently, keyed on its own exact "-s <session-name> " tmux
                 # flag (not a loose substring like "option_selling", which also matches
                 # "option_selling_sensex") - a single shared "does crontab mention option_selling at
@@ -203,19 +198,15 @@ def _run(ip_address):
                     "echo \"46 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s process_monitor '/home/ec2-user/trading/process_monitor.sh'\") | crontab -u ec2-user -"
                 ),
                 (
-                    "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s mcx_ticker ' || "
-                    "(crontab -u ec2-user -l 2>/dev/null; "
-                    "echo \"14 15 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s mcx_ticker '/home/ec2-user/trading/mcx_ticker_service.sh'\") | crontab -u ec2-user -"
-                ),
-                (
                     "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s stock_range_reversal ' || "
                     "(crontab -u ec2-user -l 2>/dev/null; "
                     "echo \"15 10 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s stock_range_reversal '/home/ec2-user/trading/stock_range_reversal.sh'\") | crontab -u ec2-user -"
                 ),
+                # 23 Oct 2026: MCX trading stopped - remove the GOLDM and MCX-ticker cron lines an instance may already
+                # have (the add-if-missing blocks above never delete anything), and stop their tmux sessions if running.
                 (
-                    "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s goldm ' || "
-                    "(crontab -u ec2-user -l 2>/dev/null; "
-                    "echo \"14 15 * * 1,2,3,4,5 sleep 30 && /usr/bin/tmux new-session -d -s goldm '/home/ec2-user/trading/exec_rsv_goldm.sh'\") | crontab -u ec2-user -"
+                    "(crontab -u ec2-user -l 2>/dev/null | grep -v -- '-s goldm ' | grep -v -- '-s mcx_ticker ') | crontab -u ec2-user - ; "
+                    "sudo -u ec2-user tmux kill-session -t goldm 2>/dev/null; sudo -u ec2-user tmux kill-session -t mcx_ticker 2>/dev/null; true"
                 ),
 
             ]

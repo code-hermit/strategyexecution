@@ -251,6 +251,9 @@ SPIKE_POINTS = 50  # combined ATM premium rise above the latest checkpoint's bas
 HOLD_MINUTES = 5  # how long a triggered buy is held before being time-exited
 STOPLOSS_POINTS = 60  # combined (CE+PE) premium drop from the position's combined entry fill price
 # that force-closes it early, on top of TIME_EXIT/EOD - see _position_combined_premium/run_day.
+RUNLOW_ENABLED = False  # 23 Oct 2026: running-low signal OFF. Backtest 2024-26: its stand-alone trades (no checkpoint
+# trade on the same spike) lost -726 pts over 97 trades; on shared spikes it only doubled the checkpoint position.
+# A running-low position already open (e.g. adopted after a restart) is still managed and exited normally.
 RUNLOW_SPIKE_POINTS = 70  # running-low signal: combined ATM premium rise above the pinned strike's
 # LOWEST combined premium since the checkpoint that triggers its own, independent buy (see docstring)
 INVERT_DIRECTION = False  # False (default): buy whichever leg (CE/PE) actually drove the trigger
@@ -1335,7 +1338,7 @@ def _close_position(state, reason, strategy='v3'):
 
 
 def run_day():
-    log.info(f'Starting {SYMBOL} option buying strategy (DRY_RUN={DRY_RUN})')
+    log.info(f'Starting {SYMBOL} option buying strategy (DRY_RUN={DRY_RUN}, lots={CFG["lots"]}, running-low signal {"ON" if RUNLOW_ENABLED else "OFF"})')
     _order_book_cache.start()  # shared poller backing every _wait_for_fill_price/_force_exit_leg
     _positions_cache.start()   # order-book/positions read for the rest of the day - see _PollingCache
     state = _load_state()
@@ -1498,7 +1501,7 @@ def run_day():
 
             checkpoint = state['checkpoint']
             v3_armed = checkpoint is not None and not state['checkpoint_used']
-            runlow_armed = checkpoint is not None and not state['runlow_used'] and state['runlow'] is not None
+            runlow_armed = RUNLOW_ENABLED and checkpoint is not None and not state['runlow_used'] and state['runlow'] is not None
             if v3_armed or runlow_armed:
                 zerodha_options = _load_zerodha_current_week_options()
                 current_premium, ce_ltp, pe_ltp = _pinned_premium(zerodha_options, checkpoint)
@@ -1529,7 +1532,7 @@ def run_day():
                     v3_str = (f'baseline={checkpoint["premium"]:.1f} (+{gap:.1f}, need +{SPIKE_POINTS})'
                               if v3_armed else 'checkpoint signal used')
                     runlow_str = (f'running low={state["runlow"]["low"]:.1f} (+{runlow_gap:.1f}, need +{RUNLOW_SPIKE_POINTS})'
-                                  if runlow_armed else 'running-low signal used')
+                                  if runlow_armed else ('running-low signal used' if RUNLOW_ENABLED else 'running-low signal OFF'))
                     log.info(
                         f'{SYMBOL} pinned ATM strike={checkpoint["strike"]} '
                         f'CE={ce_ltp:.1f} (prev {prev_ce_str}, {ce_delta_str} last candle) '
