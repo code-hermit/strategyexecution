@@ -141,9 +141,16 @@ def _run(ip_address):
                 "/home/ec2-user/trading/sensex_buying.sh "
                 "/home/ec2-user/trading/zerodha_ticker_service.sh "
                 "/home/ec2-user/trading/process_monitor.sh "
-                "/home/ec2-user/trading/stock_range_reversal.sh",
+                "/home/ec2-user/trading/stock_range_reversal.sh "
+                "/home/ec2-user/trading/hedge_buyer.sh "
+                "/home/ec2-user/trading/hedge_closer.sh",
                 # One cron line per strategy, restricted to weekdays (1-5) at the day-of-week
                 # field too so the wrong tmux session never even spins up on a weekend:
+                #   Mon-Fri (1,2,3,4,5)   9:37 -> hedge_buyer.sh (plans the day's NIFTY/SENSEX hedge
+                #                                 strangles from live margin + VIX, buys them at 9:38
+                #                                 so they're in before the 9:45 straddle entry)
+                #   Mon-Fri (1,2,3,4,5)  15:14 -> hedge_closer.sh (sells those hedges back at 15:15, once
+                #                                 each index's straddle is flat after its 15:13 exit)
                 #   Mon-Fri (1,2,3,4,5)   9:42 -> zerodha_ticker_service.sh (started first, so its
                 #                                 Redis feed is already warm by 9:45)
                 #   Mon-Fri (1,2,3,4,5)   9:44 -> exec_rsv_cont.sh (NIFTY, 2 lots - process starts a
@@ -172,6 +179,16 @@ def _run(ip_address):
                 # zerodha_ticker_service.sh had cron lines here) would see that guard already
                 # satisfied by its existing option_selling line and skip adding the newer/missing
                 # ones forever, on every subsequent run.
+                (
+                    "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s hedge_buyer ' || "
+                    "(crontab -u ec2-user -l 2>/dev/null; "
+                    "echo \"37 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s hedge_buyer '/home/ec2-user/trading/hedge_buyer.sh'\") | crontab -u ec2-user -"
+                ),
+                (
+                    "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s hedge_closer ' || "
+                    "(crontab -u ec2-user -l 2>/dev/null; "
+                    "echo \"14 15 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s hedge_closer '/home/ec2-user/trading/hedge_closer.sh'\") | crontab -u ec2-user -"
+                ),
                 (
                     "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s zerodha_ticker ' || "
                     "(crontab -u ec2-user -l 2>/dev/null; "
