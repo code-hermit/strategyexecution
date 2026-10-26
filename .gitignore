@@ -6,4 +6,5 @@
 *.csv
 /logs
 /stock_range_reversal_data
-
+/login docker
+*_token.json

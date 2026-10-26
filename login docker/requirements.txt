@@ -1,0 +1,4 @@
+selenium==4.25.0
+requests
+pyotp
+awslambdaric

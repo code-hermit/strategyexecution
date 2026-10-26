@@ -1,0 +1,9 @@
+services:
+  auto_login:
+    build: .
+    entrypoint: ["python", "auto_login.py"]   # local run; the image's default entrypoint is for Lambda
+    env_file: .env
+    shm_size: 1gb
+    volumes:
+      - ./debug:/app/debug   # screenshot + page source of any failed login
+    restart: "no"
