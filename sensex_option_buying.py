@@ -503,6 +503,10 @@ def _status(o):
 # to return" - e.g. /positions returns EC920 rather than an empty list when there are no open
 # positions. Treat these as an empty result rather than an error.
 _ALICEBLUE_EMPTY_RESULT_STATUSES = {'EC920'}
+# EC916 "No orders found for this user" is AliceBlue's other answer for an empty order book
+# (crashed hedge_buyer 2026-10-27). Only trusted on the /orders/book read - on cancel/modify/
+# placeorder it could mean the order wasn't touched, so it must still raise there.
+_ALICEBLUE_ORDER_BOOK_EMPTY_STATUSES = {'EC916'}
 
 # Exit (sell_leg only - entries via buy_leg are unchanged): once we've decided to close, priority
 # is getting OUT, not a clean fill price - see notes.md. Squares off via a forced SL (stop-loss
@@ -541,7 +545,8 @@ ALICEBLUE_SESSION_ID = _valid_aliceblue_session()
 def _aliceblue_result(path, data):
     if data.get('status') == 'Ok':
         return data['result']
-    if data.get('status') in _ALICEBLUE_EMPTY_RESULT_STATUSES:
+    if data.get('status') in _ALICEBLUE_EMPTY_RESULT_STATUSES or (
+            path.startswith('/orders/book') and data.get('status') in _ALICEBLUE_ORDER_BOOK_EMPTY_STATUSES):
         return []
     raise RuntimeError(f'AliceBlue request to {path} failed: {data}')
 

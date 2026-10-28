@@ -556,6 +556,10 @@ def _status(o):
     status = str(o.get('orderStatus', '')).strip().lower()
     return 'cancelled' if status.startswith('cancel') else status
 _ALICEBLUE_EMPTY_RESULT_STATUSES = {'EC920'}
+# EC916 "No orders found for this user" is AliceBlue's other answer for an empty order book
+# (crashed hedge_buyer 2026-10-27). Only trusted on the /orders/book read - on cancel/modify/
+# placeorder it could mean the order wasn't touched, so it must still raise there.
+_ALICEBLUE_ORDER_BOOK_EMPTY_STATUSES = {'EC916'}
 
 # Exit chase: once we've decided to close a leg, priority is getting OUT, not a clean fill price -
 # see notes.md's 14:45->14:55:51 NIFTY CE walkthrough, where a single passive LIMIT order got
@@ -602,7 +606,8 @@ except Exception:
 def _aliceblue_result(path, data):
     if data.get('status') == 'Ok':
         return data['result']
-    if data.get('status') in _ALICEBLUE_EMPTY_RESULT_STATUSES:
+    if data.get('status') in _ALICEBLUE_EMPTY_RESULT_STATUSES or (
+            path.startswith('/orders/book') and data.get('status') in _ALICEBLUE_ORDER_BOOK_EMPTY_STATUSES):
         return []
     raise RuntimeError(f'AliceBlue request to {path} failed: {data}')
 

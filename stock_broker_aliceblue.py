@@ -37,6 +37,10 @@ ALICEBLUE_PRODUCT = 'INTRADAY'      # MIS - AliceBlue squares these off itself ~
 REQUEST_TIMEOUT = 10
 ORDER_BOOK_MIN_GAP_SECONDS = 2.0    # other strategies share this AliceBlue account - keep load low
 _EMPTY_RESULT_STATUSES = {'EC920'}  # AliceBlue's "no data" answer for an empty order book
+# EC916 "No orders found for this user" is AliceBlue's other answer for an empty order book
+# (crashed hedge_buyer 2026-10-27). Only trusted on the /orders/book read - on cancel/modify/
+# placeorder it could mean the order wasn't touched, so it must still raise there.
+_ORDER_BOOK_EMPTY_STATUSES = {'EC916'}
 
 
 class Instrument(NamedTuple):
@@ -92,7 +96,8 @@ class AliceBlueBroker:
     def _result(path, data):
         if data.get('status') == 'Ok':
             return data['result']
-        if data.get('status') in _EMPTY_RESULT_STATUSES:
+        if data.get('status') in _EMPTY_RESULT_STATUSES or (
+                path.startswith('/orders/book') and data.get('status') in _ORDER_BOOK_EMPTY_STATUSES):
             return []
         raise RuntimeError(f'AliceBlue {path} failed: {data}')
 

@@ -439,6 +439,10 @@ CHASE_MAX_STEPS = 30  # ~60 s of repricing; then the order is cancelled and the 
 ALICEBLUE_PRODUCT = 'LONGTERM'  # = NRML - AliceBlue blocks MIS/INTRADAY on MCX GOLDM options (see exec_rsv_goldm.py)
 TERMINAL_ORDER_STATUSES = {'complete', 'rejected', 'cancelled'}
 _ALICEBLUE_EMPTY_RESULT_STATUSES = {'EC920'}
+# EC916 "No orders found for this user" is AliceBlue's other answer for an empty order book
+# (crashed hedge_buyer 2026-10-27). Only trusted on the /orders/book read - on cancel/modify/
+# placeorder it could mean the order wasn't touched, so it must still raise there.
+_ALICEBLUE_ORDER_BOOK_EMPTY_STATUSES = {'EC916'}
 SL_LIMIT_OFFSET_PCT = 0.02  # SL limit above its trigger - stays inside the ~20% LTP band
 # AliceBlue's MCX quantity units are inconsistent: /orders/placeorder takes LOTS (1 = one GOLDM lot), but
 # /orders/modify and /positions (netQuantity) and the order book's quantity are in UNITS - 100 per GOLDM
@@ -487,7 +491,8 @@ except Exception:
 def _aliceblue_result(path, data):
     if data.get('status') == 'Ok':
         return data['result']
-    if data.get('status') in _ALICEBLUE_EMPTY_RESULT_STATUSES:
+    if data.get('status') in _ALICEBLUE_EMPTY_RESULT_STATUSES or (
+            path.startswith('/orders/book') and data.get('status') in _ALICEBLUE_ORDER_BOOK_EMPTY_STATUSES):
         return []
     raise RuntimeError(f'AliceBlue request to {path} failed: {data}')
 

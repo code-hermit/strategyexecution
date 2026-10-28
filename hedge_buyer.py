@@ -12,6 +12,7 @@ How the legs are chosen:
      MIN_VOLUME) is priced, and the full straddle + hedge (+ any hedges already held on this expiry)
      is run through Zerodha's basket-margin API. AliceBlue charges SPAN + exposure with NO credit for
      the premium received, so Zerodha's `total` (which nets that premium off) is NOT used.
+     Every such margin figure is padded by MARGIN_SAFETY_PCT (5%) before it is compared to the budget.
   4. The cheapest NIFTY + SENSEX combination that fits the budget wins - i.e. the farthest hedges
      that still leave the spare buffer. If none does (typically an expiry day with the account near
      its limit), the cheapest one leaving at least SPARE_MIN; failing that, the lowest-margin one.
@@ -138,6 +139,8 @@ CFG = {
 }
 OPTION_BUYING_LOTS = 7  # sensex_option_buying.py CFG['lots'] - its premium is reserved out of the budget
 ALICEBLUE_EXTRA_PER_LOT = 4_150  # per index-lot: AliceBlue blocked ~Rs 8.3k per NIFTY+SENSEX lot over SPAN+exposure
+MARGIN_SAFETY_PCT = 0.05  # every straddle + hedge margin estimate is padded this much (added 28 Oct 2026) -
+# AliceBlue's live margin can run above Zerodha's basket figure, so hedges are picked for 5% more than it says
 SPARE_BASE = 300_000  # spare buffer left unused at VIX <= SPARE_VIX_FLOOR ...
 SPARE_VIX_FLOOR = 16.0
 SPARE_PER_VIX_POINT = 75_000  # ... plus this per VIX point above it (~Rs 4.5L at VIX 18)
@@ -226,7 +229,8 @@ def _margin_order(exchange, tradingsymbol, side, qty):
 
 
 def _span_plus_exposure(orders):
-    """AliceBlue-style margin for a basket: SPAN + exposure, no credit for premium received."""
+    """AliceBlue-style margin for a basket: SPAN + exposure, no credit for premium received, padded by
+    MARGIN_SAFETY_PCT."""
     time_module.sleep(MARGIN_CALL_GAP_SECONDS)
     resp = requests.post(
         f'{ZERODHA_BASE_URL}/margins/basket', params={'consider_positions': 'false'},
@@ -234,7 +238,7 @@ def _span_plus_exposure(orders):
     )
     resp.raise_for_status()
     final = resp.json()['data']['final']
-    return float(final['span']) + float(final['exposure'])
+    return (float(final['span']) + float(final['exposure'])) * (1 + MARGIN_SAFETY_PCT)
 
 
 # ── AliceBlue (REST, v3 open-api) - funds, positions, orders ───────────────────────────────────
@@ -255,6 +259,10 @@ def _aliceblue_result(path, data):
     if data.get('status') == 'Ok':
         return data['result']
     if data.get('status') == 'EC920':  # empty result (e.g. no orders yet today)
+        return []
+    # EC916 "No orders found" = empty order book (crashed the 2026-10-27 buy run) - only trusted on
+    # the /orders/book read; on placeorder/modify it must still raise
+    if path.startswith('/orders/book') and data.get('status') == 'EC916':
         return []
     raise RuntimeError(f'AliceBlue request to {path} failed: {data}')
 
