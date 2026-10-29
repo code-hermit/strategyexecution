@@ -143,8 +143,8 @@ ALICEBLUE_EXTRA_PER_LOT = 4_150  # per index-lot: AliceBlue blocked ~Rs 8.3k per
 # percent of the straddle's short notional (both legs). Hedges don't reduce it. Set in .env for that day,
 # e.g. EXTRA_EXPOSURE_PCT=2, and back to 0 after.
 EXTRA_EXPOSURE_PCT = float(os.getenv('EXTRA_EXPOSURE_PCT', '0'))
-MARGIN_SAFETY_PCT = 0.05  # every straddle + hedge margin estimate is padded this much (added 28 Oct 2026) -
-# AliceBlue's live margin can run above Zerodha's basket figure, so hedges are picked for 5% more than it says
+MARGIN_SAFETY_PCT = 0.0  # disabled 29 Oct 2026 (was 0.05) - every straddle + hedge margin estimate is padded this
+# much, because AliceBlue's live margin can run above Zerodha's basket figure. Set back to 0.05 to re-enable.
 SPARE_BASE = 300_000  # spare buffer left unused at VIX <= SPARE_VIX_FLOOR ...
 SPARE_VIX_FLOOR = 16.0
 SPARE_PER_VIX_POINT = 75_000  # ... plus this per VIX point above it (~Rs 4.5L at VIX 18)
