@@ -139,6 +139,10 @@ CFG = {
 }
 OPTION_BUYING_LOTS = 7  # sensex_option_buying.py CFG['lots'] - its premium is reserved out of the budget
 ALICEBLUE_EXTRA_PER_LOT = 4_150  # per index-lot: AliceBlue blocked ~Rs 8.3k per NIFTY+SENSEX lot over SPAN+exposure
+# Extra exposure margin the broker announces for a day (e.g. 2026-10-28: 'additional 2% exposure'), as a
+# percent of the straddle's short notional (both legs). Hedges don't reduce it. Set in .env for that day,
+# e.g. EXTRA_EXPOSURE_PCT=2, and back to 0 after.
+EXTRA_EXPOSURE_PCT = float(os.getenv('EXTRA_EXPOSURE_PCT', '0'))
 MARGIN_SAFETY_PCT = 0.05  # every straddle + hedge margin estimate is padded this much (added 28 Oct 2026) -
 # AliceBlue's live margin can run above Zerodha's basket figure, so hedges are picked for 5% more than it says
 SPARE_BASE = 300_000  # spare buffer left unused at VIX <= SPARE_VIX_FLOOR ...
@@ -420,15 +424,17 @@ def _plan_index(index, cfg, use_ltp):
     base = straddle + held
 
     held_txt = ', '.join(f"{h['tradingsymbol']} +{h['quantity']}" for h in held) or 'none'
-    none_margin = _span_plus_exposure(base)
+    extra_exposure = EXTRA_EXPOSURE_PCT / 100 * spot * qty * 2  # both short legs; not offset by hedges
+    none_margin = _span_plus_exposure(base) + extra_exposure
     log.info(f'{index}: spot {spot:.2f} ATM {atm} expiry {zexpiry} qty {qty} | held hedges: {held_txt} | '
-             f'margin with no new hedge Rs {none_margin:,.0f}', extra=QUIET)
+             f'margin with no new hedge Rs {none_margin:,.0f}'
+             + (f' (incl. broker extra {EXTRA_EXPOSURE_PCT:g}% exposure Rs {extra_exposure:,.0f})' if extra_exposure else ''), extra=QUIET)
     cands = [Candidate(index, None, (), qty, 0.0, none_margin)]
     for d in distances:
         ce, pe = price(atm + d, 'CE'), price(atm - d, 'PE')
         if not ce or not pe:
             continue
-        margin = _span_plus_exposure(base + [_margin_order(exch, leg.zsym, 'BUY', qty) for leg in (ce, pe)])
+        margin = _span_plus_exposure(base + [_margin_order(exch, leg.zsym, 'BUY', qty) for leg in (ce, pe)]) + extra_exposure
         cost = (ce.ask + pe.ask) * qty
         cands.append(Candidate(index, d, (ce, pe), qty, cost, margin))
         log.info(f'  {index} +-{d}: {ce.zsym} {ce.ask} + {pe.zsym} {pe.ask} | cost Rs {cost:,.0f} | margin Rs {margin:,.0f}', extra=QUIET)

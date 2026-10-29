@@ -4,25 +4,9 @@
   "user_name": "Hundi Mukhyaprana Rao",
   "user_shortname": "Hundi",
   "broker": "ZERODHA",
-  "exchanges": [
-    "MF",
-    "BFO",
-    "BSE",
-    "NSE"
-  ],
-  "products": [
-    "CNC",
-    "NRML",
-    "MIS",
-    "BO",
-    "CO"
-  ],
-  "order_types": [
-    "MARKET",
-    "LIMIT",
-    "SL",
-    "SL-M"
-  ],
+  "exchanges": ["MF", "BFO", "BSE", "NSE"],
+  "products": ["CNC", "NRML", "MIS", "BO", "CO"],
+  "order_types": ["MARKET", "LIMIT", "SL", "SL-M"],
   "avatar_url": null,
   "user_id": "TY3057",
   "api_key": "c6q97fnuxe4dw4uk",
