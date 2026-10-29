@@ -4,16 +4,32 @@
   "user_name": "Hundi Mukhyaprana Rao",
   "user_shortname": "Hundi",
   "broker": "ZERODHA",
-  "exchanges": ["MF", "BFO", "BSE", "NSE"],
-  "products": ["CNC", "NRML", "MIS", "BO", "CO"],
-  "order_types": ["MARKET", "LIMIT", "SL", "SL-M"],
+  "exchanges": [
+    "MF",
+    "BFO",
+    "BSE",
+    "NSE"
+  ],
+  "products": [
+    "CNC",
+    "NRML",
+    "MIS",
+    "BO",
+    "CO"
+  ],
+  "order_types": [
+    "MARKET",
+    "LIMIT",
+    "SL",
+    "SL-M"
+  ],
   "avatar_url": null,
   "user_id": "TY3057",
   "api_key": "c6q97fnuxe4dw4uk",
   "access_token": "hAvR1ij7U4uD2iwbSPA9NRYqw4914j5c",
   "public_token": "tpTl79BldQYBAZht3tYBtOVdNt5y4AGL",
   "refresh_token": "",
-  "enctoken": "fnN5gab7Ywsz1k7Hc/VKM8bImP/iCv2Du2tI/220IlY57FDa7JkwKKqJYyYeAcNFPDpPXt8p+CqFsTSNCXGvmy0wT25dB9ah/GLXtXPQfwoacZE2bChxaNjvqRhYg4I=",
+  "enctoken": "W0Cft39fi49vBrlArAWQ0o54F4KuVsC7RsypCluDtgooHsZACXoNhmlUvhM9D9Z96hx+W2SUhoJ8jOA6JFKqvYGAbO3SYceRWUf9bCibfmDlvIWboqkNUzmUIU+FMjA=",
   "login_time": "2026-10-29 09:15:39",
   "meta": {
     "demat_consent": "physical"
