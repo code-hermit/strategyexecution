@@ -145,10 +145,10 @@ ALICEBLUE_EXTRA_PER_LOT = 4_150  # per index-lot: AliceBlue blocked ~Rs 8.3k per
 EXTRA_EXPOSURE_PCT = float(os.getenv('EXTRA_EXPOSURE_PCT', '0'))
 MARGIN_SAFETY_PCT = 0.0  # disabled 29 Oct 2026 (was 0.05) - every straddle + hedge margin estimate is padded this
 # much, because AliceBlue's live margin can run above Zerodha's basket figure. Set back to 0.05 to re-enable.
-SPARE_BASE = 300_000  # spare buffer left unused at VIX <= SPARE_VIX_FLOOR ...
+SPARE_BASE = 150_000  # spare buffer left unused at VIX <= SPARE_VIX_FLOOR ... (30 Oct 2026: was 3L, cut so farther hedges fit at 7 lots)
 SPARE_VIX_FLOOR = 16.0
-SPARE_PER_VIX_POINT = 75_000  # ... plus this per VIX point above it (~Rs 4.5L at VIX 18)
-SPARE_MIN = 150_000  # when the VIX target can't be met (e.g. expiry days), cheapest set leaving at least this
+SPARE_PER_VIX_POINT = 50_000  # ... plus this per VIX point above it (~Rs 2.5L at VIX 18; was 75k)
+SPARE_MIN = 100_000  # when the VIX target can't be met (e.g. expiry days), cheapest set leaving at least this (was 1.5L)
 MAX_TOTAL_HEDGE_COST = 25_000  # hard cap on a morning's hedge spend (both indices, all legs)
 LOGIN_WAIT_UNTIL = dtime(9, 43)  # tokens come from a manual morning login - wait for them until here
 VIX_INSTRUMENT = 'NSE:INDIA VIX'

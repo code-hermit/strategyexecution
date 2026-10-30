@@ -117,3 +117,29 @@ before 09:37.
 | 12:45 | Rs 19.45L | - | - | - | All 7 lots: NIFTY 7 + SENSEX 7, both legs. Close to the morning plan's Rs 19.02L for 7+7 (Rs 19.63L less Rs 0.61L option buying). About Rs 4.0L free on Rs 23.47L funds. |
 
 **End of day** (to fill in): hedge sell-back value, net hedge cost, straddle day P&L.
+
+---
+
+## 2026-10-29 (Thu) - SENSEX expiry day, NIFTY on the 03 Nov weekly
+
+**Setup:** 7 lots each, NRML. Funds Rs 23.32L. VIX 16.30.
+
+**Decisions**
+- `hedge_buyer.py --plan` at 09:22, pre-open prices (NIFTY ATM about 22,700, SENSEX 73,258):
+
+  | Leg | Qty | Ask | Cost | Margin |
+  |---|---|---|---|---|
+  | NIFTY26N0323700CE + NIFTY26N0321700PE (±1000) | 455 | 3.10 + 6.10 | Rs 4,186 | Rs 8.65L |
+  | SENSEX26OCT74800CE + SENSEX26OCT71800PE (±1500) | 140 | 4.45 + 6.45 | Rs 1,526 | Rs 10.44L |
+  | **Total** | | | **Rs 5,712** | |
+
+- Estimate Rs 20.02L, including Rs 0.58L AliceBlue extra and Rs 0.35L option buying. Margin used should
+  be about Rs 19.7L, since option buying is cash. Spare Rs 3.30L against a Rs 3.23L target. SENSEX
+  exposure is about 4% today because it expires. The program re-prices at 09:38.
+
+**Hourly margin / VIX**
+
+| Time | Margin used | VIX | NIFTY | SENSEX | Notes |
+|---|---|---|---|---|---|
+
+**End of day** (to fill in): hedge sell-back value, net hedge cost, straddle day P&L.
