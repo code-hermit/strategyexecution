@@ -143,3 +143,31 @@ before 09:37.
 |---|---|---|---|---|---|
 
 **End of day** (to fill in): hedge sell-back value, net hedge cost, straddle day P&L.
+
+---
+
+## 2026-10-30 (Fri) - NIFTY expires 03 Nov, SENSEX 05 Nov
+
+**Setup:** 7 lots each, NRML. Funds Rs 23.31L. VIX 15.56. Spare settings cut this morning (commit eb680df):
+SPARE_BASE 3L -> 1.5L, SPARE_PER_VIX_POINT 75k -> 50k, SPARE_MIN 1.5L -> 1L.
+
+**Decisions**
+- `hedge_buyer.py --plan` at 09:21, pre-open prices (NIFTY 22,950, SENSEX 74,216):
+
+  | Leg | Qty | Ask | Cost | Margin |
+  |---|---|---|---|---|
+  | NIFTY26N0324400CE + NIFTY26N0321500PE (±1450) | 455 | 0.75 + 1.70 | Rs 1,115 | Rs 10.63L |
+  | SENSEX26N0578000CE + SENSEX26N0570400PE (±3800) | 140 | 8.05 + 23.50 | Rs 4,417 | Rs 9.40L |
+  | **Total** | | | **Rs 5,532** | |
+
+- Estimate Rs 21.52L, including Rs 0.58L AliceBlue extra and Rs 0.90L option buying. Margin used should
+  be about Rs 20.6L. Spare Rs 1.79L against the new Rs 1.5L target. SENSEX has 6 days left, so near
+  hedges are expensive (±2800 = Rs 11k). Considered and rejected: next-week hedges give Rs 15-60k
+  *less* margin benefit (calendar-spread SPAN) at 3-6x the premium.
+
+**Hourly margin / VIX**
+
+| Time | Margin used | VIX | NIFTY | SENSEX | Notes |
+|---|---|---|---|---|---|
+
+**End of day** (to fill in): hedge sell-back value, net hedge cost, straddle day P&L.
