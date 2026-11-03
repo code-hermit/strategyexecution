@@ -171,3 +171,57 @@ SPARE_BASE 3L -> 1.5L, SPARE_PER_VIX_POINT 75k -> 50k, SPARE_MIN 1.5L -> 1L.
 |---|---|---|---|---|---|
 
 **End of day** (to fill in): hedge sell-back value, net hedge cost, straddle day P&L.
+
+---
+
+## 2026-11-02 (Mon) - NIFTY expires tomorrow (03 Nov), SENSEX 05 Nov
+
+**Setup:** 7 lots each, NRML. Funds Rs 22.84L. VIX 15.51.
+
+**Decisions**
+- `hedge_buyer.py --plan` at 09:19, pre-open prices (NIFTY 23,257, SENSEX 75,233):
+
+  | Leg | Qty | Ask | Cost | Margin |
+  |---|---|---|---|---|
+  | NIFTY26N0324250CE + NIFTY26N0322250PE (±1000) | 455 | 1.00 + 2.70 | Rs 1,684 | Rs 8.88L |
+  | SENSEX26N0580000CE + SENSEX26N0570400PE (±4800) | 140 | 2.45 + 8.15 | Rs 1,484 | Rs 11.00L |
+  | **Total** | | | **Rs 3,168** | |
+
+- Estimate Rs 21.16L, including Rs 0.58L AliceBlue extra and Rs 0.70L option buying. Margin used should
+  be about Rs 20.5L. Spare Rs 1.67L against a Rs 1.5L target.
+- Cheap extra buffer if wanted: NIFTY ±800 (Rs 2,502, +Rs 818) frees Rs 0.93L more. SENSEX ±3000
+  (Rs 4,935, +Rs 3,451) frees Rs 2.57L more.
+
+**Hourly margin / VIX**
+
+| Time | Margin used | VIX | NIFTY | SENSEX | Notes |
+|---|---|---|---|---|---|
+| 09:45 | Rs 20.12L | - | - | - | First hour, 7 lots each. Rs 0.4L under the Rs 20.5L estimate. About Rs 2.7L free on Rs 22.83L funds (Rs 2.0L if option buying fires). |
+| 13:45 | Rs 20.80L | - | - | - | Up Rs 0.68L since 09:45 (spot/IV drift or re-entries). About Rs 2.0L free. |
+
+**End of day** (to fill in): hedge sell-back value, net hedge cost, straddle day P&L.
+
+---
+
+## 2026-11-02 (Mon) - NIFTY expires 03 Nov (tomorrow), SENSEX 05 Nov
+
+**Setup:** 7 lots each, NRML. Funds Rs 22.83L. VIX 15.54.
+
+**Decisions**
+- `hedge_buyer.py` buy at 09:37 (NIFTY 23,288, SENSEX 75,347), filled 09:38:
+
+  | Leg | Qty | Fill | Cost | Margin |
+  |---|---|---|---|---|
+  | NIFTY03NOV26C24350 + NIFTY03NOV26P22250 (±1050) | 455 | 0.80 + 2.85 | Rs 1,661 | Rs 9.13L |
+  | SENSEX26N0580000CE + SENSEX26N0570600PE (±4700) | 140 | 2.80 + 10.05 | Rs 1,799 | Rs 10.87L |
+  | **Total** | | | **Rs 3,460** | |
+
+- Estimate Rs 21.27L, including Rs 0.58L AliceBlue extra and Rs 0.69L option buying. Spare Rs 1.56L
+  against the Rs 1.5L target. NIFTY expires tomorrow, so its hedge could sit closer (±1050).
+
+**Hourly margin / VIX**
+
+| Time | Margin used | VIX | NIFTY | SENSEX | Notes |
+|---|---|---|---|---|---|
+
+**End of day** (to fill in): hedge sell-back value, net hedge cost, straddle day P&L.
