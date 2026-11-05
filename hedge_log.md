@@ -225,3 +225,30 @@ SPARE_BASE 3L -> 1.5L, SPARE_PER_VIX_POINT 75k -> 50k, SPARE_MIN 1.5L -> 1L.
 |---|---|---|---|---|---|
 
 **End of day** (to fill in): hedge sell-back value, net hedge cost, straddle day P&L.
+
+---
+
+## 2026-11-04 (Wed) - SENSEX expires tomorrow (05 Nov), NIFTY on the 09 Nov weekly
+
+**Setup:** 7 lots each, NRML. Funds Rs 22.98L. VIX 16.07.
+
+**Decisions**
+- `hedge_buyer.py --plan` at 09:28 (NIFTY ATM 23,900, SENSEX ATM 77,300):
+
+  | Leg | Qty | Ask | Cost | Margin |
+  |---|---|---|---|---|
+  | NIFTY26N0925350CE + NIFTY26N0922450PE (±1450) | 455 | 3.10 + 6.65 | Rs 4,436 | Rs 11.14L |
+  | SENSEX26N0580500CE + SENSEX26N0574100PE (±3200) | 140 | 4.15 + 12.70 | Rs 2,359 | Rs 9.12L |
+  | **Total** | | | **Rs 6,795** | |
+
+- Estimate Rs 21.44L, including Rs 0.58L AliceBlue extra and Rs 0.59L option buying. Margin used should
+  be about Rs 20.85L. Spare Rs 1.55L against a Rs 1.54L target.
+- Extra buffer if wanted: NIFTY ±1300 (Rs 5,596, +Rs 1,160) frees Rs 0.69L more. SENSEX ±2800
+  (Rs 3,388, +Rs 1,029) frees Rs 0.58L more.
+
+**Hourly margin / VIX**
+
+| Time | Margin used | VIX | NIFTY | SENSEX | Notes |
+|---|---|---|---|---|---|
+
+**End of day** (to fill in): hedge sell-back value, net hedge cost, straddle day P&L.
