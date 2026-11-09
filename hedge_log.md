@@ -252,3 +252,72 @@ SPARE_BASE 3L -> 1.5L, SPARE_PER_VIX_POINT 75k -> 50k, SPARE_MIN 1.5L -> 1L.
 |---|---|---|---|---|---|
 
 **End of day** (to fill in): hedge sell-back value, net hedge cost, straddle day P&L.
+
+---
+
+## 2026-11-05 (Thu) - SENSEX expiry day, NIFTY on the 09 Nov weekly
+
+**Setup:** 7 lots each, NRML. Funds Rs 22.88L (cash Rs 6.60L + collateral Rs 16.68L - Rs 0.40L used). VIX 15.18.
+AliceBlue shows COALINDIA-EQ +100 CNC @ 398.05 (Rs 39,805) as a day buy, which is the Rs 0.40L used. GOLDBEES
+is not in positions.
+
+**Decisions**
+- `hedge_buyer.py --plan` at 09:22 (NIFTY 24,344, SENSEX 78,695, both about 1.8-1.9% above yesterday's ATM):
+
+  | Leg | Qty | Ask | Cost | Margin |
+  |---|---|---|---|---|
+  | NIFTY26N0925400CE + NIFTY26N0923300PE (±1050) | 455 | 5.80 + 7.95 | Rs 6,256 | Rs 9.33L |
+  | SENSEX26N0580300CE + SENSEX26N0577100PE (±1600) | 140 | 10.45 + 8.55 | Rs 2,660 | Rs 11.02L |
+  | **Total** | | | **Rs 8,916** | |
+
+- Estimate Rs 21.32L, including Rs 0.58L AliceBlue extra and Rs 0.38L option buying. Margin used should
+  be about Rs 20.94L. Free about Rs 1.85L after the hedge premium, about Rs 1.47L if option buying fires.
+  Target Rs 1.5L.
+- **Bought at 09:38 by the server run:** NIFTY 25450CE @ 5.05 + 23250PE @ 7.75 x455 (Rs 5,824), SENSEX 80200CE @ 9.50
+  + 77200PE @ 7.95 x140 (Rs 2,443). Total **Rs 8,267**. Straddles: NIFTY 24400, SENSEX 78800.
+
+**Hourly margin / VIX**
+
+| Time | Margin used | VIX | NIFTY | SENSEX | Notes |
+|---|---|---|---|---|---|
+| 09:45 | Rs 21.3L (SPAN 7.56L + exp 13.27L + about 0.45L AliceBlue extra) | 15.17 | ~24,400 | ~78,800 | User's figure. API utilizedMargin Rs 21.76L also includes Coal India Rs 0.40L and hedge premium Rs 0.08L. Rs 0.36L over the Rs 20.94L estimate. Exposure is exactly 2% NIFTY + 4% SENSEX, no extra charged. Rs 1.52L free, about Rs 1.14L if option buying fires. |
+
+**End of day** (to fill in): hedge sell-back value, net hedge cost, straddle day P&L.
+
+---
+
+## 2026-11-06 (Fri) - NIFTY expires 09 Nov, SENSEX on the new 12 Nov weekly
+
+**Setup:** 7 lots each, NRML. Cash Rs 5.71L + collateral Rs 16.71L = Rs 22.42L before hedges (Rs 23.28L yesterday).
+VIX 16.66 at 09:38, up from a 15.58 previous close.
+
+**Decisions**
+- **Bought at 09:38 by the server run, Rs 18,899:**
+
+  | Leg | Qty | Fill | Cost |
+  |---|---|---|---|
+  | NIFTY 25400CE + 23700PE (about ±850) | 455 | 6.50 + 12.95 | Rs 8,850 |
+  | SENSEX 84100CE + 75100PE (about ±4500) | 140 | 28.48 + 43.30 | Rs 10,049 |
+
+- Highest spend so far; user queried it. Server plan at 09:37 (`logs/hedge_buyer_2026-11-06.log`): funds Rs 22.44L,
+  VIX 16.60, spare target Rs 1.80L (Rs 1.5L yesterday), option-buying reserve Rs 1.07L (Rs 0.38L yesterday), quoted
+  Rs 17,885. SENSEX has 6 days left, and nothing past ±4700 met the volume filter, so SENSEX alone cost Rs 8.6k or more.
+- Fills cost Rs 1,014 over the quote: the PE asks jumped about 15% between the 09:37:28 plan and the 09:38 order
+  (NIFTY 11.15 -> 12.85, SENSEX 38.45 -> 42.75).
+- Re-check of all 09:37 candidates: Rs 17,885 was the cheapest set meeting the target. Cheaper sets needed less buffer
+  (before hedge premium, total room including the reserve): Rs 2.5L = Rs 15,792, Rs 2.0L = Rs 13,975, Rs 1.5L = Rs 12,770.
+  A Rs 10k cost cap would have left today about Rs 2.3L over funds, so it is not a safe fix.
+- 09:39 estimate with these hedges held: about Rs 19.46L margin used, about Rs 2.77L free, about Rs 1.69L if option
+  buying fires.
+- User's point after entry: only Rs 19.72L used, so the hedges were over-bought. Agreed: the pick was cheapest only for
+  the Rs 2.87L the program held back, and Rs 2.72L actually sat free. Proposed: cap the option-buying reserve at Rs 70k
+  in `build_plan` (would have picked NIFTY ±950 + SENSEX ±4500, Rs 15,792 quoted). Not applied, awaiting user's go-ahead.
+
+**Hourly margin / VIX**
+
+| Time | Margin used | VIX | NIFTY | SENSEX | Notes |
+|---|---|---|---|---|---|
+| 09:45 | Rs 19.73L (SPAN 9.94L + exp 8.94L + hedge premium 0.19L + about 0.66L AliceBlue extra) | 16.57 | 24,587 | 79,689 | SPAN + exposure Rs 18.88L matches the plan's Rs 18.89L. Rs 2.72L free, about Rs 1.65L if option buying fires. |
+| 11:15 | Rs 6.32L (incl. hedge premium) | 17.03 | 24,615 | 79,764 | SENSEX halted 09:57 on the daily loss limit, -115.28 pts = Rs -16,140: CE stopped at 910 after the ladder widened its stop to 30% (-209.71 pts), PE closed at +94.43. SENSEX hedges (Rs 10,049) now protect nothing. NIFTY about -29 pts (Rs -13,182) against its 40 pt limit. Rs 16.12L free. |
+
+**End of day** (to fill in): hedge sell-back value, net hedge cost, straddle day P&L.

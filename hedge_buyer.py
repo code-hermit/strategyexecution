@@ -129,15 +129,15 @@ STATE_FILE = os.path.join(os.path.dirname(__file__), 'hedge_buyer_state.json')  
 # freeze_qty = exchange max quantity per order (larger orders are sliced).
 CFG = {
     'NIFTY': dict(
-        lots=7, strike_interval=50, aliceblue_exchange='NFO', zerodha_exchange='NFO',
+        lots=6, strike_interval=50, aliceblue_exchange='NFO', zerodha_exchange='NFO',
         spot='NSE:NIFTY 50', min_distance=250, max_distance=2000, min_volume=200_000, freeze_qty=1800,
     ),
     'SENSEX': dict(
-        lots=7, strike_interval=100, aliceblue_exchange='BFO', zerodha_exchange='BFO',
+        lots=6, strike_interval=100, aliceblue_exchange='BFO', zerodha_exchange='BFO',
         spot='BSE:SENSEX', min_distance=600, max_distance=6000, min_volume=20_000, freeze_qty=1000,
     ),
 }
-OPTION_BUYING_LOTS = 7  # sensex_option_buying.py CFG['lots'] - its premium is reserved out of the budget
+OPTION_BUYING_LOTS = 6  # sensex_option_buying.py CFG['lots'] - its premium is reserved out of the budget
 ALICEBLUE_EXTRA_PER_LOT = 4_150  # per index-lot: AliceBlue blocked ~Rs 8.3k per NIFTY+SENSEX lot over SPAN+exposure
 # Extra exposure margin the broker announces for a day (e.g. 2026-10-28: 'additional 2% exposure'), as a
 # percent of the straddle's short notional (both legs). Hedges don't reduce it. Set in .env for that day,

@@ -365,12 +365,12 @@ DAY_CODE_TO_WEEKDAY = {'m': 'Monday', 't': 'Tuesday', 'w': 'Wednesday', 'h': 'Th
 # underlying (matching the backtest's convention); now set per-underlying instead.
 CFG = {
     'NIFTY': dict(
-        strike_interval=50, lots=7, aliceblue_exchange='NFO',
+        strike_interval=50, lots=6, aliceblue_exchange='NFO',
         zerodha_options_exchange='NFO', zerodha_spot_instrument='NSE:NIFTY 50',
         daily_loss_limit=40,
     ),
     'SENSEX': dict(
-        strike_interval=100, lots=7, aliceblue_exchange='BFO',
+        strike_interval=100, lots=6, aliceblue_exchange='BFO',
         zerodha_options_exchange='BFO', zerodha_spot_instrument='BSE:SENSEX',
         daily_loss_limit=120,
     ),
