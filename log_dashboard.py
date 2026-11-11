@@ -1,9 +1,10 @@
 """Health dashboard for the live strategies, run on the Mac - no broker or server login needed.
 
-Every 10 minutes (on the :x0:30 mark, 09:40-15:31 IST, weekdays) it scp's the NIFTY/SENSEX straddle
-and SENSEX option-buying logs into logs/<name>_<today>.log, replays today's lines, and shows a
-green tick or a red cross per strategy. Red = act now: a short leg without an SL, a process that
-went silent, an ERROR/CRITICAL line, a missing end-of-day square-off, or the server unreachable.
+Every 10 minutes (on the :x0:30 mark, 09:40-15:31 IST, weekdays) it scp's the hedge buyer, NIFTY/SENSEX
+straddle and SENSEX option-buying logs into logs/<name>_<today>.log, replays today's lines, and shows a
+green tick or a red cross per strategy. Red = act now: hedges not filled by 09:40, a short leg without
+an SL, a process that went silent, an ERROR/CRITICAL line, a missing end-of-day square-off or hedge
+close, or the server unreachable.
 Red beeps every 20s until Acknowledged; a new issue beeps again. P&L is deliberately never shown.
 
 Caveat: this only knows what the logs say - it cannot see the broker's order book. A log claiming
@@ -31,8 +32,10 @@ LOGS_DIR = Path(__file__).parent / 'logs'
 REFRESH_MINUTES = 10
 CHECK_FROM, CHECK_UNTIL = dtime(9, 40), dtime(15, 31)
 END_TIME = dtime(15, 13)  # both strategies' EXIT_TIME
-START_GRACE = timedelta(minutes=5)  # cron start -> first log line
 END_GRACE = timedelta(minutes=7)  # 15:13 -> straddle's "done for" line
+# Hedges normally fill ~09:38. 09:40 (not later) so the 09:40:30 check catches a miss before the 09:45 entry.
+HEDGES_FILLED_BY = dtime(9, 40)
+HEDGE_CLOSE_STARTED_BY = dtime(15, 19)  # hedge_closer cron runs 15:14
 BUY_MAX_HOLD = timedelta(minutes=8)  # option buying holds 5 min (HOLD_MINUTES), then exits
 BEEP_MS = 20_000
 BEEP_SOUND = '/System/Library/Sounds/Sosumi.aiff'
@@ -45,15 +48,16 @@ GLOW_MS = 400  # flash period of the red header/border while an issue is unackno
 class Strategy:
     name: str
     remote_path: str  # relative to REMOTE
-    kind: str  # 'straddle' | 'buying'
-    start: dtime  # cron start time on the box
-    max_silence: timedelta  # straddle heartbeats every 30 min; buying logs every minute
+    kind: str  # 'hedge' | 'straddle' | 'buying'
+    first_log_by: dtime  # cron start on the box + a few minutes
+    max_silence: timedelta | None  # straddle heartbeats every 30 min; buying logs every minute; hedge exits
 
 
-STRATEGIES = [
-    Strategy('NIFTY straddle', 'exec_rsv_adjust_sl_NIFTY.log', 'straddle', dtime(9, 44), timedelta(minutes=40)),
-    Strategy('SENSEX straddle', 'exec_rsv_adjust_sl_SENSEX.log', 'straddle', dtime(9, 44), timedelta(minutes=40)),
-    Strategy('SENSEX option buying', 'logs/sensex_option_buying.log', 'buying', dtime(10, 14), timedelta(minutes=5)),
+STRATEGIES = [  # display order
+    Strategy('Hedges', 'logs/hedge_buyer.log', 'hedge', dtime(9, 40), None),
+    Strategy('NIFTY straddle', 'exec_rsv_adjust_sl_NIFTY.log', 'straddle', dtime(9, 49), timedelta(minutes=40)),
+    Strategy('SENSEX straddle', 'exec_rsv_adjust_sl_SENSEX.log', 'straddle', dtime(9, 49), timedelta(minutes=40)),
+    Strategy('SENSEX option buying', 'logs/sensex_option_buying.log', 'buying', dtime(10, 19), timedelta(minutes=5)),
 ]
 
 LINE = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ (\w+) (?:\[\w+\] )?(.*)$')
@@ -139,18 +143,41 @@ def buying_status(events, now):
     return red, f'holding {inst} since {since:%H:%M}', False
 
 
+def hedge_status(events, now):
+    bought = closed = None
+    for t, _, msg in events:
+        if msg.startswith('Hedges filled:'):
+            bought = (t, len(msg.splitlines()) - 2)  # header, one line per leg, Total line
+        elif msg.startswith('hedge_buyer close starting'):
+            closed = closed or (t, 'closing since')
+        elif msg.startswith('Hedges closed:') or 'already closed - nothing to sell' in msg:
+            closed = (t, 'closed')
+    red = []
+    if bought is None and now >= _at(now, HEDGES_FILLED_BY):
+        red.append(f'no "Hedges filled" line by {HEDGES_FILLED_BY:%H:%M} - hedges may not be in place for the 09:45 '
+                   f'straddle entry (false alarm only if hedges were already held)')
+    if closed is None and now >= _at(now, HEDGE_CLOSE_STARTED_BY):
+        red.append(f'hedge close run did not start by {HEDGE_CLOSE_STARTED_BY:%H:%M} - hedges still held?')
+    text = f'hedges bought {bought[0]:%H:%M} ({bought[1]} legs)' if bought else 'no hedges bought yet'
+    if closed:
+        text += f' · {closed[1]} {closed[0]:%H:%M}'
+    return red, text, True  # the script exits after buying - a quiet log is normal
+
+
+STATUS_FNS = {'hedge': hedge_status, 'straddle': straddle_status, 'buying': buying_status}
+
+
 def check(strategy, events, now):
     """-> (red, amber, status). red = act now (beeps), amber = warnings worth a glance."""
     if now.weekday() >= 5:
         return [], [], 'weekend - not trading'
     if not events:
-        late = now >= _at(now, strategy.start) + START_GRACE
+        late = now >= _at(now, strategy.first_log_by)
         return (['no log lines today - strategy did not start'] if late else []), [], 'waiting to start'
     red = [f'{t:%H:%M:%S} {level}: {msg.splitlines()[0][:220]}' for t, level, msg in events
            if level in ('ERROR', 'CRITICAL') and 'DAILY LOSS LIMIT' not in msg]
     amber = [f'{t:%H:%M:%S} {msg.splitlines()[0][:220]}' for t, level, msg in events if level == 'WARNING']
-    status_fn = straddle_status if strategy.kind == 'straddle' else buying_status
-    state_red, status, finished = status_fn(events, now)
+    state_red, status, finished = STATUS_FNS[strategy.kind](events, now)
     last = events[-1][0]
     if not finished and now < _at(now, END_TIME) and now - last > strategy.max_silence:
         state_red.append(f'log silent since {last:%H:%M} - process may have died')
@@ -178,6 +205,9 @@ def run_checks():
         try:
             text = download(s, now.date())
         except subprocess.CalledProcessError as exc:
+            if 'No such file' in exc.stderr:  # box is up, strategy hasn't created its log yet
+                results.append((s, *check(s, [], now)))
+                continue
             results.append((s, [f'download failed - server unreachable? ({exc.stderr.strip()[-150:]})'], [], 'unknown'))
             continue
         except subprocess.TimeoutExpired:

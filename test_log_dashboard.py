@@ -8,7 +8,7 @@ from pathlib import Path
 from log_dashboard import IST, STRATEGIES, check, todays_events
 
 LOGS = Path(__file__).parent / 'logs'
-NIFTY, SENSEX, BUYING = STRATEGIES
+HEDGE, NIFTY, SENSEX, BUYING = STRATEGIES
 
 
 def events(file, day, until=None):
@@ -77,6 +77,28 @@ class BuyingTests(unittest.TestCase):
     def test_position_stuck_open_is_red(self):
         red, _, _ = check(BUYING, events('sensex_option_buying_2026-11-05.log', '2026-11-05', '13:41:30'), at('2026-11-05', '13:50'))
         self.assertTrue(any('still open' in r for r in red))
+
+
+class HedgeTests(unittest.TestCase):
+    def test_bought_and_closed_is_green(self):
+        red, _, status = check(HEDGE, events('hedge_buyer_2026-11-02.log', '2026-11-02'), at('2026-11-02', '15:25'))
+        self.assertEqual(red, [])
+        self.assertIn('closed', status)
+
+    def test_bought_midday_is_green_without_silence_alarm(self):
+        red, _, status = check(HEDGE, events('hedge_buyer_2026-11-06.log', '2026-11-06'), at('2026-11-06', '12:00'))
+        self.assertEqual(red, [])
+        self.assertIn('bought 09:38 (4 legs)', status)
+
+    def test_not_filled_by_deadline_is_red(self):
+        evs = events('hedge_buyer_2026-11-06.log', '2026-11-06', '09:37:30')
+        self.assertEqual(check(HEDGE, evs, at('2026-11-06', '09:39'))[0], [])
+        red, _, _ = check(HEDGE, evs, at('2026-11-06', '09:40:30'))
+        self.assertTrue(any('Hedges filled' in r for r in red))
+
+    def test_close_not_started_is_red(self):
+        red, _, _ = check(HEDGE, events('hedge_buyer_2026-11-06.log', '2026-11-06'), at('2026-11-06', '15:25'))
+        self.assertTrue(any('close' in r for r in red))
 
 
 if __name__ == '__main__':

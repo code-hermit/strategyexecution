@@ -321,3 +321,31 @@ VIX 16.66 at 09:38, up from a 15.58 previous close.
 | 11:15 | Rs 6.32L (incl. hedge premium) | 17.03 | 24,615 | 79,764 | SENSEX halted 09:57 on the daily loss limit, -115.28 pts = Rs -16,140: CE stopped at 910 after the ladder widened its stop to 30% (-209.71 pts), PE closed at +94.43. SENSEX hedges (Rs 10,049) now protect nothing. NIFTY about -29 pts (Rs -13,182) against its 40 pt limit. Rs 16.12L free. |
 
 **End of day** (to fill in): hedge sell-back value, net hedge cost, straddle day P&L.
+
+---
+
+## 2026-11-09 (Mon) - NIFTY expiry day, SENSEX 12 Nov
+
+**Setup:** **6 lots each** from today (7 -> 6, commit be84787), option buying 6 lots. Funds Rs 22.31L. VIX 18.03.
+
+**Decisions**
+- 09:32 `--plan` quoted Rs 17,532: NIFTY ±450 (Rs 4,992) + SENSEX ±3700 (Rs 12,540). Spare target Rs 2.52L at VIX 18
+  + option-buying reserve Rs 0.84L. I flagged the over-buy and suggested NIFTY ±450 + SENSEX ±4400 (Rs 13,338) at
+  09:33, but it was too late to change the server before 09:37.
+- **Bought at 09:38 by the server run, Rs 17,559:** NIFTY 25400CE @ 8.15 + 24500PE @ 5.15 x390 (Rs 5,187), SENSEX
+  84500CE @ 62.70 + 77100PE @ 40.40 x120 (Rs 12,372).
+- **User: far too close and too costly** (NIFTY only 8-9 strikes out on expiry day). NIFTY ±800 was Rs 1,404 and
+  ±600 Rs 2,515. The NIFTY legs expire today, so their whole Rs 5,187 is likely lost.
+- Kept (swapping now would pay the spread twice, just before the 09:45 entry). Root cause: spare/reserve rules
+  hold back too much at high VIX. Fix to agree with user before tomorrow's 09:37 run.
+- **09:42, user swapped NIFTY by hand:** bought 25600CE @ 2.10 + 24200PE @ 1.60 x390 (Rs 1,443), sold 25400CE @ 4.70 +
+  24500PE @ 5.40 (Rs 3,939). Realized Rs -1,248 on the program's NIFTY legs.
+- 09:44 hedge P&L Rs -3,222 (realized -1,248, unrealized -1,974, of which SENSEX 84500CE -2,154 as SENSEX dipped 80,854
+  -> 80,669). The NIFTY legs would have decayed to about zero by expiry anyway, so the swap likely saved about Rs 2k.
+
+**Hourly margin / VIX**
+
+| Time | Margin used | VIX | NIFTY | SENSEX | Notes |
+|---|---|---|---|---|---|
+
+**End of day** (to fill in): hedge sell-back value, net hedge cost, straddle day P&L.
