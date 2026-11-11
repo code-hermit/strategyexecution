@@ -150,8 +150,8 @@ def _run(ip_address):
                 #   Mon-Fri (1,2,3,4,5)   9:36 -> token_check.sh (checks the AliceBlue + Zerodha tokens
                 #                                 pulled from GitHub at 9:35 actually work, and sends
                 #                                 both users' profiles to Telegram)
-                #   Mon-Fri (1,2,3,4,5)   9:37 -> hedge_buyer.sh (plans the day's NIFTY/SENSEX hedge
-                #                                 strangles from live margin + VIX, buys them at 9:38
+                #   Mon-Fri (1,2,3,4,5)   9:41 -> hedge_buyer.sh (plans the day's NIFTY/SENSEX hedge
+                #                                 strangles from live margin + VIX, buys them at 9:42
                 #                                 so they're in before the 9:45 straddle entry)
                 #   Mon-Fri (1,2,3,4,5)  15:14 -> hedge_closer.sh (sells those hedges back at 15:15, once
                 #                                 each index's straddle is flat after its 15:13 exit)
@@ -191,7 +191,7 @@ def _run(ip_address):
                 (
                     "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s hedge_buyer ' || "
                     "(crontab -u ec2-user -l 2>/dev/null; "
-                    "echo \"37 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s hedge_buyer '/home/ec2-user/trading/hedge_buyer.sh'\") | crontab -u ec2-user -"
+                    "echo \"41 9 * * 1,2,3,4,5 /usr/bin/tmux new-session -d -s hedge_buyer '/home/ec2-user/trading/hedge_buyer.sh'\") | crontab -u ec2-user -"
                 ),
                 (
                     "crontab -u ec2-user -l 2>/dev/null | grep -q -- '-s hedge_closer ' || "

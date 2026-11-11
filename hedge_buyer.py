@@ -1,5 +1,5 @@
 """
-hedge_buyer.py - picks and buys each morning's NIFTY + SENSEX straddle hedges on AliceBlue at 09:38,
+hedge_buyer.py - picks and buys each morning's NIFTY + SENSEX straddle hedges on AliceBlue at 09:42,
 ahead of exec_rsv_adjust_sl.py's 09:45 entry. Automates the process worked out by hand in Oct 2026.
 
 How the legs are chosen:
@@ -32,7 +32,7 @@ straddle is flat (exec_rsv_adjust_sl.py exits at 15:13), so a hedge is never sol
 still-open short. Hedges bought by hand are not in the file and are left alone.
 
 Usage:
-    python3 hedge_buyer.py            # cron at 09:37: plan, wait for 09:38, buy (DRY_RUN from .env)
+    python3 hedge_buyer.py            # cron at 09:41: plan, wait for 09:42, buy (DRY_RUN from .env)
     python3 hedge_buyer.py --close    # cron at 15:14: at 15:15 sell back this morning's hedges
     python3 hedge_buyer.py --plan     # just print today's picks, place nothing (any time in market hours)
     python3 hedge_buyer.py --plan --use-ltp   # same, priced off LTP with no liquidity filter (pre-open/after hours)
@@ -118,7 +118,7 @@ for _sig in (signal.SIGTERM, signal.SIGHUP):
 # ── Config ──────────────────────────────────────────────────────────────────────────────────────
 DRY_RUN = os.getenv('DRY_RUN', 'true').lower() != 'false'  # set DRY_RUN=false to place real orders
 
-PLACE_TIME = dtime(9, 38)  # orders go in here (planning starts as soon as the process does - cron 09:37)
+PLACE_TIME = dtime(9, 42)  # orders go in here (planning starts as soon as the process does - cron 09:41; was 09:37/09:38 until 11 Nov 2026)
 LATEST_PLACE_TIME = dtime(9, 44, 30)  # past this the straddles are about to enter - alert, buy nothing
 CLOSE_TIME = dtime(15, 15)  # --close sells the hedges here - after the straddles' 15:13 EXIT_TIME
 CLOSE_GIVE_UP = dtime(15, 35)  # an index's straddle still short by now -> leave its hedges, alert (F&O closes 15:40)
@@ -297,7 +297,7 @@ def _logins_valid():
 
 def _wait_for_logins(plan_only):
     """Both tokens come from a manual browser login each morning - if that hasn't happened yet at
-    09:37, wait for it (re-checking every 15s) until LOGIN_WAIT_UNTIL rather than dying."""
+    09:41, wait for it (re-checking every 15s) until LOGIN_WAIT_UNTIL rather than dying."""
     global ZERODHA_HEADERS, ALICEBLUE_HEADERS
     warned = False
     while True:

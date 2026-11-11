@@ -2,7 +2,7 @@
 
 Every 10 minutes (on the :x0:30 mark, 09:40-15:31 IST, weekdays) it scp's the hedge buyer, NIFTY/SENSEX
 straddle and SENSEX option-buying logs into logs/<name>_<today>.log, replays today's lines, and shows a
-green tick or a red cross per strategy. Red = act now: hedges not filled by 09:40, a short leg without
+green tick or a red cross per strategy. Red = act now: hedges not filled by 09:43, a short leg without
 an SL, a process that went silent, an ERROR/CRITICAL line, a missing end-of-day square-off or hedge
 close, or the server unreachable.
 Red beeps every 20s until Acknowledged; a new issue beeps again. P&L is deliberately never shown.
@@ -33,8 +33,9 @@ REFRESH_MINUTES = 10
 CHECK_FROM, CHECK_UNTIL = dtime(9, 40), dtime(15, 31)
 END_TIME = dtime(15, 13)  # both strategies' EXIT_TIME
 END_GRACE = timedelta(minutes=7)  # 15:13 -> straddle's "done for" line
-# Hedges normally fill ~09:38. 09:40 (not later) so the 09:40:30 check catches a miss before the 09:45 entry.
-HEDGES_FILLED_BY = dtime(9, 40)
+# Hedges normally fill ~09:42 (cron 09:41). The :x0:30 checks mean a miss shows at 09:50:30 - after the 09:45 entry;
+# hedge_buyer.py itself alerts "buy them manually" at once, so watch Telegram until then.
+HEDGES_FILLED_BY = dtime(9, 43)
 HEDGE_CLOSE_STARTED_BY = dtime(15, 19)  # hedge_closer cron runs 15:14
 BUY_MAX_HOLD = timedelta(minutes=8)  # option buying holds 5 min (HOLD_MINUTES), then exits
 BEEP_MS = 20_000
@@ -54,7 +55,7 @@ class Strategy:
 
 
 STRATEGIES = [  # display order
-    Strategy('Hedges', 'logs/hedge_buyer.log', 'hedge', dtime(9, 40), None),
+    Strategy('Hedges', 'logs/hedge_buyer.log', 'hedge', dtime(9, 43), None),
     Strategy('NIFTY straddle', 'exec_rsv_adjust_sl_NIFTY.log', 'straddle', dtime(9, 49), timedelta(minutes=40)),
     Strategy('SENSEX straddle', 'exec_rsv_adjust_sl_SENSEX.log', 'straddle', dtime(9, 49), timedelta(minutes=40)),
     Strategy('SENSEX option buying', 'logs/sensex_option_buying.log', 'buying', dtime(10, 19), timedelta(minutes=5)),

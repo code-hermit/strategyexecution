@@ -92,8 +92,8 @@ class HedgeTests(unittest.TestCase):
 
     def test_not_filled_by_deadline_is_red(self):
         evs = events('hedge_buyer_2026-11-06.log', '2026-11-06', '09:37:30')
-        self.assertEqual(check(HEDGE, evs, at('2026-11-06', '09:39'))[0], [])
-        red, _, _ = check(HEDGE, evs, at('2026-11-06', '09:40:30'))
+        self.assertEqual(check(HEDGE, evs, at('2026-11-06', '09:42'))[0], [])
+        red, _, _ = check(HEDGE, evs, at('2026-11-06', '09:43:30'))
         self.assertTrue(any('Hedges filled' in r for r in red))
 
     def test_close_not_started_is_red(self):

@@ -2,7 +2,7 @@
 token_check.py - 09:36 sanity check of the broker tokens pulled from GitHub at 09:35.
 
 The tokens are generated elsewhere and committed to the repo; this only checks that what landed on
-the box actually works, before hedge_buyer.py (09:37) and the straddles (09:44) depend on them:
+the box actually works, before hedge_buyer.py (09:41) and the straddles (09:44) depend on them:
   - AliceBlue: aliceblue_token.json userSession -> /limits/ (validity) + /profile/ (details)
   - Zerodha:   zerodha_token.json access_token  -> /user/profile
 The result for both goes to Telegram as one message. Exits non-zero if either token is bad.
@@ -97,7 +97,7 @@ def main():
         all_ok &= ok
         sections.append(f"{'✅' if ok else '❌'} {name}\n" + '\n'.join(lines))
 
-    header = 'Token check: all OK' if all_ok else 'Token check: FAILED - fix before 09:37'
+    header = 'Token check: all OK' if all_ok else 'Token check: FAILED - fix before 09:41'
     message = header + '\n\n' + '\n\n'.join(sections)
     print(message)
     telegram_send(message)
