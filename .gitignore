@@ -8,3 +8,4 @@
 /stock_range_reversal_data
 *.pkg
 *_token.json
+test_exec_wick_resell.py
